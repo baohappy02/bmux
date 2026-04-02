@@ -247,6 +247,22 @@ class TerminalController {
         let payload: [String: Any]
     }
 
+    private struct AgentProfileJobSpec {
+        let label: String
+        let command: String
+        let split: String?
+    }
+
+    private struct AgentProfileSpec {
+        let name: String
+        let executionClass: String
+        let approvalState: String
+        let packageManager: String?
+        let repoRoot: String?
+        let jobs: [AgentProfileJobSpec]
+        let expectedPorts: [Int]
+    }
+
     private struct AgentWorkspaceContext {
         let windowId: UUID?
         let tabManager: TabManager
@@ -269,6 +285,7 @@ class TerminalController {
     private var v2AgentSessions: [String: AgentSession] = [:]
     private var v2AgentNextTaskOrdinal: Int = 1
     private var v2AgentTasks: [String: AgentTask] = [:]
+    private var v2AgentNextGroupOrdinal: Int = 1
     private var v2AgentNextEventOrdinal: Int = 1
     private var v2AgentEventLog: [AgentEvent] = []
 
@@ -2111,6 +2128,10 @@ class TerminalController {
             return v2Result(id: id, self.v2AgentCapabilities(params: params))
         case "agent.open":
             return v2Result(id: id, self.v2AgentOpen(params: params))
+        case "agent.ensure":
+            return v2Result(id: id, self.v2AgentEnsure(params: params))
+        case "agent.batch":
+            return v2Result(id: id, self.v2AgentBatch(params: params))
         case "agent.focus":
             return v2Result(id: id, self.v2AgentFocus(params: params))
         case "agent.close":
@@ -2125,12 +2146,16 @@ class TerminalController {
             return v2Result(id: id, self.v2AgentTerminalWait(params: params))
         case "agent.task.run":
             return v2Result(id: id, self.v2AgentTaskRun(params: params))
+        case "agent.task.run_profile":
+            return v2Result(id: id, self.v2AgentTaskRunProfile(params: params))
         case "agent.task.wait":
             return v2Result(id: id, self.v2AgentTaskWait(params: params))
         case "agent.task.result":
             return v2Result(id: id, self.v2AgentTaskResult(params: params))
         case "agent.events":
             return v2Result(id: id, self.v2AgentReadEvents(params: params))
+        case "agent.service.list":
+            return v2Result(id: id, self.v2AgentServiceList(params: params))
         case "agent.service.wait":
             return v2Result(id: id, self.v2AgentServiceWait(params: params))
 
@@ -2542,6 +2567,8 @@ class TerminalController {
             "agent.layout",
             "agent.capabilities",
             "agent.open",
+            "agent.ensure",
+            "agent.batch",
             "agent.focus",
             "agent.close",
             "agent.surface.read",
@@ -2549,9 +2576,11 @@ class TerminalController {
             "agent.terminal.capture",
             "agent.terminal.wait",
             "agent.task.run",
+            "agent.task.run_profile",
             "agent.task.wait",
             "agent.task.result",
             "agent.events",
+            "agent.service.list",
             "agent.service.wait",
             "system.identify",
             "system.tree",
@@ -3308,6 +3337,266 @@ class TerminalController {
         return result
     }
 
+    private func v2AgentEnsure(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+        guard let target = (v2String(params, "target") ?? v2String(params, "kind"))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !target.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing target", data: nil)
+        }
+        guard let context = v2AgentResolveContext(params: params, session: session) else {
+            return .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+        }
+
+        switch target {
+        case "terminal":
+            let reusedSurfaceId = v2UUID(params, "surface_id")
+                .flatMap { context.workspace.terminalPanel(for: $0) != nil ? $0 : nil }
+                ?? context.surfaceId.flatMap { context.workspace.terminalPanel(for: $0) != nil ? $0 : nil }
+                ?? orderedPanels(in: context.workspace).first(where: { context.workspace.terminalPanel(for: $0.id) != nil })?.id
+            if let reusedSurfaceId {
+                let reusedContext = AgentWorkspaceContext(
+                    windowId: context.windowId,
+                    tabManager: context.tabManager,
+                    workspace: context.workspace,
+                    paneId: context.workspace.paneId(forPanelId: reusedSurfaceId)?.id,
+                    surfaceId: reusedSurfaceId
+                )
+                var payload = v2AgentSurfaceSummary(context: reusedContext)
+                payload["session_id"] = sessionId
+                payload["target"] = "terminal"
+                payload["created"] = false
+                return .ok(payload)
+            }
+
+            var openParams = params
+            openParams["kind"] = "terminal"
+            if openParams["split"] == nil { openParams["split"] = "right" }
+            if openParams["focus"] == nil { openParams["focus"] = false }
+            switch v2AgentOpen(params: openParams) {
+            case .ok(let value):
+                var payload = (value as? [String: Any]) ?? [:]
+                payload["target"] = "terminal"
+                payload["created"] = true
+                return .ok(payload)
+            case .err(let code, let message, let data):
+                return .err(code: code, message: message, data: data)
+            }
+
+        case "browser":
+            let requestedURL = v2String(params, "url")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let existingBrowserId = orderedPanels(in: context.workspace).first { panel in
+                guard let browserPanel = context.workspace.browserPanel(for: panel.id) else { return false }
+                guard let requestedURL, !requestedURL.isEmpty else { return true }
+                return browserPanel.currentURL?.absoluteString == requestedURL
+            }?.id
+            if let existingBrowserId {
+                let browserContext = AgentWorkspaceContext(
+                    windowId: context.windowId,
+                    tabManager: context.tabManager,
+                    workspace: context.workspace,
+                    paneId: context.workspace.paneId(forPanelId: existingBrowserId)?.id,
+                    surfaceId: existingBrowserId
+                )
+                var payload = v2AgentSurfaceSummary(context: browserContext)
+                payload["session_id"] = sessionId
+                payload["target"] = "browser"
+                payload["created"] = false
+                return .ok(payload)
+            }
+
+            var openParams = params
+            openParams["kind"] = "browser"
+            if openParams["split"] == nil { openParams["split"] = "right" }
+            if openParams["focus"] == nil { openParams["focus"] = false }
+            switch v2AgentOpen(params: openParams) {
+            case .ok(let value):
+                var payload = (value as? [String: Any]) ?? [:]
+                payload["target"] = "browser"
+                payload["created"] = true
+                return .ok(payload)
+            case .err(let code, let message, let data):
+                return .err(code: code, message: message, data: data)
+            }
+
+        case "service":
+            guard let port = v2Int(params, "port"), port > 0, port <= 65535 else {
+                return .err(code: "invalid_params", message: "Service ensure requires port", data: nil)
+            }
+            let services = v2AgentServicesPayload(workspace: context.workspace, sessionId: sessionId)
+            if let service = services.first(where: { v2StrictIntAny($0["port"]) == port }) {
+                var payload = service
+                payload["target"] = "service"
+                payload["created"] = false
+                payload["event_cursor"] = v2AgentCurrentEventCursor()
+                return .ok(payload)
+            }
+
+            guard let profileName = v2String(params, "profile")?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !profileName.isEmpty,
+                  let profile = v2AgentResolveProfile(name: profileName, context: context) else {
+                return .err(code: "not_found", message: "No matching service and no runnable profile provided", data: [
+                    "port": port,
+                    "session_id": sessionId
+                ])
+            }
+
+            let runningTasks = v2AgentTasks.values.filter { task in
+                guard task.sessionId == sessionId,
+                      task.workspaceId == context.workspace.id,
+                      !task.status.isTerminal else {
+                    return false
+                }
+                return profile.jobs.contains(where: { $0.command == task.command })
+            }
+            if !runningTasks.isEmpty {
+                return .ok([
+                    "session_id": sessionId,
+                    "target": "service",
+                    "created": false,
+                    "waiting": true,
+                    "service_id": "service:\(port)",
+                    "port": port,
+                    "job_ids": runningTasks.map(\.id),
+                    "profile": profileName,
+                    "event_cursor": v2AgentCurrentEventCursor()
+                ])
+            }
+
+            var profileParams = params
+            profileParams["profile"] = profileName
+            switch v2AgentTaskRunProfile(params: profileParams) {
+            case .ok(let value):
+                var payload = (value as? [String: Any]) ?? [:]
+                payload["target"] = "service"
+                payload["created"] = true
+                payload["service_id"] = "service:\(port)"
+                payload["port"] = port
+                return .ok(payload)
+            case .err(let code, let message, let data):
+                return .err(code: code, message: message, data: data)
+            }
+
+        case "profile":
+            switch v2AgentTaskRunProfile(params: params) {
+            case .ok(let value):
+                var payload = (value as? [String: Any]) ?? [:]
+                payload["target"] = "profile"
+                payload["created"] = true
+                return .ok(payload)
+            case .err(let code, let message, let data):
+                return .err(code: code, message: message, data: data)
+            }
+
+        default:
+            return .err(code: "invalid_params", message: "Unsupported ensure target", data: [
+                "target": target
+            ])
+        }
+    }
+
+    private func v2AgentBatch(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard v2AgentSessions[sessionId] != nil else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+        guard let steps = params["steps"] as? [[String: Any]], !steps.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing steps", data: nil)
+        }
+
+        let continueOnError = v2Bool(params, "continue_on_error") ?? false
+        var stepResults: [[String: Any]] = []
+        var overallOK = true
+
+        for (index, step) in steps.enumerated() {
+            guard let kind = (step["kind"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !kind.isEmpty else {
+                overallOK = false
+                stepResults.append([
+                    "index": index,
+                    "ok": false,
+                    "code": "invalid_params",
+                    "message": "Batch step missing kind"
+                ])
+                if !continueOnError { break }
+                continue
+            }
+
+            var merged = params
+            merged.removeValue(forKey: "steps")
+            merged.removeValue(forKey: "continue_on_error")
+            for (key, value) in step where key != "kind" {
+                merged[key] = value
+            }
+
+            let callResult: V2CallResult
+            switch kind {
+            case "ensure.terminal":
+                merged["target"] = "terminal"
+                callResult = v2AgentEnsure(params: merged)
+            case "ensure.browser":
+                merged["target"] = "browser"
+                callResult = v2AgentEnsure(params: merged)
+            case "ensure.service":
+                merged["target"] = "service"
+                callResult = v2AgentEnsure(params: merged)
+            case "ensure.profile":
+                merged["target"] = "profile"
+                callResult = v2AgentEnsure(params: merged)
+            case "task.run_profile", "run_profile":
+                callResult = v2AgentTaskRunProfile(params: merged)
+            case "service.wait":
+                callResult = v2AgentServiceWait(params: merged)
+            case "service.list":
+                callResult = v2AgentServiceList(params: merged)
+            default:
+                callResult = .err(code: "invalid_params", message: "Unsupported batch step kind", data: ["kind": kind])
+            }
+
+            switch callResult {
+            case .ok(let value):
+                var entry: [String: Any] = ["index": index, "kind": kind, "ok": true]
+                if let dict = value as? [String: Any] {
+                    for (key, value) in dict {
+                        entry[key] = value
+                    }
+                } else {
+                    entry["result"] = value
+                }
+                stepResults.append(entry)
+            case .err(let code, let message, let data):
+                overallOK = false
+                var entry: [String: Any] = [
+                    "index": index,
+                    "kind": kind,
+                    "ok": false,
+                    "code": code,
+                    "message": message
+                ]
+                if let data {
+                    entry["data"] = data
+                }
+                stepResults.append(entry)
+                if !continueOnError { break }
+            }
+        }
+
+        return .ok([
+            "ok": overallOK,
+            "session_id": sessionId,
+            "steps": stepResults,
+            "event_cursor": v2AgentCurrentEventCursor()
+        ])
+    }
+
     private func v2AgentFocus(params: [String: Any]) -> V2CallResult {
         guard let sessionId = v2String(params, "session_id") else {
             return .err(code: "invalid_params", message: "Missing session_id", data: nil)
@@ -3782,6 +4071,89 @@ class TerminalController {
         return result
     }
 
+    private func v2AgentTaskRunProfile(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+        guard let profileName = v2String(params, "profile")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !profileName.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing profile", data: nil)
+        }
+        guard let context = v2AgentResolveContext(params: params, session: session) else {
+            return .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+        }
+        guard let profile = v2AgentResolveProfile(name: profileName, context: context) else {
+            return .err(code: "not_found", message: "Profile not available", data: [
+                "session_id": sessionId,
+                "profile": profileName
+            ])
+        }
+        guard !profile.jobs.isEmpty else {
+            return .err(code: "invalid_state", message: "Profile has no runnable jobs", data: [
+                "session_id": sessionId,
+                "profile": profileName
+            ])
+        }
+
+        let groupId = "group:\(v2AgentNextGroupOrdinal)"
+        v2AgentNextGroupOrdinal += 1
+
+        var jobPayloads: [[String: Any]] = []
+        for (index, job) in profile.jobs.enumerated() {
+            var jobParams = params
+            jobParams["session_id"] = sessionId
+            jobParams["label"] = job.label
+            jobParams["command"] = job.command
+            jobParams["cwd"] = profile.repoRoot ?? context.workspace.currentDirectory
+            if index > 0 || params["split"] == nil {
+                jobParams["split"] = job.split ?? "right"
+            }
+
+            let runResult = v2AgentTaskRun(params: jobParams)
+            switch runResult {
+            case .ok(let value):
+                guard let dict = value as? [String: Any],
+                      let taskPayload = dict["task"] as? [String: Any] else {
+                    return .err(code: "internal_error", message: "Profile job returned malformed payload", data: [
+                        "profile": profile.name,
+                        "group_id": groupId
+                    ])
+                }
+                jobPayloads.append(taskPayload)
+            case .err(let code, let message, let data):
+                return .err(code: code, message: message, data: data)
+            }
+        }
+
+        v2AgentAppendEvent(
+            type: "task.profile.started",
+            sessionId: sessionId,
+            workspaceId: context.workspace.id,
+            surfaceId: context.surfaceId,
+            payload: [
+                "group_id": groupId,
+                "profile": profile.name,
+                "job_count": profile.jobs.count
+            ]
+        )
+
+        return .ok([
+            "ok": true,
+            "session_id": sessionId,
+            "group_id": groupId,
+            "profile": profile.name,
+            "execution_class": profile.executionClass,
+            "approval_state": profile.approvalState,
+            "package_manager": v2OrNull(profile.packageManager),
+            "expected_ports": profile.expectedPorts,
+            "jobs": jobPayloads,
+            "event_cursor": v2AgentCurrentEventCursor()
+        ])
+    }
+
     private func v2AgentTaskWait(params: [String: Any]) -> V2CallResult {
         guard let sessionId = v2String(params, "session_id") else {
             return .err(code: "invalid_params", message: "Missing session_id", data: nil)
@@ -3869,6 +4241,25 @@ class TerminalController {
             "session_id": sessionId,
             "event_cursor": v2AgentCurrentEventCursor(),
             "events": events
+        ])
+    }
+
+    private func v2AgentServiceList(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+        guard let context = v2AgentResolveContext(params: params, session: session) else {
+            return .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+        }
+
+        let services = v2AgentServicesPayload(workspace: context.workspace, sessionId: sessionId)
+        return .ok([
+            "session_id": sessionId,
+            "services": services,
+            "event_cursor": v2AgentCurrentEventCursor()
         ])
     }
 
@@ -4324,6 +4715,49 @@ class TerminalController {
         ]
     }
 
+    private func v2AgentLatestTask(
+        sessionId: String,
+        workspaceId: UUID,
+        surfaceId: UUID?
+    ) -> AgentTask? {
+        let matchingTasks = v2AgentTasks.values.filter { task in
+            guard task.sessionId == sessionId, task.workspaceId == workspaceId else {
+                return false
+            }
+            if let surfaceId {
+                return task.surfaceId == surfaceId
+            }
+            return true
+        }
+        return matchingTasks.sorted { lhs, rhs in
+            if lhs.status.isTerminal != rhs.status.isTerminal {
+                return !lhs.status.isTerminal
+            }
+            return lhs.updatedAt > rhs.updatedAt
+        }.first
+    }
+
+    private func v2AgentServicesPayload(
+        workspace: Workspace,
+        sessionId: String
+    ) -> [[String: Any]] {
+        workspace.listeningPorts.sorted().map { port in
+            let surfaceId = workspace.surfaceListeningPorts.first(where: { $0.value.contains(port) })?.key
+            let task = v2AgentLatestTask(sessionId: sessionId, workspaceId: workspace.id, surfaceId: surfaceId)
+            var payload = v2AgentServicePayload(
+                sessionId: sessionId,
+                workspace: workspace,
+                port: port,
+                surfaceId: surfaceId
+            )
+            if let task {
+                payload["job_id"] = task.id
+                payload["status"] = task.status.rawValue
+            }
+            return payload
+        }
+    }
+
     private func v2AgentResolveTerminalTarget(
         params: [String: Any],
         session: AgentSession
@@ -4437,6 +4871,134 @@ class TerminalController {
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
             return directoryURL.appendingPathComponent("\(sanitizedId).log").path
         } catch {
+            return nil
+        }
+    }
+
+    private func v2AgentPackageScripts(repoRoot: String?) -> [String: String] {
+        guard let repoRoot else { return [:] }
+        let packageJSONURL = URL(fileURLWithPath: repoRoot, isDirectory: true).appendingPathComponent("package.json")
+        guard let data = try? Data(contentsOf: packageJSONURL),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let scripts = object["scripts"] as? [String: Any] else {
+            return [:]
+        }
+
+        var resolved: [String: String] = [:]
+        for (key, value) in scripts {
+            guard let stringValue = value as? String else { continue }
+            resolved[key] = stringValue
+        }
+        return resolved
+    }
+
+    private func v2AgentHasFile(repoRoot: String?, named fileName: String) -> Bool {
+        guard let repoRoot else { return false }
+        let fileURL = URL(fileURLWithPath: repoRoot, isDirectory: true).appendingPathComponent(fileName)
+        return FileManager.default.fileExists(atPath: fileURL.path)
+    }
+
+    private func v2AgentScriptCommand(scriptName: String, packageManager: String?) -> String {
+        switch packageManager {
+        case "bun":
+            return "bun run \(scriptName)"
+        case "pnpm":
+            return "pnpm run \(scriptName)"
+        case "yarn":
+            return "yarn run \(scriptName)"
+        default:
+            return "npm run \(scriptName)"
+        }
+    }
+
+    private func v2AgentTSCCommand(packageManager: String?, availableTools: [String]) -> String? {
+        if packageManager == "bun" && availableTools.contains("bun") {
+            return "bun x tsc --noEmit"
+        }
+        if availableTools.contains("tsc") {
+            return "tsc --noEmit"
+        }
+        return nil
+    }
+
+    private func v2AgentProfilePortHints(from script: String) -> [Int] {
+        let matches = v2AgentRegexCaptureGroups(
+            pattern: #"--port(?:=|\s+)(\d{2,5})"#,
+            text: script
+        )
+        let ports: [Int] = matches.compactMap { groups -> Int? in
+            guard groups.count > 1 else { return nil }
+            return Int(groups[1])
+        }
+        return Array(Set(ports)).sorted()
+    }
+
+    private func v2AgentResolveProfile(
+        name: String,
+        context: AgentWorkspaceContext
+    ) -> AgentProfileSpec? {
+        let repoRoot = v2AgentRepositoryRoot(startingAt: context.workspace.currentDirectory)
+        let availableTools = v2AgentAvailableTools()
+        let preferredPackageManager = v2AgentPreferredJSPackageManager(
+            inferredPackageManager: v2AgentInferredPackageManager(startingAt: context.workspace.currentDirectory)
+        )
+        let scripts = v2AgentPackageScripts(repoRoot: repoRoot)
+
+        switch name {
+        case "verify.ts":
+            var jobs: [AgentProfileJobSpec] = []
+            if scripts["typecheck"] != nil {
+                jobs.append(.init(label: "typecheck", command: v2AgentScriptCommand(scriptName: "typecheck", packageManager: preferredPackageManager), split: "right"))
+            } else if scripts["check-types"] != nil {
+                jobs.append(.init(label: "check-types", command: v2AgentScriptCommand(scriptName: "check-types", packageManager: preferredPackageManager), split: "right"))
+            } else if v2AgentHasFile(repoRoot: repoRoot, named: "tsconfig.json"),
+                      let tscCommand = v2AgentTSCCommand(packageManager: preferredPackageManager, availableTools: availableTools) {
+                jobs.append(.init(label: "typecheck", command: tscCommand, split: "right"))
+            }
+            if scripts["build"] != nil {
+                jobs.append(.init(label: "build", command: v2AgentScriptCommand(scriptName: "build", packageManager: preferredPackageManager), split: "down"))
+            }
+            guard !jobs.isEmpty else { return nil }
+            return AgentProfileSpec(
+                name: name,
+                executionClass: "local_verify",
+                approvalState: "not_required",
+                packageManager: preferredPackageManager,
+                repoRoot: repoRoot,
+                jobs: jobs,
+                expectedPorts: []
+            )
+
+        case "dev.web":
+            guard scripts["dev"] != nil else { return nil }
+            let command = v2AgentScriptCommand(scriptName: "dev", packageManager: preferredPackageManager)
+            let portHints = v2AgentProfilePortHints(from: scripts["dev"] ?? "")
+            return AgentProfileSpec(
+                name: name,
+                executionClass: "local_exec",
+                approvalState: "not_required",
+                packageManager: preferredPackageManager,
+                repoRoot: repoRoot,
+                jobs: [.init(label: "dev", command: command, split: "right")],
+                expectedPorts: portHints
+            )
+
+        case "verify.flutter":
+            guard availableTools.contains("flutter"),
+                  v2AgentHasFile(repoRoot: repoRoot, named: "pubspec.yaml") else {
+                return nil
+            }
+            return AgentProfileSpec(
+                name: name,
+                executionClass: "local_verify",
+                approvalState: "not_required",
+                packageManager: nil,
+                repoRoot: repoRoot,
+                jobs: [.init(label: "flutter test", command: "flutter test", split: "right")],
+                expectedPorts: []
+            )
+
+        default:
             return nil
         }
     }

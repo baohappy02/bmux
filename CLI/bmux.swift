@@ -2825,6 +2825,70 @@ struct CMUXCLI {
         return nil
     }
 
+    private func decodeJSONValue(_ raw: String, label: String) throws -> Any {
+        guard let data = raw.data(using: .utf8) else {
+            throw CLIError(message: "\(label) must be valid UTF-8 JSON")
+        }
+        do {
+            return try JSONSerialization.jsonObject(with: data, options: [])
+        } catch {
+            throw CLIError(message: "\(label) must be valid JSON")
+        }
+    }
+
+    private func decodeJSONFile(_ rawPath: String, label: String) throws -> Any {
+        let resolvedPath = resolvePath(rawPath)
+        let url = URL(fileURLWithPath: resolvedPath)
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw CLIError(message: "\(label): failed to read \(resolvedPath)")
+        }
+        do {
+            return try JSONSerialization.jsonObject(with: data, options: [])
+        } catch {
+            throw CLIError(message: "\(label): invalid JSON in \(resolvedPath)")
+        }
+    }
+
+    private func agentBatchParams(
+        from object: Any,
+        sessionId: String,
+        workspaceId: String?,
+        surfaceId: String?,
+        windowId: String?,
+        continueOnError: Bool?
+    ) throws -> [String: Any] {
+        switch object {
+        case let steps as [[String: Any]]:
+            var params: [String: Any] = [
+                "session_id": sessionId,
+                "steps": steps
+            ]
+            if let workspaceId { params["workspace_id"] = workspaceId }
+            if let surfaceId { params["surface_id"] = surfaceId }
+            if let windowId { params["window_id"] = windowId }
+            if let continueOnError { params["continue_on_error"] = continueOnError }
+            return params
+
+        case let dict as [String: Any]:
+            guard dict["steps"] != nil else {
+                throw CLIError(message: "agent batch input object must include a top-level steps array")
+            }
+            var params = dict
+            if params["session_id"] == nil { params["session_id"] = sessionId }
+            if params["workspace_id"] == nil, let workspaceId { params["workspace_id"] = workspaceId }
+            if params["surface_id"] == nil, let surfaceId { params["surface_id"] = surfaceId }
+            if params["window_id"] == nil, let windowId { params["window_id"] = windowId }
+            if params["continue_on_error"] == nil, let continueOnError { params["continue_on_error"] = continueOnError }
+            return params
+
+        default:
+            throw CLIError(message: "agent batch input must be a JSON array of steps or an object containing steps")
+        }
+    }
+
     private func doubleFromAny(_ value: Any?) -> Double? {
         if let d = value as? Double { return d }
         if let f = value as? Float { return Double(f) }
@@ -4833,6 +4897,209 @@ struct CMUXCLI {
                 ?? kind
             output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText) kind=\(kindText)")
 
+        case "ensure":
+            var effectiveArgs = subArgs
+            let targetPositional: String? = {
+                guard let first = effectiveArgs.first, !first.hasPrefix("--") else { return nil }
+                effectiveArgs = Array(effectiveArgs.dropFirst())
+                return first
+            }()
+
+            let (sessionOptA, rem0) = parseOption(effectiveArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (targetOptA, rem2) = parseOption(rem1, name: "--target")
+            let (targetOptB, rem3) = parseOption(rem2, name: "--kind")
+            let (workspaceOpt, rem4) = parseOption(rem3, name: "--workspace")
+            let (surfaceOpt, rem5) = parseOption(rem4, name: "--surface")
+            let (paneOpt, rem6) = parseOption(rem5, name: "--pane")
+            let (windowOpt, rem7) = parseOption(rem6, name: "--window")
+            let (splitOptA, rem8) = parseOption(rem7, name: "--split")
+            let (splitOptB, rem9) = parseOption(rem8, name: "--direction")
+            let (urlOpt, rem10) = parseOption(rem9, name: "--url")
+            let (cwdOpt, rem11) = parseOption(rem10, name: "--cwd")
+            let (pathOpt, rem12) = parseOption(rem11, name: "--path")
+            let (profileOpt, rem13) = parseOption(rem12, name: "--profile")
+            let (portOpt, rem14) = parseOption(rem13, name: "--port")
+            let (focusOpt, remaining) = parseOption(rem14, name: "--focus")
+
+            guard let sessionId = sessionOptA ?? sessionOptB else {
+                throw CLIError(message: "agent ensure requires --session <id>")
+            }
+            let target = (targetPositional ?? targetOptA ?? targetOptB)?.lowercased()
+            guard let target, !target.isEmpty else {
+                throw CLIError(message: "agent ensure requires a target: terminal|browser|service|profile")
+            }
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent ensure: unknown flag '\(unknown)'")
+            }
+
+            var params: [String: Any] = [
+                "session_id": sessionId,
+                "target": target
+            ]
+            if let workspaceOpt,
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt,
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let paneOpt,
+               let paneId = try normalizePaneHandle(paneOpt, client: client) {
+                params["pane_id"] = paneId
+            }
+            if let windowOpt,
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+            if let split = splitOptA ?? splitOptB {
+                params["split"] = split
+            }
+            if let focusOpt {
+                guard let focus = parseBoolString(focusOpt) else {
+                    throw CLIError(message: "agent ensure: --focus must be true|false")
+                }
+                params["focus"] = focus
+            }
+
+            let positionalArgs = remaining.filter { !$0.hasPrefix("--") }
+            switch target {
+            case "terminal":
+                if pathOpt != nil {
+                    throw CLIError(message: "agent ensure terminal does not support --path")
+                }
+                if !positionalArgs.isEmpty {
+                    throw CLIError(message: "agent ensure terminal: unexpected positional arguments")
+                }
+                if let cwdOpt {
+                    params["cwd"] = resolvePath(cwdOpt)
+                }
+
+            case "browser":
+                if pathOpt != nil {
+                    throw CLIError(message: "agent ensure browser does not support --path")
+                }
+                if urlOpt != nil, !positionalArgs.isEmpty {
+                    throw CLIError(message: "agent ensure browser: specify the URL either positionally or with --url, not both")
+                }
+                if positionalArgs.count > 1 {
+                    throw CLIError(message: "agent ensure browser: unexpected extra arguments")
+                }
+                if let url = urlOpt ?? positionalArgs.first {
+                    params["url"] = url
+                }
+
+            case "service":
+                if pathOpt != nil || cwdOpt != nil {
+                    throw CLIError(message: "agent ensure service does not support --path or --cwd")
+                }
+                if !positionalArgs.isEmpty {
+                    throw CLIError(message: "agent ensure service: unexpected positional arguments")
+                }
+                guard let portText = portOpt, let port = Int(portText), port > 0, port <= 65535 else {
+                    throw CLIError(message: "agent ensure service requires --port <1-65535>")
+                }
+                params["port"] = port
+                if let profileOpt, !profileOpt.isEmpty {
+                    params["profile"] = profileOpt
+                }
+
+            case "profile":
+                if pathOpt != nil || cwdOpt != nil || urlOpt != nil || portOpt != nil {
+                    throw CLIError(message: "agent ensure profile only accepts --profile and routing flags")
+                }
+                let profile = profileOpt ?? positionalArgs.first
+                guard let profile, !profile.isEmpty else {
+                    throw CLIError(message: "agent ensure profile requires --profile <name>")
+                }
+                let residual = profileOpt == nil ? Array(positionalArgs.dropFirst()) : positionalArgs
+                if !residual.isEmpty {
+                    throw CLIError(message: "agent ensure profile: unexpected extra arguments")
+                }
+                params["profile"] = profile
+
+            default:
+                throw CLIError(message: "agent ensure: unsupported target '\(target)'")
+            }
+
+            let payload = try client.sendV2(method: "agent.ensure", params: params)
+            let created = (payload["created"] as? Bool) ?? false
+            switch target {
+            case "terminal", "browser":
+                let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) target=\(target) surface=\(surfaceText) created=\(created)")
+            case "service":
+                let port = intFromAny(payload["port"]) ?? (portOpt.flatMap(Int.init) ?? 0)
+                output(payload, fallback: "OK session=\(sessionId) target=service port=\(port) created=\(created)")
+            case "profile":
+                let groupId = (payload["group_id"] as? String) ?? "unknown"
+                let profile = (payload["profile"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) target=profile group=\(groupId) profile=\(profile)")
+            default:
+                output(payload, fallback: "OK session=\(sessionId) target=\(target) created=\(created)")
+            }
+
+        case "batch":
+            let (sessionOptA, rem0) = parseOption(subArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+            let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+            let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+            let (jsonOpt, rem5) = parseOption(rem4, name: "--json")
+            let (fileOpt, rem6) = parseOption(rem5, name: "--file")
+            let (continueOpt, remaining) = parseOption(rem6, name: "--continue-on-error")
+
+            guard let sessionId = sessionOptA ?? sessionOptB else {
+                throw CLIError(message: "agent batch requires --session <id>")
+            }
+            if jsonOpt != nil, fileOpt != nil {
+                throw CLIError(message: "agent batch: use either --json or --file, not both")
+            }
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent batch: unknown flag '\(unknown)'")
+            }
+
+            let batchObject: Any
+            if let jsonOpt {
+                batchObject = try decodeJSONValue(jsonOpt, label: "agent batch --json")
+            } else if let fileOpt {
+                batchObject = try decodeJSONFile(fileOpt, label: "agent batch --file")
+            } else if let raw = remaining.first {
+                guard remaining.count == 1 else {
+                    throw CLIError(message: "agent batch accepts one positional JSON payload at most")
+                }
+                batchObject = try decodeJSONValue(raw, label: "agent batch payload")
+            } else {
+                throw CLIError(message: "agent batch requires --json <payload>, --file <path>, or a positional JSON payload")
+            }
+
+            let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client)
+            let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client)
+            let windowId = try normalizeWindowHandle(windowOpt, client: client)
+            let continueOnError: Bool?
+            if let continueOpt {
+                guard let value = parseBoolString(continueOpt) else {
+                    throw CLIError(message: "agent batch: --continue-on-error must be true|false")
+                }
+                continueOnError = value
+            } else {
+                continueOnError = nil
+            }
+
+            let params = try agentBatchParams(
+                from: batchObject,
+                sessionId: sessionId,
+                workspaceId: workspaceId,
+                surfaceId: surfaceId,
+                windowId: windowId,
+                continueOnError: continueOnError
+            )
+            let payload = try client.sendV2(method: "agent.batch", params: params)
+            let stepCount = (payload["steps"] as? [[String: Any]])?.count ?? 0
+            let ok = (payload["ok"] as? Bool) ?? false
+            output(payload, fallback: "OK session=\(sessionId) steps=\(stepCount) ok=\(ok)")
+
         case "focus":
             let (sessionOptA, rem0) = parseOption(subArgs, name: "--session")
             let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
@@ -5121,6 +5388,44 @@ struct CMUXCLI {
                 let jobId = (taskPayload["job_id"] as? String) ?? "unknown"
                 output(payload, fallback: "OK session=\(sessionId) job=\(jobId)")
 
+            case "run-profile":
+                let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+                let (profileOpt, remaining) = parseOption(rem4, name: "--profile")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent task run-profile requires --session <id>")
+                }
+                let profile = profileOpt ?? remaining.first
+                guard let profile, !profile.isEmpty else {
+                    throw CLIError(message: "agent task run-profile requires --profile <name>")
+                }
+                let residual = profileOpt == nil ? Array(remaining.dropFirst()) : remaining
+                if let unknown = residual.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent task run-profile: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId, "profile": profile]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+
+                let payload = try client.sendV2(method: "agent.task.run_profile", params: params)
+                let groupId = (payload["group_id"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) group=\(groupId) profile=\(profile)")
+
             case "wait":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
                 let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
@@ -5224,6 +5529,38 @@ struct CMUXCLI {
             let serviceArgs = Array(subArgs.dropFirst())
 
             switch serviceSubcommand {
+            case "list":
+                let (sessionOptA, rem0) = parseOption(serviceArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, remaining) = parseOption(rem3, name: "--window")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent service list requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent service list: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+
+                let payload = try client.sendV2(method: "agent.service.list", params: params)
+                let count = (payload["services"] as? [[String: Any]])?.count ?? 0
+                output(payload, fallback: "OK session=\(sessionId) services=\(count)")
+
             case "wait":
                 let (sessionOptA, rem0) = parseOption(serviceArgs, name: "--session")
                 let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
@@ -7840,7 +8177,7 @@ struct CMUXCLI {
             """
         case "agent":
             return """
-            Usage: bmux agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task|events|service> [flags]
+            Usage: bmux agent <attach|layout|capabilities|open|ensure|batch|focus|close|surface-read|terminal|task|events|service> [flags]
 
             Compact agent-oriented commands for coding agents such as Codex.
 
@@ -7849,6 +8186,8 @@ struct CMUXCLI {
               layout --session <session-id> [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
               capabilities [--session <session-id>] [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
               open <terminal|browser|markdown> --session <session-id> [--split <left|right|up|down>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--url <url>] [--path <file>] [--cwd <path>] [--focus <true|false>]
+              ensure <terminal|browser|service|profile> --session <session-id> [--split <left|right|up|down>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--url <url>] [--cwd <path>] [--profile <name>] [--port <port>] [--focus <true|false>]
+              batch --session <session-id> (--json '<payload>' | --file <path> | <json-payload>) [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--continue-on-error <true|false>]
               focus --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
               close --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
               surface-read --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
@@ -7856,9 +8195,11 @@ struct CMUXCLI {
               terminal capture --session <session-id> [--surface <id|ref|index>] [--mode tail|full|delta] [--lines <n>] [--scrollback <true|false>]
               terminal wait --session <session-id> [--surface <id|ref|index>] [--state prompt|running] [--timeout-ms <ms>]
               task run --session <session-id> [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--cmd <command> | <command>]
+              task run-profile --session <session-id> --profile <name>
               task wait --session <session-id> --job <job-id> [--timeout-ms <ms>]
               task result --session <session-id> --job <job-id> [--tail-lines <n>]
               events --session <session-id> [--since <cursor>] [--limit <n>]
+              service list --session <session-id> [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
               service wait --session <session-id> --port <port> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>] [--timeout-ms <ms>]
 
             Notes:
@@ -7866,11 +8207,13 @@ struct CMUXCLI {
               - `layout` returns a compact split tree for the selected workspace.
               - `capabilities` returns backend, environment, and preference metadata.
               - `open` opens a compact agent-managed terminal/browser/markdown surface.
+              - `ensure` reuses existing surfaces/services when possible and only creates new ones when needed.
+              - `batch` runs compact multi-step plans in one round-trip.
               - `surface-read` returns a compact metadata snapshot for the target surface.
               - `terminal` wraps low-token terminal input/capture/wait primitives.
-              - `task` runs managed shell commands in bmux terminals and returns compact status.
+              - `task` runs managed shell commands or named profiles in bmux terminals and returns compact status.
               - `events` streams cursor-based task and service events.
-              - `service wait` blocks on listening-port readiness instead of parsing boot logs.
+              - `service list|wait` exposes listening-port state without parsing boot logs.
             """
         case "browser":
             return """
