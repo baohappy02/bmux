@@ -5,6 +5,7 @@ Last updated: April 2, 2026
 This document proposes a token-efficient control layer for bmux agents such as Codex.
 It covers layout orchestration for windows, workspaces, panes, and surfaces, plus compact browser control inside bmux.
 It is complementary to [docs/agent-browser-port-spec.md](/Users/macbook/Desktop/Me/TOOLs/bmux/docs/agent-browser-port-spec.md), which focuses on command-surface parity. This plan focuses on response shape, statefulness, and backend strategy.
+The canonical operator guide lives in [docs/codex-agent-guide.md](/Users/macbook/Desktop/Me/TOOLs/bmux/docs/codex-agent-guide.md).
 
 ## Outcome
 

@@ -1,6 +1,6 @@
 # Slice 08 - Milestone 3 Browser Agent Core
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s08-browser-agent-core`
 

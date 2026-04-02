@@ -1,6 +1,6 @@
 # Slice 04 - Milestone 2 Hardening And Recovery
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s04-hardening-recovery`
 

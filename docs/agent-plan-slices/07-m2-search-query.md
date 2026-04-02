@@ -1,6 +1,6 @@
 # Slice 07 - Milestone 2 Search Query
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s07-search-query`
 

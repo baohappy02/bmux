@@ -1,6 +1,6 @@
 # Slice 02 - Milestone 1 State And Artifacts
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s02-state-artifacts`
 

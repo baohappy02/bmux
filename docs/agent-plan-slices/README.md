@@ -1,6 +1,6 @@
 # bmux Agent Plan Slices
 
-This folder turns the remaining work in [docs/bmux-browser-agent-plan.md](../bmux-browser-agent-plan.md) into reviewable Spark-sized slices.
+This folder turns [docs/bmux-browser-agent-plan.md](../bmux-browser-agent-plan.md) into reviewable Spark-sized slices and a landed implementation checklist.
 
 Use it as the handoff pack for fast implementation plus manual review.
 
@@ -13,6 +13,7 @@ These commits are already on `main`:
 3. `d5d7e993` `Add agent events and service waiting`
 4. `c081031a` `Add agent ensure and batch commands`
 5. `slice 01 task-ops work is already landed locally and should not be reimplemented`
+6. `state, artifacts, search, and browser-agent work landed after the initial slice pack`
 
 These are already done:
 
@@ -41,19 +42,11 @@ These are already done:
 23. `Cmd+N -> ~/Desktop`
 24. automatic workspace title basename plus duplicate disambiguation
 
-## Remaining Slice Order
+## Current Status
 
-Implement in this order:
+All slices in this folder are now implemented in the bmux codebase.
 
-1. [02-m1-state-and-artifacts.md](./02-m1-state-and-artifacts.md)
-2. [03-m2-events-services-profiles.md](./03-m2-events-services-profiles.md)
-3. [04-m2-hardening-and-recovery.md](./04-m2-hardening-and-recovery.md)
-4. [05-m2-managed-jobs-ux.md](./05-m2-managed-jobs-ux.md)
-5. [06-m2-search-status-and-index.md](./06-m2-search-status-and-index.md)
-6. [07-m2-search-query.md](./07-m2-search-query.md)
-7. [08-m3-browser-agent-core.md](./08-m3-browser-agent-core.md)
-8. [09-m3-browser-agent-actions.md](./09-m3-browser-agent-actions.md)
-9. [10-agent-enablement-and-measurement.md](./10-agent-enablement-and-measurement.md)
+Use the individual slice docs as review checkpoints and acceptance references, not as open TODOs.
 
 ## Rules For Every Slice
 
@@ -68,9 +61,18 @@ Implement in this order:
 9. Respect the repo rule that non-focus socket commands must not steal app focus.
 10. Prefer `bun` in examples and profiles when the project allows it.
 
+## Codex Guide
+
+Use [docs/codex-agent-guide.md](../codex-agent-guide.md) as the canonical operator guide for:
+
+1. compact `agent.*` loops
+2. `bun`-first verify and dev flows
+3. `browser.agent.*` usage
+4. event and debug-log measurement
+
 ## Spark Workflow
 
-For each slice:
+For follow-up work after the core plan:
 
 1. Checkout `main`.
 2. Create the suggested branch from the slice doc.

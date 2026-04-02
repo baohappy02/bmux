@@ -1,6 +1,6 @@
 # Slice 09 - Milestone 3 Browser Agent Actions
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s09-browser-agent-actions`
 

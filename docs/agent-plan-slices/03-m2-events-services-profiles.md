@@ -1,6 +1,6 @@
 # Slice 03 - Milestone 2 Events, Services, And Profiles
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s03-events-services-profiles`
 

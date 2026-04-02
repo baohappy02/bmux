@@ -1,6 +1,6 @@
 # Slice 06 - Milestone 2 Search Status And Index
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s06-search-status-index`
 

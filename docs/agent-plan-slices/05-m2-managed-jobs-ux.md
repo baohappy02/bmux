@@ -1,6 +1,6 @@
 # Slice 05 - Milestone 2 Managed Jobs UX
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s05-managed-jobs-ux`
 

@@ -1,6 +1,6 @@
 # Slice 10 - Agent Enablement And Measurement
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s10-enable-measure`
 

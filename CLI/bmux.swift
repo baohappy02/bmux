@@ -5516,8 +5516,13 @@ struct CMUXCLI {
                 }
 
                 let payload = try client.sendV2(method: "agent.task.run_profile", params: params)
-                let groupId = (payload["group_id"] as? String) ?? "unknown"
-                output(payload, fallback: "OK session=\(sessionId) group=\(groupId) profile=\(profile)")
+                if (payload["cached"] as? Bool) == true {
+                    let summary = (payload["summary"] as? String) ?? "cached"
+                    output(payload, fallback: "OK session=\(sessionId) profile=\(profile) \(summary)")
+                } else {
+                    let groupId = (payload["group_id"] as? String) ?? "unknown"
+                    output(payload, fallback: "OK session=\(sessionId) group=\(groupId) profile=\(profile)")
+                }
 
             case "logs":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
@@ -5683,6 +5688,99 @@ struct CMUXCLI {
             let count = (payload["events"] as? [[String: Any]])?.count ?? 0
             output(payload, fallback: "OK session=\(sessionId) cursor=\(eventCursor) events=\(count)")
 
+        case "state":
+            guard let stateSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "agent state requires a subcommand")
+            }
+            let stateSubcommand = stateSubcommandRaw.lowercased()
+            let stateArgs = Array(subArgs.dropFirst())
+
+            switch stateSubcommand {
+            case "summary":
+                let (sessionOptA, rem0) = parseOption(stateArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, remaining) = parseOption(rem3, name: "--window")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent state summary requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent state summary: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+
+                let payload = try client.sendV2(method: "agent.state.summary", params: params)
+                let layoutRev = intFromAny(payload["layout_rev"]) ?? 0
+                output(payload, fallback: "OK session=\(sessionId) layout_rev=\(layoutRev)")
+
+            default:
+                throw CLIError(message: "Unsupported agent state subcommand: \(stateSubcommand)")
+            }
+
+        case "artifact":
+            guard let artifactSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "agent artifact requires a subcommand")
+            }
+            let artifactSubcommand = artifactSubcommandRaw.lowercased()
+            let artifactArgs = Array(subArgs.dropFirst())
+
+            switch artifactSubcommand {
+            case "list":
+                let (sessionOptA, rem0) = parseOption(artifactArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (jobOptA, rem2) = parseOption(rem1, name: "--job")
+                let (jobOptB, rem3) = parseOption(rem2, name: "--job-id")
+                let (workspaceOpt, rem4) = parseOption(rem3, name: "--workspace")
+                let (surfaceOpt, rem5) = parseOption(rem4, name: "--surface")
+                let (windowOpt, remaining) = parseOption(rem5, name: "--window")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent artifact list requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent artifact list: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let jobId = jobOptA ?? jobOptB {
+                    params["job_id"] = jobId
+                }
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+
+                let payload = try client.sendV2(method: "agent.artifact.list", params: params)
+                let count = (payload["artifacts"] as? [[String: Any]])?.count ?? 0
+                output(payload, fallback: "OK session=\(sessionId) artifacts=\(count)")
+
+            default:
+                throw CLIError(message: "Unsupported agent artifact subcommand: \(artifactSubcommand)")
+            }
+
         case "service":
             guard let serviceSubcommandRaw = subArgs.first else {
                 throw CLIError(message: "agent service requires a subcommand")
@@ -5730,7 +5828,9 @@ struct CMUXCLI {
                 let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
                 let (windowOpt, rem4) = parseOption(rem3, name: "--window")
                 let (portOpt, rem5) = parseOption(rem4, name: "--port")
-                let (timeoutMsOpt, remaining) = parseOption(rem5, name: "--timeout-ms")
+                let (timeoutMsOpt, rem6) = parseOption(rem5, name: "--timeout-ms")
+                let (urlPathOpt, rem7) = parseOption(rem6, name: "--url-path")
+                let (expectTextOpt, remaining) = parseOption(rem7, name: "--expect-text")
 
                 guard let sessionId = sessionOptA ?? sessionOptB else {
                     throw CLIError(message: "agent service wait requires --session <id>")
@@ -5761,6 +5861,12 @@ struct CMUXCLI {
                     }
                     params["timeout_ms"] = timeoutMs
                 }
+                if let urlPathOpt {
+                    params["url_path"] = urlPathOpt
+                }
+                if let expectTextOpt {
+                    params["expect_text"] = expectTextOpt
+                }
 
                 let payload = try client.sendV2(method: "agent.service.wait", params: params)
                 let url = (payload["url"] as? String) ?? "unknown"
@@ -5768,6 +5874,77 @@ struct CMUXCLI {
 
             default:
                 throw CLIError(message: "Unsupported agent service subcommand: \(serviceSubcommand)")
+            }
+
+        case "search":
+            guard let searchSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "agent search requires a subcommand")
+            }
+            let searchSubcommand = searchSubcommandRaw.lowercased()
+            let searchArgs = Array(subArgs.dropFirst())
+
+            switch searchSubcommand {
+            case "status", "index":
+                let (sessionOptA, rem0) = parseOption(searchArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, remaining) = parseOption(rem1, name: "--cwd")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent search \(searchSubcommand) requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent search \(searchSubcommand): unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+
+                let method = searchSubcommand == "status" ? "agent.search.status" : "agent.search.index"
+                let payload = try client.sendV2(method: method, params: params)
+                let status = (payload["status"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) status=\(status)")
+
+            case "query":
+                let (sessionOptA, rem0) = parseOption(searchArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, rem2) = parseOption(rem1, name: "--cwd")
+                let (limitOpt, rem3) = parseOption(rem2, name: "--limit")
+                let (queryOpt, remaining) = parseOption(rem3, name: "--query")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent search query requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent search query: unknown flag '\(unknown)'")
+                }
+                let query = queryOpt ?? remaining.joined(separator: " ")
+                guard !query.isEmpty else {
+                    throw CLIError(message: "agent search query requires --query <text> or positional text")
+                }
+
+                var params: [String: Any] = [
+                    "session_id": sessionId,
+                    "query": query
+                ]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "agent search query: --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+
+                let payload = try client.sendV2(method: "agent.search", params: params)
+                let mode = (payload["mode"] as? String) ?? "unknown"
+                let count = (payload["hits"] as? [[String: Any]])?.count ?? 0
+                output(payload, fallback: "OK session=\(sessionId) mode=\(mode) hits=\(count)")
+
+            default:
+                throw CLIError(message: "Unsupported agent search subcommand: \(searchSubcommand)")
             }
 
         default:
@@ -5945,6 +6122,178 @@ struct CMUXCLI {
             }
             output(payload, fallback: "OK")
             return
+        }
+
+        if subcommand == "agent" {
+            guard let agentSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "browser agent requires a subcommand")
+            }
+            let agentSubcommand = agentSubcommandRaw.lowercased()
+            let agentArgs = Array(subArgs.dropFirst())
+
+            func browserAgentSessionAndParams(
+                from values: [String],
+                sessionRequired: Bool = false
+            ) throws -> (sessionId: String?, params: [String: Any], remaining: [String]) {
+                let (sessionOptA, rem0) = parseOption(values, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let sessionId = sessionOptA ?? sessionOptB
+                if sessionRequired, sessionId == nil, surfaceRaw == nil {
+                    throw CLIError(message: "browser agent \(agentSubcommand) requires --session <id> or a browser surface")
+                }
+
+                var params: [String: Any] = [:]
+                if let sessionId {
+                    params["session_id"] = sessionId
+                }
+                if let rawSurface = surfaceRaw,
+                   let surfaceId = try normalizeSurfaceHandle(rawSurface, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                return (sessionId, params, rem1)
+            }
+
+            switch agentSubcommand {
+            case "observe":
+                let (sessionId, baseParams, rem0) = try browserAgentSessionAndParams(from: agentArgs, sessionRequired: true)
+                let (scopeOpt, rem1) = parseOption(rem0, name: "--scope")
+                let (limitOpt, rem2) = parseOption(rem1, name: "--limit")
+                let (selectorOpt, remaining) = parseOption(rem2, name: "--selector")
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "browser agent observe: unknown flag '\(unknown)'")
+                }
+                var params = baseParams
+                if let scopeOpt { params["scope"] = scopeOpt }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "browser agent observe: --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+                if let selector = selectorOpt ?? remaining.first {
+                    params["selector"] = selector
+                }
+                let payload = try client.sendV2(method: "browser.agent.observe", params: params)
+                let count = (payload["items"] as? [[String: Any]])?.count ?? 0
+                output(payload, fallback: "OK session=\(sessionId ?? "none") items=\(count)")
+                return
+
+            case "read":
+                let (sessionId, baseParams, rem0) = try browserAgentSessionAndParams(from: agentArgs, sessionRequired: true)
+                let (fieldsOpt, rem1) = parseOption(rem0, name: "--fields")
+                let (selectorOpt, rem2) = parseOption(rem1, name: "--selector")
+                let (refOpt, remaining) = parseOption(rem2, name: "--ref")
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "browser agent read: unknown flag '\(unknown)'")
+                }
+                var params = baseParams
+                if let fieldsOpt { params["fields"] = fieldsOpt }
+                if let target = refOpt ?? selectorOpt ?? remaining.first {
+                    if target.hasPrefix("e") || target.hasPrefix("@e") {
+                        params["ref"] = target
+                    } else {
+                        params["selector"] = target
+                    }
+                }
+                let payload = try client.sendV2(method: "browser.agent.read", params: params)
+                output(payload, fallback: "OK session=\(sessionId ?? "none")")
+                return
+
+            case "logs":
+                let (sessionId, baseParams, rem0) = try browserAgentSessionAndParams(from: agentArgs, sessionRequired: true)
+                let (kindOpt, rem1) = parseOption(rem0, name: "--kind")
+                let (cursorOpt, rem2) = parseOption(rem1, name: "--cursor")
+                let (limitOpt, remaining) = parseOption(rem2, name: "--limit")
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "browser agent logs: unknown flag '\(unknown)'")
+                }
+                var params = baseParams
+                if let kindOpt { params["kind"] = kindOpt }
+                if let cursorOpt {
+                    guard let cursor = Int(cursorOpt), cursor >= 0 else {
+                        throw CLIError(message: "browser agent logs: --cursor must be >= 0")
+                    }
+                    params["cursor"] = cursor
+                }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "browser agent logs: --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+                let payload = try client.sendV2(method: "browser.agent.logs", params: params)
+                let count = (payload["entries"] as? [Any])?.count ?? 0
+                output(payload, fallback: "OK session=\(sessionId ?? "none") entries=\(count)")
+                return
+
+            case "artifact":
+                let (sessionId, baseParams, rem0) = try browserAgentSessionAndParams(from: agentArgs, sessionRequired: true)
+                let (kindOpt, remaining) = parseOption(rem0, name: "--kind")
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "browser agent artifact: unknown flag '\(unknown)'")
+                }
+                var params = baseParams
+                if let kindOpt { params["kind"] = kindOpt }
+                let payload = try client.sendV2(method: "browser.agent.artifact", params: params)
+                let path = (payload["path"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId ?? "none") path=\(path)")
+                return
+
+            case "act":
+                guard let actionRaw = agentArgs.first else {
+                    throw CLIError(message: "browser agent act requires an action")
+                }
+                let action = actionRaw.lowercased()
+                let actionArgs = Array(agentArgs.dropFirst())
+                let (sessionId, baseParams, rem0) = try browserAgentSessionAndParams(from: actionArgs, sessionRequired: true)
+                let (refOpt, rem1) = parseOption(rem0, name: "--ref")
+                let (selectorOpt, rem2) = parseOption(rem1, name: "--selector")
+                let (valueOpt, rem3) = parseOption(rem2, name: "--value")
+                let (keyOpt, remaining) = parseOption(rem3, name: "--key")
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "browser agent act: unknown flag '\(unknown)'")
+                }
+                var params = baseParams
+                params["action"] = action
+                let positionalTarget = remaining.first
+                if let target = refOpt ?? selectorOpt ?? positionalTarget {
+                    if target.hasPrefix("e") || target.hasPrefix("@e") {
+                        params["ref"] = target
+                    } else {
+                        params["selector"] = target
+                    }
+                }
+                switch action {
+                case "fill", "type":
+                    let remainingValue = positionalTarget != nil ? Array(remaining.dropFirst()).joined(separator: " ") : remaining.joined(separator: " ")
+                    let textValue = valueOpt ?? remainingValue
+                    guard !textValue.isEmpty else {
+                        throw CLIError(message: "browser agent act \(action) requires --value <text> or positional text")
+                    }
+                    params["text"] = textValue
+                case "press":
+                    let key = keyOpt ?? (positionalTarget != nil ? remaining.dropFirst().first : remaining.first)
+                    guard let key, !key.isEmpty else {
+                        throw CLIError(message: "browser agent act press requires --key <key> or positional key")
+                    }
+                    params["key"] = key
+                case "select":
+                    let selection = valueOpt ?? (positionalTarget != nil ? Array(remaining.dropFirst()).joined(separator: " ") : remaining.joined(separator: " "))
+                    guard !selection.isEmpty else {
+                        throw CLIError(message: "browser agent act select requires --value <option>")
+                    }
+                    params["value"] = selection
+                default:
+                    break
+                }
+                let payload = try client.sendV2(method: "browser.agent.act", params: params)
+                let pageRev = intFromAny(payload["page_rev"]) ?? 0
+                output(payload, fallback: "OK session=\(sessionId ?? "none") action=\(action) page_rev=\(pageRev)")
+                return
+
+            default:
+                throw CLIError(message: "Unsupported browser agent subcommand: \(agentSubcommand)")
+            }
         }
 
         if subcommand == "open" || subcommand == "open-split" || subcommand == "new" {
@@ -8339,7 +8688,7 @@ struct CMUXCLI {
             """
         case "agent":
             return """
-            Usage: bmux agent <attach|layout|capabilities|open|ensure|batch|focus|close|surface-read|terminal|task|events|service> [flags]
+            Usage: bmux agent <attach|layout|capabilities|open|ensure|batch|focus|close|surface-read|terminal|task|events|state|artifact|service|search> [flags]
 
             Compact agent-oriented commands for coding agents such as Codex.
 
@@ -8364,8 +8713,13 @@ struct CMUXCLI {
               task wait --session <session-id> --job <job-id> [--timeout-ms <ms>]
               task result --session <session-id> --job <job-id> [--tail-lines <n>]
               events --session <session-id> [--since <cursor>] [--limit <n>]
+              state summary --session <session-id> [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
+              artifact list --session <session-id> [--job <job-id>] [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
               service list --session <session-id> [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
-              service wait --session <session-id> --port <port> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>] [--timeout-ms <ms>]
+              service wait --session <session-id> --port <port> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>] [--timeout-ms <ms>] [--url-path </health>] [--expect-text <text>]
+              search status --session <session-id> [--cwd <path>]
+              search index --session <session-id> [--cwd <path>]
+              search query --session <session-id> [--limit <n>] [--cwd <path>] [--query <text> | <text>]
 
             Notes:
               - `attach` creates a lightweight bmux agent session and returns focused context.
@@ -8378,7 +8732,11 @@ struct CMUXCLI {
               - `terminal` wraps low-token terminal input/capture/wait primitives.
               - `task` runs managed shell commands or named profiles in bmux terminals and returns compact status.
               - `events` streams cursor-based task and service events.
+              - `state summary` returns the minimal server-side memory Codex needs to resume work cheaply.
+              - `artifact list` returns compact metadata for job logs and other saved artifacts.
               - `service list|wait` exposes listening-port state without parsing boot logs.
+              - `service wait` can optionally probe HTTP readiness with `--url-path` and `--expect-text`.
+              - `search` is a local-first compact repo search path; it uses lexical retrieval and explicit fallback modes.
             """
         case "browser":
             return """
@@ -8391,6 +8749,11 @@ struct CMUXCLI {
             Subcommands:
               open|open-split|new [url] [--workspace <id|ref|index>] [--window <id|ref|index>]
                 open/open-split/new default to $CMUX_WORKSPACE_ID when --workspace is omitted and --window is not set
+              agent observe [--session <id>] [--scope interactive|content] [--limit <n>] [--selector <css>]
+              agent read [--session <id>] [--fields text,value,visible,enabled,checked,box,styles,title,url] [--selector <css>|--ref <eN>]
+              agent logs [--session <id>] [--kind console|errors] [--cursor <n>] [--limit <n>]
+              agent artifact [--session <id>] [--kind screenshot]
+              agent act <click|dblclick|hover|focus|fill|type|press|select|check|uncheck|scroll-into-view> [...]
               goto|navigate <url> [--snapshot-after]
               back|forward|reload [--snapshot-after]
               url|get-url
@@ -14450,7 +14813,7 @@ struct CMUXCLI {
           claude-teams [claude-args...]
           omo [opencode-args...]
           codex <install-hooks|uninstall-hooks>
-          agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task|events|service>
+          agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task|events|state|artifact|service>
           ping
           version
           capabilities
