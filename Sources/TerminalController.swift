@@ -7571,7 +7571,6 @@ class TerminalController {
             return "bun"
         }
 
-        let rootURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
         let fileManager = FileManager.default
 
         let candidates: [(String, String)] = [
@@ -7584,13 +7583,13 @@ class TerminalController {
         ]
 
         for (filename, manager) in candidates {
-            let candidate = rootURL.appendingPathComponent(filename).path
+            let candidate = (repoRoot as NSString).appendingPathComponent(filename)
             if fileManager.fileExists(atPath: candidate) {
                 return manager
             }
         }
 
-        let packageJSON = rootURL.appendingPathComponent("package.json").path
+        let packageJSON = (repoRoot as NSString).appendingPathComponent("package.json")
         if fileManager.fileExists(atPath: packageJSON) {
             return "bun"
         }
@@ -7598,24 +7597,31 @@ class TerminalController {
         return nil
     }
 
-    private func v2AgentRepositoryRoot(startingAt directory: String?) -> String? {
+    private func v2AgentNormalizedDirectoryPath(_ directory: String?) -> String? {
         guard let directory else { return nil }
+        let trimmed = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let standardized = (expanded as NSString).standardizingPath
+        guard !standardized.isEmpty else { return nil }
+        return standardized
+    }
 
-        let normalized = URL(fileURLWithPath: directory).standardizedFileURL.path
+    private func v2AgentRepositoryRoot(startingAt directory: String?) -> String? {
+        guard var currentPath = v2AgentNormalizedDirectoryPath(directory) else { return nil }
         let fileManager = FileManager.default
-        var currentURL = URL(fileURLWithPath: normalized, isDirectory: true)
 
         while true {
-            let gitURL = currentURL.appendingPathComponent(".git")
-            if fileManager.fileExists(atPath: gitURL.path) {
-                return currentURL.path
+            let gitPath = (currentPath as NSString).appendingPathComponent(".git")
+            if fileManager.fileExists(atPath: gitPath) {
+                return currentPath
             }
 
-            let parentURL = currentURL.deletingLastPathComponent()
-            if parentURL.path == currentURL.path {
+            let parentPath = (currentPath as NSString).deletingLastPathComponent
+            if parentPath.isEmpty || parentPath == currentPath {
                 break
             }
-            currentURL = parentURL
+            currentPath = parentPath
         }
 
         return nil
