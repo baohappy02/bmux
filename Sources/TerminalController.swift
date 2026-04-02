@@ -356,6 +356,7 @@ class TerminalController {
     private var v2AgentSearchIndexByRepo: [String: AgentSearchIndexState] = [:]
     private var v2AgentRecordedArtifacts: [AgentRecordedArtifact] = []
     private var v2AgentAvailableToolsCache: [String]?
+    private let v2AgentStateLock = NSRecursiveLock()
 
     private init() {
         browserDownloadObserver = NotificationCenter.default.addObserver(
@@ -372,6 +373,12 @@ class TerminalController {
                 self.v2BrowserDownloadEventsBySurface[surfaceId] = queue
             }
         }
+    }
+
+    private func withV2AgentState<T>(_ body: () -> T) -> T {
+        v2AgentStateLock.lock()
+        defer { v2AgentStateLock.unlock() }
+        return body()
     }
 
     private nonisolated func withListenerState<T>(_ body: () -> T) -> T {
@@ -2179,6 +2186,11 @@ class TerminalController {
             return v2Error(id: id, code: "invalid_request", message: "Missing method")
         }
 
+#if DEBUG
+        if method.hasPrefix("agent.") || method.hasPrefix("browser.") {
+            dlog("v2.request method=\(method) paramsKeys=\(params.keys.sorted().joined(separator: ","))")
+        }
+#endif
         v2MainSync { self.v2RefreshKnownRefs() }
 
 
@@ -3173,8 +3185,11 @@ class TerminalController {
             return .err(code: "not_found", message: "Workspace not found", data: nil)
         }
 
-        let sessionId = "ag_\(v2AgentNextSessionOrdinal)"
-        v2AgentNextSessionOrdinal += 1
+        let sessionId = withV2AgentState { () -> String in
+            let next = "ag_\(v2AgentNextSessionOrdinal)"
+            v2AgentNextSessionOrdinal += 1
+            return next
+        }
 
         let layout = v2AgentLayoutSnapshot(for: context)
         let now = Date()
@@ -3189,7 +3204,9 @@ class TerminalController {
             layoutRev: 1,
             layoutSignature: layout.signature
         )
-        v2AgentSessions[sessionId] = session
+        withV2AgentState {
+            v2AgentSessions[sessionId] = session
+        }
 
         return .ok(v2AgentAttachPayload(session: session, context: context))
     }
@@ -3198,7 +3215,7 @@ class TerminalController {
         guard let sessionId = v2String(params, "session_id") else {
             return .err(code: "invalid_params", message: "Missing session_id", data: nil)
         }
-        guard let session = v2AgentSessions[sessionId] else {
+        guard let session = withV2AgentState({ v2AgentSessions[sessionId] }) else {
             return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
         }
         guard let context = v2AgentResolveContext(params: params, session: session) else {
@@ -3211,7 +3228,9 @@ class TerminalController {
             context: context,
             layoutSignature: layout.signature
         )
-        v2AgentSessions[sessionId] = updatedSession
+        withV2AgentState {
+            v2AgentSessions[sessionId] = updatedSession
+        }
 
         var payload = layout.payload
         payload["session_id"] = sessionId
@@ -3220,19 +3239,39 @@ class TerminalController {
     }
 
     private func v2AgentCapabilities(params: [String: Any]) -> V2CallResult {
-        let session = v2String(params, "session_id").flatMap { v2AgentSessions[$0] }
+        let session = v2String(params, "session_id").flatMap { sessionId in
+            withV2AgentState { v2AgentSessions[sessionId] }
+        }
+#if DEBUG
+        dlog("agent.capabilities.start session=\(session?.id ?? "nil")")
+#endif
         guard let context = v2AgentResolveContext(params: params, session: session) else {
             return .err(code: "not_found", message: "Workspace not found", data: nil)
         }
+#if DEBUG
+        dlog("agent.capabilities.after_context workspace=\(context.workspace.id.uuidString.prefix(5)) surface=\(context.surfaceId?.uuidString.prefix(5) ?? "nil")")
+#endif
 
-        let workingDirectory = v2AgentEffectiveDirectory(context: context)
+        let workingDirectory = v2AgentWorkspaceDirectory(context: context)
+#if DEBUG
+        dlog("agent.capabilities.after_cwd cwd=\(workingDirectory ?? "nil")")
+#endif
         let packageManager = v2AgentInferredPackageManager(startingAt: workingDirectory)
+#if DEBUG
+        dlog("agent.capabilities.after_package_manager manager=\(packageManager ?? "nil")")
+#endif
         let environment = v2AgentEnvironmentPayload(
             context: context,
             inferredPackageManager: packageManager
         )
+#if DEBUG
+        dlog("agent.capabilities.after_environment repo=\((environment["repo_root"] as? String) ?? "nil") cwd=\((environment["cwd"] as? String) ?? "nil")")
+#endif
         let preferences = v2AgentUserPreferences(inferredPackageManager: packageManager)
 
+#if DEBUG
+        dlog("agent.capabilities cwd=\(workingDirectory ?? "nil") repo=\((environment["repo_root"] as? String) ?? "nil")")
+#endif
         return .ok([
             "backend_kind": v2AgentBackendKind(surfaceId: context.surfaceId, workspace: context.workspace),
             "capabilities": v2AgentCapabilityFlags(),
@@ -4871,13 +4910,16 @@ class TerminalController {
         guard let sessionId = v2String(params, "session_id") else {
             return .err(code: "invalid_params", message: "Missing session_id", data: nil)
         }
-        guard let session = v2AgentSessions[sessionId] else {
+        guard let session = withV2AgentState({ v2AgentSessions[sessionId] }) else {
             return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
         }
 
         let since = max(0, v2Int(params, "since") ?? v2Int(params, "cursor") ?? 0)
         let limit = min(max(1, v2Int(params, "limit") ?? 50), 200)
-        let events = v2AgentEventLog
+        let eventLogSnapshot = withV2AgentState {
+            v2AgentEventLog
+        }
+        let events = eventLogSnapshot
             .filter { event in
                 guard event.seq > since else { return false }
                 if event.sessionId == session.id { return true }
@@ -4901,7 +4943,7 @@ class TerminalController {
         guard let sessionId = v2String(params, "session_id") else {
             return .err(code: "invalid_params", message: "Missing session_id", data: nil)
         }
-        guard let session = v2AgentSessions[sessionId] else {
+        guard let session = withV2AgentState({ v2AgentSessions[sessionId] }) else {
             return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
         }
         guard let context = v2AgentResolveContext(params: params, session: session) else {
@@ -4920,24 +4962,38 @@ class TerminalController {
         guard let sessionId = v2String(params, "session_id") else {
             return .err(code: "invalid_params", message: "Missing session_id", data: nil)
         }
-        guard let session = v2AgentSessions[sessionId] else {
+        guard let session = withV2AgentState({ v2AgentSessions[sessionId] }) else {
             return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
         }
         guard let context = v2AgentResolveContext(params: params, session: session) else {
             return .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
         }
-        let effectiveSession = v2AgentSessions[sessionId] ?? session
+        let effectiveSession = withV2AgentState({ v2AgentSessions[sessionId] }) ?? session
 
-        let workingDirectory = v2AgentEffectiveDirectory(context: context)
+        let workingDirectory = v2AgentWorkspaceDirectory(context: context)
         let packageManager = v2AgentInferredPackageManager(startingAt: workingDirectory)
         let preferences = v2AgentUserPreferences(inferredPackageManager: packageManager)
+        let mainSnapshot = v2MainSync {
+            (
+                activeDevServer: v2AgentActiveDevServer(sessionId: sessionId, workspace: context.workspace),
+                preferredBrowserSurface: v2AgentPreferredBrowserSurfaceRef(session: effectiveSession, context: context)
+            )
+        }
+        let lastFailedJob = v2AgentLastFailedJobSummary(session: effectiveSession, context: context)
 
+#if DEBUG
+        dlog(
+            "agent.state.summary cwd=\(workingDirectory ?? "nil") " +
+            "activeDev=\((mainSnapshot.activeDevServer?["url"] as? String) ?? "nil") " +
+            "failedJob=\((lastFailedJob?["job_id"] as? String) ?? "nil")"
+        )
+#endif
         return .ok([
             "session_id": sessionId,
             "layout_rev": effectiveSession.layoutRev,
-            "active_dev_server": v2OrNull(v2AgentActiveDevServer(sessionId: sessionId, workspace: context.workspace)),
-            "preferred_browser_surface": v2OrNull(v2AgentPreferredBrowserSurfaceRef(session: effectiveSession, context: context)),
-            "last_failed_job": v2OrNull(v2AgentLastFailedJobSummary(session: effectiveSession, context: context)),
+            "active_dev_server": v2OrNull(mainSnapshot.activeDevServer),
+            "preferred_browser_surface": v2OrNull(mainSnapshot.preferredBrowserSurface),
+            "last_failed_job": v2OrNull(lastFailedJob),
             "workspace_fingerprint": v2AgentWorkspaceFingerprint(context: context, inferredPackageManager: packageManager),
             "user_preferences": preferences,
             "recovered": effectiveSession.recoveredAt != nil,
@@ -5131,7 +5187,9 @@ class TerminalController {
         if scan.fileCount == 0 {
             state.status = "degraded"
         }
-        v2AgentSearchIndexByRepo[repoRoot] = state
+        withV2AgentState {
+            v2AgentSearchIndexByRepo[repoRoot] = state
+        }
         v2AgentAppendEvent(
             type: "search.indexed",
             sessionId: resolution.session?.id,
@@ -5239,42 +5297,46 @@ class TerminalController {
         }
 
         func buildContext(_ candidateParams: [String: Any]) -> AgentWorkspaceContext? {
-            guard let tabManager = v2ResolveTabManager(params: candidateParams),
-                  let workspace = v2ResolveWorkspace(params: candidateParams, tabManager: tabManager) else {
+            guard let tabManager = v2ResolveTabManager(params: candidateParams) else {
                 return nil
             }
-
-            let requestedPaneUUID = v2UUID(candidateParams, "pane_id")
-            let requestedPaneId = requestedPaneUUID.flatMap { v2AgentPaneId(for: $0, workspace: workspace) }
-            let requestedSurfaceId = v2UUID(candidateParams, "surface_id")
-            let resolvedSurfaceId: UUID? = {
-                if let requestedSurfaceId, workspace.panels[requestedSurfaceId] != nil {
-                    return requestedSurfaceId
+            return v2MainSync {
+                guard let workspace = v2ResolveWorkspace(params: candidateParams, tabManager: tabManager) else {
+                    return nil
                 }
-                if let requestedPaneId {
-                    if let selectedTab = workspace.bonsplitController.selectedTab(inPane: requestedPaneId),
-                       let panelId = workspace.panelIdFromSurfaceId(selectedTab.id) {
-                        return panelId
-                    }
-                    if let firstTab = workspace.bonsplitController.tabs(inPane: requestedPaneId).first,
-                       let panelId = workspace.panelIdFromSurfaceId(firstTab.id) {
-                        return panelId
-                    }
-                }
-                return workspace.focusedPanelId ?? orderedPanels(in: workspace).first?.id
-            }()
-            let resolvedPaneId = requestedPaneId?.id
-                ?? resolvedSurfaceId.flatMap { workspace.paneId(forPanelId: $0)?.id }
-                ?? workspace.bonsplitController.focusedPaneId?.id
-            let windowId = v2ResolveWindowId(tabManager: tabManager)
 
-            return AgentWorkspaceContext(
-                windowId: windowId,
-                tabManager: tabManager,
-                workspace: workspace,
-                paneId: resolvedPaneId,
-                surfaceId: resolvedSurfaceId
-            )
+                let requestedPaneUUID = v2UUID(candidateParams, "pane_id")
+                let requestedPaneId = requestedPaneUUID.flatMap { v2AgentPaneId(for: $0, workspace: workspace) }
+                let requestedSurfaceId = v2UUID(candidateParams, "surface_id")
+                let resolvedSurfaceId: UUID? = {
+                    if let requestedSurfaceId, workspace.panels[requestedSurfaceId] != nil {
+                        return requestedSurfaceId
+                    }
+                    if let requestedPaneId {
+                        if let selectedTab = workspace.bonsplitController.selectedTab(inPane: requestedPaneId),
+                           let panelId = workspace.panelIdFromSurfaceId(selectedTab.id) {
+                            return panelId
+                        }
+                        if let firstTab = workspace.bonsplitController.tabs(inPane: requestedPaneId).first,
+                           let panelId = workspace.panelIdFromSurfaceId(firstTab.id) {
+                            return panelId
+                        }
+                    }
+                    return workspace.focusedPanelId ?? orderedPanels(in: workspace).first?.id
+                }()
+                let resolvedPaneId = requestedPaneId?.id
+                    ?? resolvedSurfaceId.flatMap { workspace.paneId(forPanelId: $0)?.id }
+                    ?? workspace.bonsplitController.focusedPaneId?.id
+                let windowId = v2ResolveWindowId(tabManager: tabManager)
+
+                return AgentWorkspaceContext(
+                    windowId: windowId,
+                    tabManager: tabManager,
+                    workspace: workspace,
+                    paneId: resolvedPaneId,
+                    surfaceId: resolvedSurfaceId
+                )
+            }
         }
 
         let context: AgentWorkspaceContext? = {
@@ -5302,6 +5364,12 @@ class TerminalController {
             )
         }
         return context
+    }
+
+    private func v2AgentWorkspaceDirectory(context: AgentWorkspaceContext) -> String? {
+        v2MainSync {
+            v2AgentString(context.workspace.currentDirectory)
+        }
     }
 
     private func v2AgentRecordRecoveryIfNeeded(
@@ -5387,7 +5455,9 @@ class TerminalController {
             context: context,
             layoutSignature: layout.signature
         )
-        v2AgentSessions[sessionId] = updatedSession
+        withV2AgentState {
+            v2AgentSessions[sessionId] = updatedSession
+        }
         if updatedSession.layoutRev != session.layoutRev {
             v2AgentAppendEvent(
                 type: "layout.changed",
@@ -5521,15 +5591,17 @@ class TerminalController {
     }
 
     private func v2AgentEffectiveDirectory(context: AgentWorkspaceContext) -> String? {
-        if let surfaceId = context.surfaceId {
-            if let panelDirectory = v2AgentString(context.workspace.panelDirectories[surfaceId]) {
-                return panelDirectory
+        v2MainSync {
+            if let surfaceId = context.surfaceId {
+                if let panelDirectory = v2AgentString(context.workspace.panelDirectories[surfaceId]) {
+                    return panelDirectory
+                }
+                if let requested = v2AgentString(context.workspace.terminalPanel(for: surfaceId)?.requestedWorkingDirectory) {
+                    return requested
+                }
             }
-            if let requested = v2AgentString(context.workspace.terminalPanel(for: surfaceId)?.requestedWorkingDirectory) {
-                return requested
-            }
+            return v2AgentString(context.workspace.currentDirectory)
         }
-        return v2AgentString(context.workspace.currentDirectory)
     }
 
     private func v2AgentFocusedTitle(context: AgentWorkspaceContext) -> String {
@@ -5614,7 +5686,9 @@ class TerminalController {
     }
 
     private func v2AgentCurrentEventCursor() -> Int {
-        max(0, v2AgentNextEventOrdinal - 1)
+        withV2AgentState {
+            max(0, v2AgentNextEventOrdinal - 1)
+        }
     }
 
     private func v2AgentAppendEvent(
@@ -5624,19 +5698,21 @@ class TerminalController {
         surfaceId: UUID? = nil,
         payload: [String: Any] = [:]
     ) {
-        let event = AgentEvent(
-            seq: v2AgentNextEventOrdinal,
-            createdAt: Date(),
-            type: type,
-            sessionId: sessionId,
-            workspaceId: workspaceId,
-            surfaceId: surfaceId,
-            payload: payload
-        )
-        v2AgentNextEventOrdinal += 1
-        v2AgentEventLog.append(event)
-        if v2AgentEventLog.count > 500 {
-            v2AgentEventLog.removeFirst(v2AgentEventLog.count - 500)
+        withV2AgentState {
+            let event = AgentEvent(
+                seq: v2AgentNextEventOrdinal,
+                createdAt: Date(),
+                type: type,
+                sessionId: sessionId,
+                workspaceId: workspaceId,
+                surfaceId: surfaceId,
+                payload: payload
+            )
+            v2AgentNextEventOrdinal += 1
+            v2AgentEventLog.append(event)
+            if v2AgentEventLog.count > 500 {
+                v2AgentEventLog.removeFirst(v2AgentEventLog.count - 500)
+            }
         }
 #if DEBUG
         let payloadKeys = payload.keys.sorted().joined(separator: ",")
@@ -5739,7 +5815,9 @@ class TerminalController {
         workspaceId: UUID,
         surfaceId: UUID?
     ) -> AgentTask? {
-        let matchingTasks = v2AgentTasks.values.filter { task in
+        let matchingTasks = withV2AgentState {
+            Array(v2AgentTasks.values)
+        }.filter { task in
             guard task.sessionId == sessionId, task.workspaceId == workspaceId else {
                 return false
             }
@@ -5760,7 +5838,9 @@ class TerminalController {
         sessionId: String,
         workspaceId: UUID
     ) -> AgentTask? {
-        v2AgentTasks.values
+        withV2AgentState {
+            Array(v2AgentTasks.values)
+        }
             .filter { task in
                 task.sessionId == sessionId &&
                     task.workspaceId == workspaceId &&
@@ -5775,14 +5855,17 @@ class TerminalController {
         workspace: Workspace
     ) -> [String: Any]? {
         let services = v2AgentServicesPayload(workspace: workspace, sessionId: sessionId)
+        let tasksById = withV2AgentState {
+            v2AgentTasks
+        }
         if let preferredService = services.sorted(by: { lhs, rhs in
             let lhsReady = (lhs["ready"] as? Bool) ?? false
             let rhsReady = (rhs["ready"] as? Bool) ?? false
             if lhsReady != rhsReady {
                 return lhsReady && !rhsReady
             }
-            let lhsTask = (lhs["job_id"] as? String).flatMap { v2AgentTasks[$0] }
-            let rhsTask = (rhs["job_id"] as? String).flatMap { v2AgentTasks[$0] }
+            let lhsTask = (lhs["job_id"] as? String).flatMap { tasksById[$0] }
+            let rhsTask = (rhs["job_id"] as? String).flatMap { tasksById[$0] }
             return (lhsTask?.updatedAt ?? .distantPast) > (rhsTask?.updatedAt ?? .distantPast)
         }).first {
             return [
@@ -5799,42 +5882,51 @@ class TerminalController {
         session: AgentSession,
         context: AgentWorkspaceContext
     ) -> String? {
-        let workspace = context.workspace
-        let candidateSurfaceIds: [UUID?] = [
-            session.surfaceId,
-            context.surfaceId,
-            workspace.focusedPanelId,
-            orderedPanels(in: workspace).first(where: { $0.panelType == .browser })?.id
-        ]
+        v2MainSync {
+            let workspace = context.workspace
+            let candidateSurfaceIds: [UUID?] = [
+                session.surfaceId,
+                context.surfaceId,
+                workspace.focusedPanelId,
+                orderedPanels(in: workspace).first(where: { $0.panelType == .browser })?.id
+            ]
 
-        for candidate in candidateSurfaceIds {
-            guard let candidate,
-                  workspace.browserPanel(for: candidate) != nil,
-                  let surfaceRef = v2Ref(kind: .surface, uuid: candidate) as? String else {
-                continue
+            for candidate in candidateSurfaceIds {
+                guard let candidate,
+                      workspace.browserPanel(for: candidate) != nil,
+                      let surfaceRef = v2Ref(kind: .surface, uuid: candidate) as? String else {
+                    continue
+                }
+                return surfaceRef
             }
-            return surfaceRef
+            return nil
         }
-        return nil
     }
 
     private func v2AgentWorkspaceFingerprint(
         context: AgentWorkspaceContext,
         inferredPackageManager: String?
     ) -> String {
-        let workingDirectory = v2AgentEffectiveDirectory(context: context)
+        let workingDirectory = v2AgentWorkspaceDirectory(context: context)
         let repoRoot = v2AgentRepositoryRoot(startingAt: workingDirectory)
+        let availableTools = repoRoot == nil ? [] : v2AgentAvailableTools()
         let profiles = v2AgentAvailableProfiles(
             repoRoot: repoRoot,
-            availableTools: v2AgentAvailableTools()
+            availableTools: availableTools
         )
+        let workspaceSnapshot = v2MainSync {
+            (
+                listeningPorts: context.workspace.listeningPorts.sorted(),
+                surfaceCount: context.workspace.panels.count
+            )
+        }
         let fingerprintPayload: [String: Any] = [
             "repo_root": v2OrNull(repoRoot),
             "cwd": v2OrNull(workingDirectory),
             "package_manager": v2OrNull(inferredPackageManager),
             "profiles": profiles,
-            "listening_ports": context.workspace.listeningPorts.sorted(),
-            "surface_count": context.workspace.panels.count
+            "listening_ports": workspaceSnapshot.listeningPorts,
+            "surface_count": workspaceSnapshot.surfaceCount
         ]
         return "ws:" + v2AgentShortHash(fingerprintPayload)
     }
@@ -5862,14 +5954,18 @@ class TerminalController {
         var summary = "command failed"
         var logPath: String?
         if let taskTarget = v2AgentTaskTerminalTarget(task: task, session: session) {
-            let loaded = v2AgentLoadTaskLog(task: task, terminalPanel: taskTarget.terminalPanel)
-            logPath = loaded.path
-            let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: loaded.text)
+            let captured = v2AgentReadTerminalText(
+                terminalPanel: taskTarget.terminalPanel,
+                includeScrollback: true,
+                lineLimit: 400
+            ) ?? ""
+            logPath = v2AgentTaskLogPath(taskId: task.id)
+            let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: captured)
             if let derivedSummary = failurePayload["summary"] as? String, !derivedSummary.isEmpty {
                 summary = derivedSummary
             }
         } else if let existingLogPath = v2AgentTaskLogPath(taskId: task.id),
-                  let text = try? String(contentsOfFile: existingLogPath, encoding: .utf8) {
+                  let text = v2AgentReadFileTail(path: existingLogPath, maxBytes: 64 * 1024) {
             logPath = existingLogPath
             let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: text)
             if let derivedSummary = failurePayload["summary"] as? String, !derivedSummary.isEmpty {
@@ -5891,7 +5987,10 @@ class TerminalController {
         context: AgentWorkspaceContext,
         jobId: String?
     ) -> [[String: Any]] {
-        let candidateTasks = v2AgentTasks.values
+        let taskSnapshot = withV2AgentState {
+            Array(v2AgentTasks.values)
+        }
+        let candidateTasks = taskSnapshot
             .filter { task in
                 guard task.sessionId == session.id,
                       task.workspaceId == context.workspace.id else {
@@ -5946,7 +6045,10 @@ class TerminalController {
             ])
         }
 
-        let recordedArtifacts = v2AgentRecordedArtifacts
+        let recordedArtifactSnapshot = withV2AgentState {
+            v2AgentRecordedArtifacts
+        }
+        let recordedArtifacts = recordedArtifactSnapshot
             .filter { artifact in
                 let matchesScope =
                     artifact.workspaceId == context.workspace.id ||
@@ -6392,6 +6494,25 @@ class TerminalController {
         do {
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
             return directoryURL.appendingPathComponent("\(sanitizedId).log").path
+        } catch {
+            return nil
+        }
+    }
+
+    private func v2AgentReadFileTail(path: String, maxBytes: Int) -> String? {
+        guard maxBytes > 0,
+              let handle = FileHandle(forReadingAtPath: path) else {
+            return nil
+        }
+        defer { try? handle.close() }
+
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: path)
+            let fileSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+            let offset = max(0, fileSize - maxBytes)
+            try handle.seek(toOffset: UInt64(offset))
+            let data = try handle.readToEnd() ?? Data()
+            return String(data: data, encoding: .utf8)
         } catch {
             return nil
         }
@@ -7345,15 +7466,17 @@ class TerminalController {
         context: AgentWorkspaceContext,
         inferredPackageManager: String?
     ) -> [String: Any] {
-        let cwd = v2AgentEffectiveDirectory(context: context)
+        let cwd = v2AgentWorkspaceDirectory(context: context)
         let repoRoot = v2AgentRepositoryRoot(startingAt: cwd)
-        let availableTools = v2AgentAvailableTools()
+        let availableTools = repoRoot == nil ? [] : v2AgentAvailableTools()
         let parserNames = v2AgentAvailableParsers(from: availableTools)
         let profileNames = v2AgentAvailableProfiles(
             repoRoot: repoRoot,
             availableTools: availableTools
         )
-        let searchState = repoRoot.flatMap { v2AgentSearchIndexByRepo[$0] }
+        let searchState = repoRoot.flatMap { repoRoot in
+            withV2AgentState { v2AgentSearchIndexByRepo[repoRoot] }
+        }
 
         var payload: [String: Any] = [
             "repo_root": v2OrNull(repoRoot),
@@ -7366,14 +7489,14 @@ class TerminalController {
             "search_index_ready": (searchState?.status == "warm"),
             "search_status": searchState?.status ?? (repoRoot == nil ? "missing" : "missing")
         ]
-        if let repoRoot {
-            payload["cwd"] = repoRoot
+        if let cwd {
+            payload["cwd"] = cwd
         }
         return payload
     }
 
     private func v2AgentAvailableTools() -> [String] {
-        if let cached = v2AgentAvailableToolsCache {
+        if let cached = withV2AgentState({ v2AgentAvailableToolsCache }) {
             return cached
         }
 
@@ -7388,7 +7511,9 @@ class TerminalController {
         ]
 
         let detected = candidates.filter { v2AgentResolvedCommandPath($0) != nil }
-        v2AgentAvailableToolsCache = detected
+        withV2AgentState {
+            v2AgentAvailableToolsCache = detected
+        }
         return detected
     }
 
@@ -7443,7 +7568,7 @@ class TerminalController {
 
     private func v2AgentInferredPackageManager(startingAt directory: String?) -> String? {
         guard let repoRoot = v2AgentRepositoryRoot(startingAt: directory) else {
-            return v2AgentResolvedCommandPath("bun") != nil ? "bun" : nil
+            return "bun"
         }
 
         let rootURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
@@ -7467,12 +7592,7 @@ class TerminalController {
 
         let packageJSON = rootURL.appendingPathComponent("package.json").path
         if fileManager.fileExists(atPath: packageJSON) {
-            if v2AgentResolvedCommandPath("bun") != nil {
-                return "bun"
-            }
-            if v2AgentResolvedCommandPath("npm") != nil {
-                return "npm"
-            }
+            return "bun"
         }
 
         return nil
@@ -7506,14 +7626,18 @@ class TerminalController {
 
         let fileManager = FileManager.default
         let environment = ProcessInfo.processInfo.environment
+        let homeDirectory = fileManager.homeDirectoryForCurrentUser.path
+        let allowedPrefixes = [homeDirectory, "/opt", "/usr", "/bin", "/sbin"]
         var searchDirectories: [String] = []
         var seenDirectories = Set<String>()
 
         func appendSearchPath(_ path: String?) {
             guard let path else { return }
-            for rawComponent in path.split(separator: ":") {
+            for rawComponent in path.split(separator: ":").prefix(24) {
                 let component = String(rawComponent).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !component.isEmpty,
+                      component.hasPrefix("/"),
+                      allowedPrefixes.contains(where: { component.hasPrefix($0) }),
                       seenDirectories.insert(component).inserted else {
                     continue
                 }
@@ -7521,9 +7645,17 @@ class TerminalController {
             }
         }
 
+        appendSearchPath([
+            homeDirectory + "/.bun/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ].joined(separator: ":"))
         appendSearchPath(environment["PATH"])
         appendSearchPath(getenv("PATH").map { String(cString: $0) })
-        appendSearchPath("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
 
         for directory in searchDirectories {
             let candidate = URL(fileURLWithPath: directory, isDirectory: true)
@@ -7540,12 +7672,14 @@ class TerminalController {
     private func v2AgentSearchResolution(
         params: [String: Any]
     ) -> (session: AgentSession?, repoRoot: String?) {
-        let session = v2String(params, "session_id").flatMap { v2AgentSessions[$0] }
+        let session = v2String(params, "session_id").flatMap { sessionId in
+            withV2AgentState { v2AgentSessions[sessionId] }
+        }
         let cwd = v2String(params, "cwd")
             ?? v2String(params, "repo_root")
             ?? session.flatMap { session in
                 v2AgentResolveContext(params: params, session: session).flatMap { context in
-                    v2AgentEffectiveDirectory(context: context)
+                    v2AgentWorkspaceDirectory(context: context)
                 }
             }
         return (session, v2AgentRepositoryRoot(startingAt: cwd))
@@ -7568,7 +7702,7 @@ class TerminalController {
 
     private func v2AgentEffectiveSearchState(repoRoot: String) -> AgentSearchIndexState {
         let currentFingerprint = v2AgentSearchSourceFingerprint(repoRoot: repoRoot)
-        guard var state = v2AgentSearchIndexByRepo[repoRoot] else {
+        guard var state = withV2AgentState({ v2AgentSearchIndexByRepo[repoRoot] }) else {
             return AgentSearchIndexState(
                 repoRoot: repoRoot,
                 status: "missing",

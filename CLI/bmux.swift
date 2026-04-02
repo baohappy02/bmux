@@ -844,6 +844,7 @@ final class SocketClient {
     private var socketFD: Int32 = -1
     private static let defaultResponseTimeoutSeconds: TimeInterval = 15.0
     private static let multilineResponseIdleTimeoutSeconds: TimeInterval = 0.12
+    private static let defaultV2ResponseMaxBytes = 256 * 1024
     private static let responseTimeoutSeconds: TimeInterval = {
         let env = ProcessInfo.processInfo.environment
         if let raw = env["CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC"],
@@ -874,7 +875,11 @@ final class SocketClient {
         }
     }
 
-    func send(command: String) throws -> String {
+    func send(
+        command: String,
+        stopAfterFirstLine: Bool = false,
+        maxResponseBytes: Int? = nil
+    ) throws -> String {
         guard socketFD >= 0 else { throw CLIError(message: "Not connected") }
         let payload = command + "\n"
         try payload.withCString { ptr in
@@ -910,8 +915,20 @@ final class SocketClient {
                 break
             }
             data.append(buffer, count: count)
-            if data.contains(UInt8(0x0A)) {
+            if let maxResponseBytes,
+               data.count > maxResponseBytes {
+                throw CLIError(message: "Response exceeded \(maxResponseBytes) bytes")
+            }
+            if buffer[0..<count].contains(UInt8(0x0A)) {
                 sawNewline = true
+                if stopAfterFirstLine,
+                   let newlineIndex = data.firstIndex(of: UInt8(0x0A)) {
+                    let lineData = data.prefix(upTo: newlineIndex)
+                    guard let response = String(data: lineData, encoding: .utf8) else {
+                        throw CLIError(message: "Invalid UTF-8 response")
+                    }
+                    return response
+                }
             }
         }
 
@@ -1122,7 +1139,11 @@ final class SocketClient {
             throw CLIError(message: "Failed to encode v2 request")
         }
 
-        let raw = try send(command: requestLine)
+        let raw = try send(
+            command: requestLine,
+            stopAfterFirstLine: true,
+            maxResponseBytes: Self.defaultV2ResponseMaxBytes
+        )
 
         // The server may return plain-text errors (e.g., "ERROR: Access denied ...")
         // before the JSON protocol starts. Surface these directly instead of letting

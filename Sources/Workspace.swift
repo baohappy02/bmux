@@ -6443,6 +6443,11 @@ final class Workspace: Identifiable, ObservableObject {
         return !trimmed.isEmpty
     }
 
+    private var prefersDirectoryAutomaticTitle: Bool {
+        guard customTitle == nil, focusedTerminalPanel != nil else { return false }
+        return !currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func automaticTitleFallback() -> String {
         let trimmedProcessTitle = processTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedProcessTitle.isEmpty {
@@ -6468,11 +6473,17 @@ final class Workspace: Identifiable, ObservableObject {
     }
 
     func applyProcessTitle(_ title: String) {
-        let didChange = processTitle != title || (customTitle == nil && self.title != title)
+        let didProcessTitleChange = processTitle != title
         processTitle = title
         guard customTitle == nil else { return }
-        self.title = title
-        if didChange {
+        let didVisibleTitleChange: Bool
+        if prefersDirectoryAutomaticTitle {
+            didVisibleTitleChange = false
+        } else {
+            didVisibleTitleChange = self.title != title
+            self.title = title
+        }
+        if didProcessTitleChange || didVisibleTitleChange {
             owningTabManager?.workspaceAutomaticTitleStateDidChange(workspaceId: id)
         }
     }
@@ -6720,7 +6731,7 @@ final class Workspace: Identifiable, ObservableObject {
 
         // If this is the only panel and no custom title, update workspace title
         if panels.count == 1, customTitle == nil {
-            if self.title != trimmed {
+            if !prefersDirectoryAutomaticTitle, self.title != trimmed {
                 self.title = trimmed
                 didMutate = true
             }

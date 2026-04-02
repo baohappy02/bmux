@@ -688,6 +688,7 @@ class TabManager: ObservableObject {
     /// The window that owns this TabManager. Set by AppDelegate.registerMainWindow().
     /// Used to apply title updates to the correct window instead of NSApp.keyWindow.
     weak var window: NSWindow?
+    private var automaticWorkspaceTitleInputStateByWorkspaceId: [UUID: AutomaticWorkspaceTitleInputState] = [:]
 
     @Published var tabs: [Workspace] = [] {
         didSet {
@@ -2412,6 +2413,11 @@ class TabManager: ObservableObject {
         }
     }
 
+    private enum AutomaticWorkspaceTitleInputState: Equatable {
+        case automatic(pathKey: String, fallbackTitle: String)
+        case custom(title: String)
+    }
+
     private func automaticWorkspaceTitlePathComponents(from rawValue: String) -> [String] {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
@@ -2477,6 +2483,19 @@ class TabManager: ObservableObject {
             }
         }
         return seed.fallbackTitle
+    }
+
+    private func automaticWorkspaceTitleInputState(for workspace: Workspace) -> AutomaticWorkspaceTitleInputState {
+        if workspace.hasCustomTitle {
+            let trimmedTitle = workspace.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return .custom(title: trimmedTitle)
+        }
+
+        let seed = automaticWorkspaceTitleSeed(for: workspace)
+        return .automatic(
+            pathKey: seed.pathComponents.joined(separator: "/"),
+            fallbackTitle: seed.fallbackTitle
+        )
     }
 
     private func reconcileAutomaticWorkspaceTitles() {
@@ -2589,6 +2608,12 @@ class TabManager: ObservableObject {
                 ?? seed.baseTitle
             _ = seed.workspace.applyResolvedAutomaticTitle(resolvedTitle)
         }
+
+        automaticWorkspaceTitleInputStateByWorkspaceId = Dictionary(
+            uniqueKeysWithValues: tabs.map { workspace in
+                (workspace.id, automaticWorkspaceTitleInputState(for: workspace))
+            }
+        )
     }
 
     private func newTabInsertIndex(placementOverride: NewWorkspacePlacement? = nil) -> Int {
@@ -3614,8 +3639,12 @@ class TabManager: ObservableObject {
     }
 
     func workspaceAutomaticTitleStateDidChange(workspaceId: UUID) {
-        guard tabs.contains(where: { $0.id == workspaceId }) else { return }
-        reconcileAutomaticWorkspaceTitles()
+        guard let workspace = tabs.first(where: { $0.id == workspaceId }) else { return }
+        let nextInputState = automaticWorkspaceTitleInputState(for: workspace)
+        let previousInputState = automaticWorkspaceTitleInputStateByWorkspaceId[workspaceId]
+        if previousInputState != nextInputState {
+            reconcileAutomaticWorkspaceTitles()
+        }
         if selectedTabId == workspaceId {
             updateWindowTitleForSelectedTab()
         }
