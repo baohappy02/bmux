@@ -5472,7 +5472,12 @@ final class Workspace: Identifiable, ObservableObject {
     @Published var customTitle: String?
     @Published var isPinned: Bool = false
     @Published var customColor: String?  // hex string, e.g. "#C0392B"
-    @Published var currentDirectory: String
+    @Published var currentDirectory: String {
+        didSet {
+            guard currentDirectory != oldValue else { return }
+            owningTabManager?.workspaceAutomaticTitleStateDidChange(workspaceId: id)
+        }
+    }
     private(set) var preferredBrowserProfileID: UUID?
 
     /// Ordinal for CMUX_PORT range assignment (monotonically increasing per app session)
@@ -5804,9 +5809,10 @@ final class Workspace: Identifiable, ObservableObject {
 
         let trimmedWorkingDirectory = workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let hasWorkingDirectory = !trimmedWorkingDirectory.isEmpty
-        self.currentDirectory = hasWorkingDirectory
+        let resolvedWorkingDirectory = hasWorkingDirectory
             ? trimmedWorkingDirectory
             : bmuxDefaultWorkingDirectoryPath()
+        self.currentDirectory = resolvedWorkingDirectory
 
         // Configure bonsplit with keepAllAlive to preserve terminal state
         // and keep split entry instantaneous.
@@ -5838,7 +5844,7 @@ final class Workspace: Identifiable, ObservableObject {
             workspaceId: id,
             context: GHOSTTY_SURFACE_CONTEXT_TAB,
             configTemplate: configTemplate,
-            workingDirectory: hasWorkingDirectory ? trimmedWorkingDirectory : nil,
+            workingDirectory: resolvedWorkingDirectory,
             portOrdinal: portOrdinal,
             initialCommand: initialTerminalCommand,
             initialEnvironmentOverrides: initialTerminalEnvironment
@@ -6437,10 +6443,38 @@ final class Workspace: Identifiable, ObservableObject {
         return !trimmed.isEmpty
     }
 
+    func automaticTitleFallback() -> String {
+        let trimmedProcessTitle = processTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedProcessTitle.isEmpty {
+            return trimmedProcessTitle
+        }
+
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTitle.isEmpty {
+            return trimmedTitle
+        }
+
+        return "Terminal"
+    }
+
+    @discardableResult
+    func applyResolvedAutomaticTitle(_ title: String) -> Bool {
+        guard customTitle == nil else { return false }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolved = trimmed.isEmpty ? automaticTitleFallback() : trimmed
+        guard self.title != resolved else { return false }
+        self.title = resolved
+        return true
+    }
+
     func applyProcessTitle(_ title: String) {
+        let didChange = processTitle != title || (customTitle == nil && self.title != title)
         processTitle = title
         guard customTitle == nil else { return }
         self.title = title
+        if didChange {
+            owningTabManager?.workspaceAutomaticTitleStateDidChange(workspaceId: id)
+        }
     }
 
     func setCustomColor(_ hex: String?) {
@@ -6453,12 +6487,17 @@ final class Workspace: Identifiable, ObservableObject {
 
     func setCustomTitle(_ title: String?) {
         let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let previousCustomTitle = customTitle
+        let previousTitle = self.title
         if trimmed.isEmpty {
             customTitle = nil
             self.title = processTitle
         } else {
             customTitle = trimmed
             self.title = trimmed
+        }
+        if previousCustomTitle != customTitle || previousTitle != self.title {
+            owningTabManager?.workspaceAutomaticTitleStateDidChange(workspaceId: id)
         }
     }
 

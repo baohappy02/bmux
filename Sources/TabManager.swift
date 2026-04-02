@@ -689,7 +689,16 @@ class TabManager: ObservableObject {
     /// Used to apply title updates to the correct window instead of NSApp.keyWindow.
     weak var window: NSWindow?
 
-    @Published var tabs: [Workspace] = []
+    @Published var tabs: [Workspace] = [] {
+        didSet {
+            reconcileAutomaticWorkspaceTitles()
+            guard let selectedTabId,
+                  tabs.contains(where: { $0.id == selectedTabId }) else {
+                return
+            }
+            updateWindowTitleForSelectedTab()
+        }
+    }
     @Published private(set) var isWorkspaceCycleHot: Bool = false
     @Published private(set) var pendingBackgroundWorkspaceLoadIds: Set<UUID> = []
     @Published private(set) var debugPinnedWorkspaceLoadIds: Set<UUID> = []
@@ -1242,7 +1251,7 @@ class TabManager: ObservableObject {
         // entire creation path. Release ARC can otherwise drop retains early across the
         // helper/insertion chain, which reintroduces use-after-free crashes in optimized builds.
         return withExtendedLifetime((capturedTabs, sourceWorkspace)) {
-            let dir = preferredWorkingDirectoryForNewTab(workspace: sourceWorkspace)
+            let dir = bmuxDefaultWorkingDirectoryPath()
             let font = inheritedTerminalFontPointsForNewWorkspace(workspace: sourceWorkspace)
             let snapshot = workspaceCreationSnapshotLite(
                 currentTabs: capturedTabs,
@@ -2378,6 +2387,210 @@ class TabManager: ObservableObject {
         return trimmed.isEmpty ? nil : normalized
     }
 
+    private struct AutomaticWorkspaceTitleSeed {
+        let workspace: Workspace
+        let pathComponents: [String]
+        let fallbackTitle: String
+
+        var baseTitle: String {
+            if let lastComponent = pathComponents.last, !lastComponent.isEmpty {
+                return lastComponent
+            }
+            return fallbackTitle
+        }
+
+        var maxDepth: Int {
+            max(1, pathComponents.count)
+        }
+
+        var sortKey: String {
+            let pathKey = pathComponents.joined(separator: "/")
+            if !pathKey.isEmpty {
+                return pathKey
+            }
+            return fallbackTitle
+        }
+    }
+
+    private func automaticWorkspaceTitlePathComponents(from rawValue: String) -> [String] {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let normalized = normalizeDirectory(trimmed)
+        let expanded = (normalized as NSString).expandingTildeInPath
+        let fileManager = FileManager.default
+        let homeDirectory = fileManager.homeDirectoryForCurrentUser.path
+
+        if expanded == homeDirectory {
+            return [fileManager.homeDirectoryForCurrentUser.lastPathComponent]
+        }
+
+        if expanded.hasPrefix(homeDirectory + "/") {
+            let relativePath = String(expanded.dropFirst(homeDirectory.count + 1))
+            return relativePath
+                .split(separator: "/")
+                .map(String.init)
+                .filter { !$0.isEmpty }
+        }
+
+        if expanded.hasPrefix("/") {
+            return expanded
+                .split(separator: "/")
+                .map(String.init)
+                .filter { !$0.isEmpty }
+        }
+
+        return expanded
+            .split(separator: "/")
+            .map(String.init)
+            .filter { !$0.isEmpty }
+    }
+
+    private func automaticWorkspaceTitleSeed(for workspace: Workspace) -> AutomaticWorkspaceTitleSeed {
+        let fallbackTitle = workspace.automaticTitleFallback()
+        if workspace.focusedTerminalPanel != nil,
+           let directory = normalizedWorkingDirectory(workspace.currentDirectory) {
+            return AutomaticWorkspaceTitleSeed(
+                workspace: workspace,
+                pathComponents: automaticWorkspaceTitlePathComponents(from: directory),
+                fallbackTitle: fallbackTitle
+            )
+        }
+
+        return AutomaticWorkspaceTitleSeed(
+            workspace: workspace,
+            pathComponents: automaticWorkspaceTitlePathComponents(from: fallbackTitle),
+            fallbackTitle: fallbackTitle
+        )
+    }
+
+    private func automaticWorkspaceTitle(
+        for seed: AutomaticWorkspaceTitleSeed,
+        depth: Int
+    ) -> String {
+        if !seed.pathComponents.isEmpty {
+            let clampedDepth = min(max(depth, 1), seed.pathComponents.count)
+            let suffix = seed.pathComponents.suffix(clampedDepth)
+            let joined = suffix.joined(separator: "/")
+            if !joined.isEmpty {
+                return joined
+            }
+        }
+        return seed.fallbackTitle
+    }
+
+    private func reconcileAutomaticWorkspaceTitles() {
+        let automaticSeeds = tabs.compactMap { workspace -> AutomaticWorkspaceTitleSeed? in
+            workspace.hasCustomTitle ? nil : automaticWorkspaceTitleSeed(for: workspace)
+        }
+        guard !automaticSeeds.isEmpty else { return }
+
+        let fixedTitles = Set(
+            tabs.compactMap { workspace -> String? in
+                guard workspace.hasCustomTitle else { return nil }
+                let trimmed = workspace.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        )
+
+        var depthByWorkspaceId = Dictionary(
+            uniqueKeysWithValues: automaticSeeds.map { ($0.workspace.id, 1) }
+        )
+
+        while true {
+            let candidateByWorkspaceId = Dictionary(
+                uniqueKeysWithValues: automaticSeeds.map { seed in
+                    (
+                        seed.workspace.id,
+                        automaticWorkspaceTitle(
+                            for: seed,
+                            depth: depthByWorkspaceId[seed.workspace.id] ?? 1
+                        )
+                    )
+                }
+            )
+
+            let groupedByCandidate = Dictionary(grouping: automaticSeeds) { seed in
+                candidateByWorkspaceId[seed.workspace.id] ?? seed.baseTitle
+            }
+
+            var conflictingWorkspaceIds: Set<UUID> = []
+            for (candidate, seeds) in groupedByCandidate {
+                if seeds.count > 1 || fixedTitles.contains(candidate) {
+                    conflictingWorkspaceIds.formUnion(seeds.map(\.workspace.id))
+                }
+            }
+
+            guard !conflictingWorkspaceIds.isEmpty else { break }
+
+            var didAdvance = false
+            for seed in automaticSeeds where conflictingWorkspaceIds.contains(seed.workspace.id) {
+                let currentDepth = depthByWorkspaceId[seed.workspace.id] ?? 1
+                if currentDepth < seed.maxDepth {
+                    depthByWorkspaceId[seed.workspace.id] = currentDepth + 1
+                    didAdvance = true
+                }
+            }
+
+            if !didAdvance {
+                break
+            }
+        }
+
+        let candidateByWorkspaceId = Dictionary(
+            uniqueKeysWithValues: automaticSeeds.map { seed in
+                (
+                    seed.workspace.id,
+                    automaticWorkspaceTitle(
+                        for: seed,
+                        depth: depthByWorkspaceId[seed.workspace.id] ?? 1
+                    )
+                )
+            }
+        )
+
+        var reservedTitles = fixedTitles
+        var resolvedTitlesByWorkspaceId: [UUID: String] = [:]
+        let groupedByCandidate = Dictionary(grouping: automaticSeeds) { seed in
+            candidateByWorkspaceId[seed.workspace.id] ?? seed.baseTitle
+        }
+
+        for candidate in groupedByCandidate.keys.sorted() {
+            guard let seeds = groupedByCandidate[candidate] else { continue }
+            let orderedSeeds = seeds.sorted { lhs, rhs in
+                if lhs.sortKey == rhs.sortKey {
+                    return lhs.workspace.id.uuidString < rhs.workspace.id.uuidString
+                }
+                return lhs.sortKey < rhs.sortKey
+            }
+
+            let hasConflict = orderedSeeds.count > 1 || reservedTitles.contains(candidate)
+            if !hasConflict, let seed = orderedSeeds.first {
+                resolvedTitlesByWorkspaceId[seed.workspace.id] = candidate
+                reservedTitles.insert(candidate)
+                continue
+            }
+
+            for (index, seed) in orderedSeeds.enumerated() {
+                var ordinal = index + 1
+                var resolvedTitle = "\(candidate) (\(ordinal))"
+                while reservedTitles.contains(resolvedTitle) {
+                    ordinal += 1
+                    resolvedTitle = "\(candidate) (\(ordinal))"
+                }
+                resolvedTitlesByWorkspaceId[seed.workspace.id] = resolvedTitle
+                reservedTitles.insert(resolvedTitle)
+            }
+        }
+
+        for seed in automaticSeeds {
+            let resolvedTitle = resolvedTitlesByWorkspaceId[seed.workspace.id]
+                ?? candidateByWorkspaceId[seed.workspace.id]
+                ?? seed.baseTitle
+            _ = seed.workspace.applyResolvedAutomaticTitle(resolvedTitle)
+        }
+    }
+
     private func newTabInsertIndex(placementOverride: NewWorkspacePlacement? = nil) -> Int {
         newTabInsertIndex(snapshot: workspaceCreationSnapshot(), placementOverride: placementOverride)
     }
@@ -3357,6 +3570,7 @@ class TabManager: ObservableObject {
         guard let tab = tabs.first(where: { $0.id == tabId }) else { return }
         let didChange = tab.updatePanelTitle(panelId: panelId, title: title)
         guard didChange else { return }
+        workspaceAutomaticTitleStateDidChange(workspaceId: tabId)
 
         // Update window title if this is the selected tab and focused panel
         if selectedTabId == tabId && tab.focusedPanelId == panelId {
@@ -3395,8 +3609,16 @@ class TabManager: ObservableObject {
         if !trimmedTitle.isEmpty {
             return trimmedTitle
         }
-        let trimmedDirectory = tab.currentDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedDirectory.isEmpty ? "bmux" : trimmedDirectory
+        let automaticTitle = automaticWorkspaceTitleSeed(for: tab).baseTitle
+        return automaticTitle.isEmpty ? "bmux" : automaticTitle
+    }
+
+    func workspaceAutomaticTitleStateDidChange(workspaceId: UUID) {
+        guard tabs.contains(where: { $0.id == workspaceId }) else { return }
+        reconcileAutomaticWorkspaceTitles()
+        if selectedTabId == workspaceId {
+            updateWindowTitleForSelectedTab()
+        }
     }
 
     func focusTab(_ tabId: UUID, surfaceId: UUID? = nil, suppressFlash: Bool = false) {
