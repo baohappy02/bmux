@@ -106,7 +106,7 @@ bmux agent artifact list --session ag_123 --job job:3 --json
 bmux agent search --session ag_123 --query "where auth is configured" --json
 bmux agent search status --session ag_123 --json
 bmux agent search index --session ag_123 --scope repo --json
-bmux agent terminal write --session ag_123 --surface surface:9 --text "npm run dev\n" --json
+bmux agent terminal write --session ag_123 --surface surface:9 --text "bun run dev\n" --json
 bmux agent terminal capture --session ag_123 --surface surface:9 --mode delta --json
 bmux browser agent observe --session ag_123 --surface surface:7 --scope interactive --json
 bmux browser agent act --session ag_123 click --ref e12 --json
@@ -157,7 +157,7 @@ The agent should be able to do these cheaply:
 1. discover the current layout
 2. open a terminal split on the right or below
 3. open a browser split on the right or below
-4. run `bun`, `flutter`, `npm`, `pytest`, or other commands in managed job terminals
+4. run `bun`, `flutter`, `pytest`, or other commands in managed job terminals
 5. focus a specific pane or surface
 6. close a surface or pane
 7. read minimal state from the focused surface
@@ -212,6 +212,13 @@ This keeps both prompts and responses small, and it also gives bmux a single sta
 
 Exact or syntax-sensitive lookups still belong to `rg`, GitNexus, or future exact-match agent wrappers.
 `agent.search` is for concept lookup, intent search, and "I know what this does but not what it is named" workflows.
+
+Package-manager and research policy should also be part of the operating contract:
+
+1. prefer `bun` for JavaScript or TypeScript installs, scripts, and one-off executables whenever the environment supports it
+2. only fall back to `npm`, `pnpm`, `yarn`, or `npx` when the repo clearly requires it or Bun is incompatible
+3. check pricing before deeper research on external tools, services, dependencies, or platforms
+4. if pricing shows the intended option is paid, usage-based, or billing-gated, stop and report that before continuing
 
 ## In-App Agent UX
 
@@ -464,6 +471,26 @@ The capability payload should include:
 5. available named profiles
 6. default cwd and title policies for new terminals
 7. whether local semantic search is available, warming, or disabled
+8. persisted user preferences that affect tool choice or research policy
+
+## Preference Memory and Research Gates
+
+The agent should not have to relearn obvious user preferences every turn.
+
+Priority preferences:
+
+1. preferred JavaScript or TypeScript package manager
+2. pricing-first research behavior
+3. whether paid or billing-gated options require explicit approval before deeper work
+
+Rules:
+
+1. preference memory belongs in server-side session state and should be exposed by `agent.capabilities` and `agent.state.summary`
+2. if `bun` is both preferred and supported, examples, profiles, and generated commands should default to `bun`
+3. if the inferred project toolchain conflicts with the preferred package manager, bmux should surface both so Codex can explain the fallback briefly
+4. before Codex does deeper research, setup, or prototyping for an external tool or service, it should check pricing first
+5. if pricing is paid, usage-based, or billing-gated for the intended workflow, Codex should stop and ask before going deeper
+6. if pricing cannot be confirmed quickly, Codex should report that pricing is still unclear before continuing
 
 ## Local-First Semantic Retrieval
 
@@ -671,6 +698,7 @@ Each attached agent session should maintain server-side state:
 23. `capability_snapshot`
 24. `search_index_state`
 25. `search_backend`
+26. `user_preferences`
 
 Rules:
 
@@ -686,7 +714,8 @@ Rules:
 10. `workspace_fingerprint` allows bmux to reuse safe verification results.
 11. `recovery_snapshot` allows attach or re-attach to report whether useful state was recovered.
 12. `search_index_state` keeps track of whether local semantic retrieval is ready, stale, or warming.
-13. Sessions are cheap and disposable; agents should re-attach rather than rebuild state in-context.
+13. `user_preferences` keeps high-signal durable preferences such as preferred package manager and pricing-first research behavior.
+14. Sessions are cheap and disposable; agents should re-attach rather than rebuild state in-context.
 
 ## Response Contracts
 
@@ -774,7 +803,7 @@ This is the key token-saving primitive for split panes. Codex should not need to
 
 ### `capabilities`
 
-`agent.capabilities` should be the one cheap discovery call that replaces shell probing and guesswork.
+`agent.capabilities` should be the one cheap discovery call that replaces shell probing, package-manager guesswork, and forgotten preference restatement.
 
 Example:
 
@@ -795,6 +824,11 @@ Example:
     "default_new_terminal_cwd": "~/Desktop",
     "search_backend": "local_hybrid",
     "search_index_ready": false
+  },
+  "preferences": {
+    "preferred_js_package_manager": "bun",
+    "pricing_first_research": true,
+    "stop_on_paid_option_without_approval": true
   }
 }
 ```
@@ -1225,7 +1259,7 @@ Service state should be compact and actionable:
 
 ### `state.summary`
 
-State summary should give Codex just enough server-side memory to resume work cheaply:
+State summary should give Codex just enough server-side memory to resume work cheaply, including the highest-signal user preferences that change tool choice or research behavior:
 
 ```json
 {
@@ -1238,6 +1272,11 @@ State summary should give Codex just enough server-side memory to resume work ch
   "preferred_browser_surface": "surface:7",
   "last_failed_job": null,
   "workspace_fingerprint": "ws:2b9f8a",
+  "user_preferences": {
+    "preferred_js_package_manager": "bun",
+    "pricing_first_research": true,
+    "stop_on_paid_option_without_approval": true
+  },
   "recovered": true
 }
 ```
@@ -1316,7 +1355,7 @@ Example:
   "surface_id": "surface:9",
   "capture_cursor": 41,
   "rows": [
-    "$ npm run dev",
+    "$ bun run dev",
     "ready - started server on http://localhost:3000"
   ],
   "has_more_before": false
@@ -1624,7 +1663,7 @@ Likely work split:
 Server and model state:
 
 1. add an `AgentSession` model keyed by `session_id`
-2. store `window_id`, `workspace_id`, `pane_id`, `surface_id`, `layout_rev`, event cursor, service registry, artifact registry, workspace fingerprint, and terminal capture cursors
+2. store `window_id`, `workspace_id`, `pane_id`, `surface_id`, `layout_rev`, event cursor, service registry, artifact registry, workspace fingerprint, terminal capture cursors, and user preferences
 3. invalidate or refresh session state on split, close, move, focus changes, job churn, and recovery events
 
 Socket methods:
@@ -1722,6 +1761,7 @@ Agent enablement:
 3. document one standard workflow: run build and typecheck in parallel, return only failures
 4. document one standard workflow: open split, run server, wait for ready text, open browser
 5. document one standard workflow: attach, inspect capabilities, and use `ensure` instead of recreating resources
+6. document one standard workflow: check pricing first for an external tool and stop immediately when the intended option is paid unless the user approves
 
 App integration:
 
@@ -1769,7 +1809,8 @@ Deliverables after the CLI exists:
 5. document app-level defaults such as `Cmd+N -> ~/Desktop` and duplicate-title disambiguation
 6. include one idempotent example using `capabilities`, `ensure`, and `batch`
 7. include one semantic lookup example using `agent.search` before falling back to `rg`
-8. keep legacy CLI docs for humans, but clearly mark `agent.*` as the preferred interface for coding agents
+8. include one example where `bun` is preferred by policy but a fallback package manager is chosen with a brief explanation
+9. keep legacy CLI docs for humans, but clearly mark `agent.*` as the preferred interface for coding agents
 
 ## Open Questions
 
@@ -1787,3 +1828,4 @@ Deliverables after the CLI exists:
 12. How aggressive should redaction be before it starts hiding information that is still useful for debugging?
 13. Which local backend should power `agent.search`: sqlite FTS, a vector index, or a hybrid of both?
 14. Should GitNexus participate as an optional reranker or separate companion path for `agent.search`?
+15. Should user preferences such as package-manager policy and pricing-first research live in bmux app settings, Codex instructions, or both?
