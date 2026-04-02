@@ -4930,6 +4930,259 @@ struct CMUXCLI {
             let kind = (payload["surface_kind"] as? String) ?? "unknown"
             output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText) kind=\(kind)")
 
+        case "terminal":
+            guard let terminalSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "agent terminal requires a subcommand")
+            }
+            let terminalSubcommand = terminalSubcommandRaw.lowercased()
+            let terminalArgs = Array(subArgs.dropFirst())
+
+            switch terminalSubcommand {
+            case "write":
+                let (sessionOptA, rem0) = parseOption(terminalArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+                let (textOpt, remaining) = parseOption(rem4, name: "--text")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent terminal write requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent terminal write: unknown flag '\(unknown)'")
+                }
+                let text = textOpt ?? remaining.joined(separator: " ")
+                guard !text.isEmpty else {
+                    throw CLIError(message: "agent terminal write requires --text <value> or positional text")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId, "text": text]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+
+                let payload = try client.sendV2(method: "agent.terminal.write", params: params)
+                let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText)")
+
+            case "capture":
+                let (sessionOptA, rem0) = parseOption(terminalArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+                let (modeOpt, rem5) = parseOption(rem4, name: "--mode")
+                let (linesOpt, rem6) = parseOption(rem5, name: "--lines")
+                let (scrollbackOpt, remaining) = parseOption(rem6, name: "--scrollback")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent terminal capture requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent terminal capture: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+                if let modeOpt { params["mode"] = modeOpt }
+                if let linesOpt {
+                    guard let lines = Int(linesOpt), lines > 0 else {
+                        throw CLIError(message: "agent terminal capture: --lines must be > 0")
+                    }
+                    params["lines"] = lines
+                }
+                if let scrollbackOpt {
+                    guard let scrollback = parseBoolString(scrollbackOpt) else {
+                        throw CLIError(message: "agent terminal capture: --scrollback must be true|false")
+                    }
+                    params["scrollback"] = scrollback
+                }
+
+                let payload = try client.sendV2(method: "agent.terminal.capture", params: params)
+                let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+                let bytes = intFromAny(payload["bytes"]) ?? 0
+                output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText) bytes=\(bytes)")
+
+            case "wait":
+                let (sessionOptA, rem0) = parseOption(terminalArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+                let (stateOpt, rem5) = parseOption(rem4, name: "--state")
+                let (timeoutMsOpt, remaining) = parseOption(rem5, name: "--timeout-ms")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent terminal wait requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent terminal wait: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+                if let stateOpt { params["state"] = stateOpt }
+                if let timeoutMsOpt {
+                    guard let timeoutMs = Int(timeoutMsOpt), timeoutMs >= 0 else {
+                        throw CLIError(message: "agent terminal wait: --timeout-ms must be >= 0")
+                    }
+                    params["timeout_ms"] = timeoutMs
+                }
+
+                let payload = try client.sendV2(method: "agent.terminal.wait", params: params)
+                let state = (payload["state"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) state=\(state)")
+
+            default:
+                throw CLIError(message: "Unsupported agent terminal subcommand: \(terminalSubcommand)")
+            }
+
+        case "task":
+            guard let taskSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "agent task requires a subcommand")
+            }
+            let taskSubcommand = taskSubcommandRaw.lowercased()
+            let taskArgs = Array(subArgs.dropFirst())
+
+            switch taskSubcommand {
+            case "run":
+                let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+                let (labelOpt, rem5) = parseOption(rem4, name: "--label")
+                let (commandOpt, rem6) = parseOption(rem5, name: "--cmd")
+                let (splitOpt, rem7) = parseOption(rem6, name: "--split")
+                let (cwdOpt, remaining) = parseOption(rem7, name: "--cwd")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent task run requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent task run: unknown flag '\(unknown)'")
+                }
+                let command = commandOpt ?? remaining.joined(separator: " ")
+                guard !command.isEmpty else {
+                    throw CLIError(message: "agent task run requires --cmd <command> or positional command")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId, "command": command]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+                if let labelOpt { params["label"] = labelOpt }
+                if let splitOpt { params["split"] = splitOpt }
+                if let cwdOpt { params["cwd"] = resolvePath(cwdOpt) }
+
+                let payload = try client.sendV2(method: "agent.task.run", params: params)
+                let taskPayload = payload["task"] as? [String: Any] ?? [:]
+                let jobId = (taskPayload["job_id"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) job=\(jobId)")
+
+            case "wait":
+                let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (jobOptA, rem2) = parseOption(rem1, name: "--job")
+                let (jobOptB, rem3) = parseOption(rem2, name: "--job-id")
+                let (timeoutMsOpt, remaining) = parseOption(rem3, name: "--timeout-ms")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent task wait requires --session <id>")
+                }
+                guard let jobId = jobOptA ?? jobOptB else {
+                    throw CLIError(message: "agent task wait requires --job <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent task wait: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId, "job_id": jobId]
+                if let timeoutMsOpt {
+                    guard let timeoutMs = Int(timeoutMsOpt), timeoutMs >= 0 else {
+                        throw CLIError(message: "agent task wait: --timeout-ms must be >= 0")
+                    }
+                    params["timeout_ms"] = timeoutMs
+                }
+
+                let payload = try client.sendV2(method: "agent.task.wait", params: params)
+                let status = (payload["status"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status)")
+
+            case "result":
+                let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (jobOptA, rem2) = parseOption(rem1, name: "--job")
+                let (jobOptB, rem3) = parseOption(rem2, name: "--job-id")
+                let (tailLinesOpt, remaining) = parseOption(rem3, name: "--tail-lines")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent task result requires --session <id>")
+                }
+                guard let jobId = jobOptA ?? jobOptB else {
+                    throw CLIError(message: "agent task result requires --job <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent task result: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId, "job_id": jobId]
+                if let tailLinesOpt {
+                    guard let tailLines = Int(tailLinesOpt), tailLines >= 0 else {
+                        throw CLIError(message: "agent task result: --tail-lines must be >= 0")
+                    }
+                    params["tail_lines"] = tailLines
+                }
+
+                let payload = try client.sendV2(method: "agent.task.result", params: params)
+                let status = (payload["status"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status)")
+
+            default:
+                throw CLIError(message: "Unsupported agent task subcommand: \(taskSubcommand)")
+            }
+
         default:
             throw CLIError(message: "Unsupported agent subcommand: \(subcommand)")
         }
@@ -7499,7 +7752,7 @@ struct CMUXCLI {
             """
         case "agent":
             return """
-            Usage: bmux agent <attach|layout|capabilities|open|focus|close|surface-read> [flags]
+            Usage: bmux agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task> [flags]
 
             Compact agent-oriented commands for coding agents such as Codex.
 
@@ -7511,6 +7764,12 @@ struct CMUXCLI {
               focus --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
               close --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
               surface-read --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
+              terminal write --session <session-id> [--surface <id|ref|index>] [--text <text> | <text>]
+              terminal capture --session <session-id> [--surface <id|ref|index>] [--mode tail|full|delta] [--lines <n>] [--scrollback <true|false>]
+              terminal wait --session <session-id> [--surface <id|ref|index>] [--state prompt|running] [--timeout-ms <ms>]
+              task run --session <session-id> [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--cmd <command> | <command>]
+              task wait --session <session-id> --job <job-id> [--timeout-ms <ms>]
+              task result --session <session-id> --job <job-id> [--tail-lines <n>]
 
             Notes:
               - `attach` creates a lightweight bmux agent session and returns focused context.
@@ -7518,6 +7777,8 @@ struct CMUXCLI {
               - `capabilities` returns backend, environment, and preference metadata.
               - `open` opens a compact agent-managed terminal/browser/markdown surface.
               - `surface-read` returns a compact metadata snapshot for the target surface.
+              - `terminal` wraps low-token terminal input/capture/wait primitives.
+              - `task` runs managed shell commands in bmux terminals and returns compact status.
             """
         case "browser":
             return """
@@ -13589,7 +13850,7 @@ struct CMUXCLI {
           claude-teams [claude-args...]
           omo [opencode-args...]
           codex <install-hooks|uninstall-hooks>
-          agent <attach|layout|capabilities|open|focus|close|surface-read>
+          agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task>
           ping
           version
           capabilities

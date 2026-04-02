@@ -6535,6 +6535,10 @@ final class Workspace: Identifiable, ObservableObject {
         )
     }
 
+    func panelShellActivityState(panelId: UUID) -> PanelShellActivityState {
+        panelShellActivityStates[panelId] ?? .unknown
+    }
+
     func updatePanelGitBranch(panelId: UUID, branch: String, isDirty: Bool) {
         let state = SidebarGitBranchState(branch: branch, isDirty: isDirty)
         let existing = panelGitBranches[panelId]

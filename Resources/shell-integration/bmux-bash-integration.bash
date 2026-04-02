@@ -92,6 +92,7 @@ _CMUX_ASYNC_JOB_TIMEOUT="${_CMUX_ASYNC_JOB_TIMEOUT:-20}"
 
 _CMUX_PORTS_LAST_RUN="${_CMUX_PORTS_LAST_RUN:-0}"
 _CMUX_SHELL_ACTIVITY_LAST="${_CMUX_SHELL_ACTIVITY_LAST:-}"
+_CMUX_ACTIVE_TASK_ID="${_CMUX_ACTIVE_TASK_ID:-}"
 _CMUX_TTY_NAME="${_CMUX_TTY_NAME:-}"
 _CMUX_TTY_REPORTED="${_CMUX_TTY_REPORTED:-0}"
 _CMUX_TMUX_PUSH_SIGNATURE="${_CMUX_TMUX_PUSH_SIGNATURE:-}"
@@ -200,6 +201,7 @@ _bmux_tmux_refresh_bmux_environment() {
     if (( did_change )); then
         _CMUX_TTY_REPORTED=0
         _CMUX_SHELL_ACTIVITY_LAST=""
+        _CMUX_ACTIVE_TASK_ID=""
         _CMUX_PWD_LAST_PWD=""
         _CMUX_GIT_LAST_PWD=""
         _CMUX_GIT_HEAD_LAST_PWD=""
@@ -293,6 +295,26 @@ _bmux_report_shell_activity_state() {
     {
         _bmux_send "report_shell_state $state --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
     } >/dev/null 2>&1 & disown
+}
+
+_bmux_set_active_task_from_command() {
+    local cmd="$1"
+    _CMUX_ACTIVE_TASK_ID=""
+    if [[ "$cmd" =~ ^[[:space:]]*BMUX_AGENT_TASK_ID=([^[:space:];]+)[[:space:]]+ ]]; then
+        _CMUX_ACTIVE_TASK_ID="${BASH_REMATCH[1]}"
+    fi
+}
+
+_bmux_report_active_task_result() {
+    local exit_code="$1"
+    [[ -n "$_CMUX_ACTIVE_TASK_ID" ]] || return 0
+    [[ -S "$CMUX_SOCKET_PATH" ]] || { _CMUX_ACTIVE_TASK_ID=""; return 0; }
+    [[ -n "$CMUX_TAB_ID" ]] || { _CMUX_ACTIVE_TASK_ID=""; return 0; }
+    [[ -n "$CMUX_PANEL_ID" ]] || { _CMUX_ACTIVE_TASK_ID=""; return 0; }
+    {
+        _bmux_send "report_task_result $_CMUX_ACTIVE_TASK_ID $exit_code --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
+    } >/dev/null 2>&1 & disown
+    _CMUX_ACTIVE_TASK_ID=""
 }
 
 _bmux_ports_kick() {
@@ -712,6 +734,7 @@ _bmux_command_starts_nested_shell() {
 
 _bmux_preexec_command() {
     local cmd="${1:-${BASH_COMMAND:-}}"
+    _bmux_set_active_task_from_command "$cmd"
     _bmux_tmux_sync_bmux_environment
 
     [[ -S "$CMUX_SOCKET_PATH" ]] || return 0
@@ -739,12 +762,14 @@ _bmux_bash_preexec_hook() {
 }
 
 _bmux_prompt_command() {
+    local last_status=$?
     _bmux_tmux_sync_bmux_environment
 
     [[ -S "$CMUX_SOCKET_PATH" ]] || return 0
     [[ -n "$CMUX_TAB_ID" ]] || return 0
     [[ -n "$CMUX_PANEL_ID" ]] || return 0
     _bmux_report_shell_activity_state prompt
+    _bmux_report_active_task_result "$last_status"
 
     local now
     now="$(_bmux_now)"
