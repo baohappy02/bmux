@@ -4743,16 +4743,45 @@ struct CMUXCLI {
         jsonOutput: Bool,
         idFormat: CLIIDFormat
     ) throws {
-        guard let subcommandRaw = commandArgs.first else {
+        guard !commandArgs.isEmpty else {
+            throw CLIError(message: "agent requires a subcommand")
+        }
+
+        var effectiveJSONOutput = jsonOutput
+        var effectiveIDFormat = idFormat
+        var agentArgs = commandArgs
+
+        while !agentArgs.isEmpty {
+            if agentArgs.last == "--json" {
+                effectiveJSONOutput = true
+                agentArgs.removeLast()
+                continue
+            }
+
+            if agentArgs.count >= 2,
+               agentArgs[agentArgs.count - 2] == "--id-format" {
+                let raw = agentArgs.last!
+                guard let parsed = try CLIIDFormat.parse(raw) else {
+                    throw CLIError(message: "--id-format must be one of: refs, uuids, both")
+                }
+                effectiveIDFormat = parsed
+                agentArgs.removeLast(2)
+                continue
+            }
+
+            break
+        }
+
+        guard let subcommandRaw = agentArgs.first else {
             throw CLIError(message: "agent requires a subcommand")
         }
 
         let subcommand = subcommandRaw.lowercased()
-        let subArgs = Array(commandArgs.dropFirst())
+        let subArgs = Array(agentArgs.dropFirst())
 
         func output(_ payload: [String: Any], fallback: String) {
-            if jsonOutput {
-                print(jsonString(formatIDs(payload, mode: idFormat)))
+            if effectiveJSONOutput {
+                print(jsonString(formatIDs(payload, mode: effectiveIDFormat)))
             } else {
                 print(fallback)
             }
@@ -5993,7 +6022,7 @@ struct CMUXCLI {
         var surfaceRaw = surfaceOpt
         var args = argsWithoutSurfaceFlag
 
-        let verbsWithoutSurface: Set<String> = ["open", "open-split", "new", "identify"]
+        let verbsWithoutSurface: Set<String> = ["open", "open-split", "new", "identify", "agent"]
         if surfaceRaw == nil, let first = args.first {
             if !first.hasPrefix("-") && !verbsWithoutSurface.contains(first.lowercased()) {
                 surfaceRaw = first

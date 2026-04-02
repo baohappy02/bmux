@@ -355,6 +355,7 @@ class TerminalController {
     private var v2AgentProfileSuccessCache: [String: AgentCachedProfileResult] = [:]
     private var v2AgentSearchIndexByRepo: [String: AgentSearchIndexState] = [:]
     private var v2AgentRecordedArtifacts: [AgentRecordedArtifact] = []
+    private var v2AgentAvailableToolsCache: [String]?
 
     private init() {
         browserDownloadObserver = NotificationCenter.default.addObserver(
@@ -3224,7 +3225,8 @@ class TerminalController {
             return .err(code: "not_found", message: "Workspace not found", data: nil)
         }
 
-        let packageManager = v2AgentInferredPackageManager(startingAt: context.workspace.currentDirectory)
+        let workingDirectory = v2AgentEffectiveDirectory(context: context)
+        let packageManager = v2AgentInferredPackageManager(startingAt: workingDirectory)
         let environment = v2AgentEnvironmentPayload(
             context: context,
             inferredPackageManager: packageManager
@@ -4203,7 +4205,10 @@ class TerminalController {
             } else {
                 effectiveCommand = command
             }
-            let commandText = "BMUX_AGENT_TASK_ID=\(taskId) \(effectiveCommand)\n"
+            let commandText = v2AgentWrappedTaskCommand(
+                taskId: taskId,
+                command: effectiveCommand
+            ) + "\n"
             let queued = v2AgentSendText(commandText, terminalPanel: terminalPanel)
             let updatedSession = v2AgentPersistSession(
                 sessionId: sessionId,
@@ -4300,7 +4305,7 @@ class TerminalController {
             jobParams["cache_eligible"] = profile.cacheEligible
             jobParams["label"] = job.label
             jobParams["command"] = job.command
-            jobParams["cwd"] = profile.repoRoot ?? context.workspace.currentDirectory
+            jobParams["cwd"] = profile.repoRoot ?? v2AgentEffectiveDirectory(context: context)
             if let retryPolicy = profile.retryPolicy {
                 jobParams["retry_policy"] = [
                     "max_attempts": retryPolicy.maxAttempts,
@@ -4923,7 +4928,8 @@ class TerminalController {
         }
         let effectiveSession = v2AgentSessions[sessionId] ?? session
 
-        let packageManager = v2AgentInferredPackageManager(startingAt: context.workspace.currentDirectory)
+        let workingDirectory = v2AgentEffectiveDirectory(context: context)
+        let packageManager = v2AgentInferredPackageManager(startingAt: workingDirectory)
         let preferences = v2AgentUserPreferences(inferredPackageManager: packageManager)
 
         return .ok([
@@ -5514,6 +5520,18 @@ class TerminalController {
         ]
     }
 
+    private func v2AgentEffectiveDirectory(context: AgentWorkspaceContext) -> String? {
+        if let surfaceId = context.surfaceId {
+            if let panelDirectory = v2AgentString(context.workspace.panelDirectories[surfaceId]) {
+                return panelDirectory
+            }
+            if let requested = v2AgentString(context.workspace.terminalPanel(for: surfaceId)?.requestedWorkingDirectory) {
+                return requested
+            }
+        }
+        return v2AgentString(context.workspace.currentDirectory)
+    }
+
     private func v2AgentFocusedTitle(context: AgentWorkspaceContext) -> String {
         guard let surfaceId = context.surfaceId,
               let panel = context.workspace.panels[surfaceId] else {
@@ -5804,14 +5822,15 @@ class TerminalController {
         context: AgentWorkspaceContext,
         inferredPackageManager: String?
     ) -> String {
-        let repoRoot = v2AgentRepositoryRoot(startingAt: context.workspace.currentDirectory)
+        let workingDirectory = v2AgentEffectiveDirectory(context: context)
+        let repoRoot = v2AgentRepositoryRoot(startingAt: workingDirectory)
         let profiles = v2AgentAvailableProfiles(
             repoRoot: repoRoot,
             availableTools: v2AgentAvailableTools()
         )
         let fingerprintPayload: [String: Any] = [
             "repo_root": v2OrNull(repoRoot),
-            "cwd": context.workspace.currentDirectory,
+            "cwd": v2OrNull(workingDirectory),
             "package_manager": v2OrNull(inferredPackageManager),
             "profiles": profiles,
             "listening_ports": context.workspace.listeningPorts.sorted(),
@@ -6531,10 +6550,11 @@ class TerminalController {
         name: String,
         context: AgentWorkspaceContext
     ) -> AgentProfileSpec? {
-        let repoRoot = v2AgentRepositoryRoot(startingAt: context.workspace.currentDirectory)
+        let workingDirectory = v2AgentEffectiveDirectory(context: context)
+        let repoRoot = v2AgentRepositoryRoot(startingAt: workingDirectory)
         let availableTools = v2AgentAvailableTools()
         let preferredPackageManager = v2AgentPreferredJSPackageManager(
-            inferredPackageManager: v2AgentInferredPackageManager(startingAt: context.workspace.currentDirectory)
+            inferredPackageManager: v2AgentInferredPackageManager(startingAt: workingDirectory)
         )
         let scripts = v2AgentPackageScripts(repoRoot: repoRoot)
 
@@ -7325,7 +7345,7 @@ class TerminalController {
         context: AgentWorkspaceContext,
         inferredPackageManager: String?
     ) -> [String: Any] {
-        let cwd = context.workspace.currentDirectory
+        let cwd = v2AgentEffectiveDirectory(context: context)
         let repoRoot = v2AgentRepositoryRoot(startingAt: cwd)
         let availableTools = v2AgentAvailableTools()
         let parserNames = v2AgentAvailableParsers(from: availableTools)
@@ -7333,7 +7353,7 @@ class TerminalController {
             repoRoot: repoRoot,
             availableTools: availableTools
         )
-        let searchState = repoRoot.map { v2AgentEffectiveSearchState(repoRoot: $0) }
+        let searchState = repoRoot.flatMap { v2AgentSearchIndexByRepo[$0] }
 
         var payload: [String: Any] = [
             "repo_root": v2OrNull(repoRoot),
@@ -7342,9 +7362,9 @@ class TerminalController {
             "parsers": parserNames,
             "profiles": profileNames,
             "default_new_terminal_cwd": bmuxDefaultWorkingDirectoryPath(),
-            "search_backend": searchState?.backend ?? "none",
+            "search_backend": searchState?.backend ?? (repoRoot == nil ? "none" : "lexical"),
             "search_index_ready": (searchState?.status == "warm"),
-            "search_status": searchState?.status ?? "missing"
+            "search_status": searchState?.status ?? (repoRoot == nil ? "missing" : "missing")
         ]
         if let repoRoot {
             payload["cwd"] = repoRoot
@@ -7353,6 +7373,10 @@ class TerminalController {
     }
 
     private func v2AgentAvailableTools() -> [String] {
+        if let cached = v2AgentAvailableToolsCache {
+            return cached
+        }
+
         let candidates = [
             "bun",
             "node",
@@ -7363,7 +7387,9 @@ class TerminalController {
             "xcodebuild"
         ]
 
-        return candidates.filter { v2AgentResolvedCommandPath($0) != nil }
+        let detected = candidates.filter { v2AgentResolvedCommandPath($0) != nil }
+        v2AgentAvailableToolsCache = detected
+        return detected
     }
 
     private func v2AgentAvailableParsers(from availableTools: [String]) -> [String] {
@@ -7517,8 +7543,20 @@ class TerminalController {
         let session = v2String(params, "session_id").flatMap { v2AgentSessions[$0] }
         let cwd = v2String(params, "cwd")
             ?? v2String(params, "repo_root")
-            ?? v2AgentResolveContext(params: params, session: session)?.workspace.currentDirectory
+            ?? session.flatMap { session in
+                v2AgentResolveContext(params: params, session: session).flatMap { context in
+                    v2AgentEffectiveDirectory(context: context)
+                }
+            }
         return (session, v2AgentRepositoryRoot(startingAt: cwd))
+    }
+
+    private func v2AgentWrappedTaskCommand(taskId: String, command: String) -> String {
+        let reportPayload = "report_task_result \(taskId) $__bmux_exit --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
+        let quotedReportPayload = v2AgentShellQuote(reportPayload)
+        return """
+        ( \(command) ); __bmux_exit=$?; if [ -n "$CMUX_SOCKET_PATH" ] && [ -n "$CMUX_TAB_ID" ] && [ -n "$CMUX_PANEL_ID" ]; then if command -v _bmux_send_bg >/dev/null 2>&1; then _bmux_send_bg \(quotedReportPayload); elif command -v ncat >/dev/null 2>&1; then printf '%s\\n' \(quotedReportPayload) | ncat -w 1 -U "$CMUX_SOCKET_PATH" --send-only >/dev/null 2>&1 || true; elif command -v socat >/dev/null 2>&1; then printf '%s\\n' \(quotedReportPayload) | socat -T 1 - "UNIX-CONNECT:$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; elif command -v nc >/dev/null 2>&1; then if printf '%s\\n' \(quotedReportPayload) | nc -N -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1; then :; else printf '%s\\n' \(quotedReportPayload) | nc -w 1 -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; fi; fi; fi; ( exit $__bmux_exit )
+        """
     }
 
     private func v2AgentGitNexusAvailable() -> Bool {
