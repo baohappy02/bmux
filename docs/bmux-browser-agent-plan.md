@@ -523,6 +523,8 @@ Rules:
 
 Semantic retrieval is worth adding to bmux, but bmux should not copy `mgrep` blindly.
 
+Detailed backend direction for bmux-local search and the reduced GitNexus role lives in [docs/bmux-agent-search-architecture.md](/Users/macbook/Desktop/Me/TOOLs/bmux/docs/bmux-agent-search-architecture.md).
+
 ### What bmux should borrow
 
 The `mgrep` evaluation confirms a real pattern worth adopting:
