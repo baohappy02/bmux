@@ -79,6 +79,9 @@ Add a dedicated agent namespace over the existing bmux control surface:
 28. `agent.batch`
 29. `agent.ensure`
 30. `agent.artifact.list`
+31. `agent.search`
+32. `agent.search.index`
+33. `agent.search.status`
 
 Suggested CLI wrappers:
 
@@ -100,6 +103,9 @@ bmux agent capabilities --session ag_123 --json
 bmux agent batch --session ag_123 --file bmux-setup.json --json
 bmux agent ensure service --session ag_123 --profile dev.web --json
 bmux agent artifact list --session ag_123 --job job:3 --json
+bmux agent search --session ag_123 --query "where auth is configured" --json
+bmux agent search status --session ag_123 --json
+bmux agent search index --session ag_123 --scope repo --json
 bmux agent terminal write --session ag_123 --surface surface:9 --text "npm run dev\n" --json
 bmux agent terminal capture --session ag_123 --surface surface:9 --mode delta --json
 bmux browser agent observe --session ag_123 --surface surface:7 --scope interactive --json
@@ -127,6 +133,7 @@ Phase 0 scope:
 13. discover the environment and supported profiles in one cheap call
 14. make common setup flows idempotent through `ensure` and `batch`
 15. avoid repeated verification runs when a safe cached result is still valid
+16. find likely-relevant code by intent without forcing Codex into dozens of `grep` guesses
 
 This is the minimum feature set that makes bmux feel usable, fast, and low-token for Codex even before browser automation becomes the main focus.
 
@@ -162,6 +169,7 @@ The agent should be able to do these cheaply:
 13. discover which tools, profiles, and parsers are available without probing the shell
 14. reuse an existing browser, split, or dev server when one already satisfies the request
 15. resume useful local state after bmux or Codex restarts
+16. answer concept-level codebase questions with bounded local semantic retrieval
 
 ## Codex Operating Contract
 
@@ -195,10 +203,15 @@ Codex should default to:
 15. `agent.service.wait`
 16. `agent.state.summary`
 17. `agent.artifact.list`
-18. `agent.wait`
-19. `browser.agent.*` only when the target surface is a browser
+18. `agent.search`
+19. `agent.search.status`
+20. `agent.wait`
+21. `browser.agent.*` only when the target surface is a browser
 
 This keeps both prompts and responses small, and it also gives bmux a single stable operating model for future agent skills and documentation.
+
+Exact or syntax-sensitive lookups still belong to `rg`, GitNexus, or future exact-match agent wrappers.
+`agent.search` is for concept lookup, intent search, and "I know what this does but not what it is named" workflows.
 
 ## In-App Agent UX
 
@@ -450,6 +463,95 @@ The capability payload should include:
 4. available parser adapters
 5. available named profiles
 6. default cwd and title policies for new terminals
+7. whether local semantic search is available, warming, or disabled
+
+## Local-First Semantic Retrieval
+
+Semantic retrieval is worth adding to bmux, but bmux should not copy `mgrep` blindly.
+
+### What bmux should borrow
+
+The `mgrep` evaluation confirms a real pattern worth adopting:
+
+1. semantic top-k retrieval beats repeated blind `grep` guessing for concept-level questions
+2. small path plus line-range results are much cheaper than dumping file contents
+3. background indexing matters because latency is part of token efficiency
+4. good reranking lets the model spend tokens on reasoning, not on search retries
+
+### What bmux should not copy
+
+For bmux and Codex, the current `mgrep` shape has several mismatches:
+
+1. it is cloud-backed and requires authentication before meaningful use
+2. even dry-run flows still require auth because they create a store first
+3. `install-codex` mainly adds background sync plus a skill that aggressively says to always use `mgrep`
+4. the current `mgrep mcp` server does not yet expose useful callable tools, so the Codex integration is not a rich MCP search surface
+
+bmux should therefore treat `mgrep` as design inspiration, not as the product architecture.
+
+### bmux retrieval goals
+
+`agent.search` should be:
+
+1. local-first
+2. auth-free for local repositories
+3. bounded in bytes and hit count
+4. hybrid, not semantic-only
+5. optional to warm in the background
+
+The ideal default backend is a local hybrid retriever:
+
+1. lexical candidate generation
+2. semantic reranking
+3. optional symbol or graph fusion when GitNexus is available
+
+### Proposed search surface
+
+Add a retrieval trio:
+
+1. `agent.search`
+2. `agent.search.index`
+3. `agent.search.status`
+
+Semantics:
+
+1. `search` asks a question or intent query and returns top-k snippets
+2. `search.index` starts or refreshes local indexing
+3. `search.status` reports whether the local index is warm, stale, or missing
+
+### Query routing rules
+
+Codex should not use one search mode for everything.
+
+Recommended routing:
+
+1. exact identifier, regex, or rename work: use `rg` or GitNexus
+2. architecture or concept lookup: use `agent.search`
+3. local repo plus docs blend: use `agent.search` plus explicit web only when needed
+
+### Local storage and privacy
+
+The search index should stay local by default.
+
+Recommended properties:
+
+1. index stored on-disk under bmux-controlled local app data
+2. no login required
+3. no background upload to third-party servers
+4. explicit opt-in for any future cloud sync mode
+
+### Result shape
+
+`agent.search` should return only the minimum useful retrieval payload:
+
+1. file path
+2. line range
+3. optional symbol name
+4. small snippet
+5. score
+6. search mode such as `lexical`, `semantic`, or `hybrid`
+
+The response should stay small enough that Codex can often answer after one search plus one file read.
 
 ## Workspace Fingerprints and Caching
 
@@ -468,6 +570,8 @@ Rules:
 2. cached success should return `cache_status: hit` or `status: cached_ok`
 3. cache invalidation must happen on relevant file changes, dependency changes, or explicit `--no-cache`
 4. Codex should not need to restate why a cached result is acceptable
+
+The same fingerprinting system can also invalidate local search indexes cheaply.
 
 ## Secret Redaction
 
@@ -565,6 +669,8 @@ Each attached agent session should maintain server-side state:
 21. `recovery_snapshot`
 22. `redaction_policy`
 23. `capability_snapshot`
+24. `search_index_state`
+25. `search_backend`
 
 Rules:
 
@@ -579,7 +685,8 @@ Rules:
 9. `artifact_registry` keeps compact ids for logs, diagnostics, screenshots, and browser snapshots.
 10. `workspace_fingerprint` allows bmux to reuse safe verification results.
 11. `recovery_snapshot` allows attach or re-attach to report whether useful state was recovered.
-12. Sessions are cheap and disposable; agents should re-attach rather than rebuild state in-context.
+12. `search_index_state` keeps track of whether local semantic retrieval is ready, stale, or warming.
+13. Sessions are cheap and disposable; agents should re-attach rather than rebuild state in-context.
 
 ## Response Contracts
 
@@ -685,8 +792,25 @@ Example:
     "tools": ["bun", "node", "tsc", "pytest"],
     "parsers": ["tsc", "pytest"],
     "profiles": ["verify.ts", "dev.web"],
-    "default_new_terminal_cwd": "~/Desktop"
+    "default_new_terminal_cwd": "~/Desktop",
+    "search_backend": "local_hybrid",
+    "search_index_ready": false
   }
+}
+```
+
+### `search.status`
+
+Search status should be cheap enough to check at attach time or before a concept lookup:
+
+```json
+{
+  "backend": "local_hybrid",
+  "repo_root": "/repo",
+  "ready": true,
+  "stale": false,
+  "indexed_file_count": 1824,
+  "pending_change_count": 0
 }
 ```
 
@@ -970,8 +1094,64 @@ Example:
       "seq": 44,
       "type": "session.recovered",
       "session_id": "ag_123"
+    },
+    {
+      "seq": 45,
+      "type": "search.index_ready",
+      "backend": "local_hybrid"
     }
   ]
+}
+```
+
+### `search`
+
+Search should return a small number of high-confidence hits.
+
+Example:
+
+```json
+{
+  "query": "where auth is configured",
+  "mode": "hybrid",
+  "hits": [
+    {
+      "file": "src/auth/config.ts",
+      "start_line": 12,
+      "end_line": 34,
+      "symbol": "configureAuth",
+      "score": 0.93,
+      "snippet": "export function configureAuth(...) { ... }"
+    },
+    {
+      "file": "src/server/middleware.ts",
+      "start_line": 55,
+      "end_line": 78,
+      "symbol": "authMiddleware",
+      "score": 0.87,
+      "snippet": "app.use(authMiddleware(...))"
+    }
+  ]
+}
+```
+
+Rules:
+
+1. default to 3 to 5 hits
+2. cap snippet bytes aggressively
+3. prefer symbol-aligned chunks when available
+4. do not attach full file bodies
+
+### `search.index`
+
+Indexing should be explicit when needed, but cheap to inspect:
+
+```json
+{
+  "ok": true,
+  "backend": "local_hybrid",
+  "status": "indexing",
+  "repo_root": "/repo"
 }
 ```
 
@@ -1269,13 +1449,15 @@ The agent protocol should be cheap by default:
 7. `events` target: under 2 KB for routine polling.
 8. `service.wait` and `state.summary` targets: under 1 KB.
 9. `capabilities`, `ensure`, and `artifact.list` targets: under 1 KB.
-10. `batch` target: under 2 KB for common setup sequences.
-11. `act` target: under 512 bytes unless an error requires more detail.
-12. `terminal.write` target: under 256 bytes.
-13. `terminal.capture` target: under 4 KB by default.
-14. `observe` target: under 4 KB by default.
-15. `logs` target: cursor-based and capped by entry count and byte size.
-16. `artifact` target: no inline binary payloads unless explicitly requested.
+10. `search.status` target: under 512 bytes.
+11. `search` target: under 2 KB for the default hit count.
+12. `batch` target: under 2 KB for common setup sequences.
+13. `act` target: under 512 bytes unless an error requires more detail.
+14. `terminal.write` target: under 256 bytes.
+15. `terminal.capture` target: under 4 KB by default.
+16. `observe` target: under 4 KB by default.
+17. `logs` target: cursor-based and capped by entry count and byte size.
+18. `artifact` target: no inline binary payloads unless explicitly requested.
 
 The model should not need to repeatedly ask for:
 
@@ -1289,6 +1471,7 @@ The model should not need to repeatedly ask for:
 8. repeated “is the server ready yet?” polling against raw terminal output
 9. repeated shell probing to discover whether `bun`, `flutter`, or `pytest` exists
 10. repeated recreation of the same browser, split, or dev server after a retry
+11. repeated shotgun `grep` guesses for concept-level questions
 
 ## Error Contract
 
@@ -1309,6 +1492,9 @@ Recommended error codes:
 11. `already_satisfied`
 12. `cache_miss`
 13. `redacted`
+14. `index_missing`
+15. `index_stale`
+16. `search_backend_unavailable`
 
 Example:
 
@@ -1335,14 +1521,15 @@ The expected low-token loop is:
 8. `task.result`
 9. `service.wait` when a server or preview must come up
 10. `state.summary`
-11. `surface.read`
-12. `terminal.write` or `browser.agent.observe`
-13. `terminal.capture` or `browser.agent.act`
-14. `wait`
-15. `browser.agent.read`
-16. `artifact.list` only when needed
-17. `logs` only when needed
-18. `artifact` only for debugging or human review
+11. `search` for concept lookup when exact names are unknown
+12. `surface.read`
+13. `terminal.write` or `browser.agent.observe`
+14. `terminal.capture` or `browser.agent.act`
+15. `wait`
+16. `browser.agent.read`
+17. `artifact.list` only when needed
+18. `logs` only when needed
+19. `artifact` only for debugging or human review
 
 This replaces the current anti-pattern of:
 
@@ -1416,8 +1603,9 @@ Likely work split:
 3. derive a compact layout tree from existing pane and surface state
 4. add a managed job registry, artifact registry, and event cursor store
 5. add environment discovery and workspace fingerprint helpers
-6. reuse browser telemetry and navigation hooks for `page_rev` updates
-7. keep legacy verbose commands for human debugging
+6. add a local search index and repo-fingerprint invalidation path
+7. reuse browser telemetry and navigation hooks for `page_rev` updates
+8. keep legacy verbose commands for human debugging
 
 ## Rollout Plan
 
@@ -1552,7 +1740,8 @@ App integration:
 5. Add in-app managed job UX, service badges, and failure-first notifications.
 6. Add workspace fingerprint caching for safe verify profiles.
 7. Add secret redaction, transient retry policy, and recovery events.
-8. Add documentation and examples for event-driven Codex loops.
+8. Add local-first `agent.search`, `agent.search.index`, and `agent.search.status`.
+9. Add documentation and examples for event-driven Codex loops.
 
 ### Milestone 3
 
@@ -1579,7 +1768,8 @@ Deliverables after the CLI exists:
 4. include one FE example: run dev server, wait for service, open browser, verify app
 5. document app-level defaults such as `Cmd+N -> ~/Desktop` and duplicate-title disambiguation
 6. include one idempotent example using `capabilities`, `ensure`, and `batch`
-7. keep legacy CLI docs for humans, but clearly mark `agent.*` as the preferred interface for coding agents
+7. include one semantic lookup example using `agent.search` before falling back to `rg`
+8. keep legacy CLI docs for humans, but clearly mark `agent.*` as the preferred interface for coding agents
 
 ## Open Questions
 
@@ -1595,3 +1785,5 @@ Deliverables after the CLI exists:
 10. Which resource types should `agent.ensure` support in Milestone 1 versus Milestone 2?
 11. Which inputs belong in the first workspace fingerprint implementation?
 12. How aggressive should redaction be before it starts hiding information that is still useful for debugging?
+13. Which local backend should power `agent.search`: sqlite FTS, a vector index, or a hybrid of both?
+14. Should GitNexus participate as an optional reranker or separate companion path for `agent.search`?
