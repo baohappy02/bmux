@@ -255,6 +255,14 @@ class TerminalController {
         var exitCode: Int?
     }
 
+    private struct AgentPendingTaskCommand {
+        let taskId: String
+        let sessionId: String
+        let workspaceId: UUID
+        let surfaceId: UUID
+        let text: String
+    }
+
     private struct AgentEvent {
         let seq: Int
         let createdAt: Date
@@ -291,6 +299,42 @@ class TerminalController {
         let workspace: Workspace
         let paneId: UUID?
         let surfaceId: UUID?
+    }
+
+    private struct AgentSplitVisibilityDecision {
+        let sourcePaneId: UUID
+        let sourceBounds: CGRect
+        let predictedBounds: CGRect
+        let minimumVisibleWidth: CGFloat
+        let minimumVisibleHeight: CGFloat
+
+        var requiresFallback: Bool {
+            predictedBounds.width < minimumVisibleWidth || predictedBounds.height < minimumVisibleHeight
+        }
+
+        var payload: [String: Any] {
+            [
+                "policy": "minimum_visible_content_area",
+                "source_pane_id": sourcePaneId.uuidString,
+                "source_frame": [
+                    "x": Int(sourceBounds.origin.x.rounded()),
+                    "y": Int(sourceBounds.origin.y.rounded()),
+                    "width": Int(sourceBounds.width.rounded()),
+                    "height": Int(sourceBounds.height.rounded())
+                ],
+                "predicted_frame": [
+                    "x": Int(predictedBounds.origin.x.rounded()),
+                    "y": Int(predictedBounds.origin.y.rounded()),
+                    "width": Int(predictedBounds.width.rounded()),
+                    "height": Int(predictedBounds.height.rounded())
+                ],
+                "minimum_visible_size": [
+                    "width": Int(minimumVisibleWidth.rounded()),
+                    "height": Int(minimumVisibleHeight.rounded())
+                ],
+                "fallback": "pane_tab"
+            ]
+        }
     }
 
     private struct AgentCachedProfileResult {
@@ -348,6 +392,7 @@ class TerminalController {
     private var v2AgentSessions: [String: AgentSession] = [:]
     private var v2AgentNextTaskOrdinal: Int = 1
     private var v2AgentTasks: [String: AgentTask] = [:]
+    private var v2AgentPendingTaskCommandsBySurface: [UUID: AgentPendingTaskCommand] = [:]
     private var v2AgentNextGroupOrdinal: Int = 1
     private var v2AgentNextEventOrdinal: Int = 1
     private var v2AgentEventLog: [AgentEvent] = []
@@ -357,6 +402,8 @@ class TerminalController {
     private var v2AgentRecordedArtifacts: [AgentRecordedArtifact] = []
     private var v2AgentAvailableToolsCache: [String]?
     private let v2AgentStateLock = NSRecursiveLock()
+    private let v2AgentMinimumVisibleSplitWidth: CGFloat = 320
+    private let v2AgentMinimumVisibleSplitHeight: CGFloat = 200
 
     private init() {
         browserDownloadObserver = NotificationCenter.default.addObserver(
@@ -3282,7 +3329,16 @@ class TerminalController {
                 "default_execution_class": "local_verify",
                 "network_research_requires_pricing_check": true,
                 "block_paid_or_billing_gated_work_without_approval": true,
-                "block_unknown_pricing_before_deeper_research": true
+                "block_unknown_pricing_before_deeper_research": true,
+                "split_visibility_guard": [
+                    "minimum_visible_width_px": Int(v2AgentMinimumVisibleSplitWidth.rounded()),
+                    "minimum_visible_height_px": Int(v2AgentMinimumVisibleSplitHeight.rounded()),
+                    "fallback": "pane_tab",
+                    "applies_to": [
+                        "agent.open split",
+                        "agent.task.run split"
+                    ]
+                ]
             ]
         ])
     }
@@ -3354,7 +3410,10 @@ class TerminalController {
             }
 
             let openedPanelId: UUID?
+            let requestedPlacement = splitDirection == nil ? "surface" : "split"
             let placement: String
+            let splitApplied: Bool
+            let visibilityGuardPayload: [String: Any]?
             switch kind {
             case "browser":
                 if let splitDirection {
@@ -3362,14 +3421,35 @@ class TerminalController {
                         result = .err(code: "not_found", message: "Source surface not found", data: nil)
                         return
                     }
-                    openedPanelId = workspace.newBrowserSplit(
-                        from: requestedSurfaceId,
-                        orientation: splitDirection.orientation,
-                        insertFirst: splitDirection.insertFirst,
+                    let splitDecision = v2AgentSplitVisibilityDecision(
+                        workspace: workspace,
+                        sourceSurfaceId: requestedSurfaceId,
+                        direction: splitDirection
+                    )
+                    if let splitDecision,
+                       splitDecision.requiresFallback,
+                       let sourcePaneId = workspace.paneId(forPanelId: requestedSurfaceId),
+                       let fallbackPanel = workspace.newBrowserSurface(
+                        inPane: sourcePaneId,
                         url: url,
                         focus: shouldFocus
-                    )?.id
-                    placement = "split"
+                       ) {
+                        openedPanelId = fallbackPanel.id
+                        placement = "surface"
+                        splitApplied = false
+                        visibilityGuardPayload = splitDecision.payload
+                    } else {
+                        openedPanelId = workspace.newBrowserSplit(
+                            from: requestedSurfaceId,
+                            orientation: splitDirection.orientation,
+                            insertFirst: splitDirection.insertFirst,
+                            url: url,
+                            focus: shouldFocus
+                        )?.id
+                        placement = "split"
+                        splitApplied = true
+                        visibilityGuardPayload = nil
+                    }
                 } else {
                     guard let requestedPaneId else {
                         result = .err(code: "not_found", message: "Pane not found", data: nil)
@@ -3381,6 +3461,8 @@ class TerminalController {
                         focus: shouldFocus
                     )?.id
                     placement = "surface"
+                    splitApplied = false
+                    visibilityGuardPayload = nil
                 }
 
             case "markdown":
@@ -3389,14 +3471,35 @@ class TerminalController {
                         result = .err(code: "not_found", message: "Source surface not found", data: nil)
                         return
                     }
-                    openedPanelId = workspace.newMarkdownSplit(
-                        from: requestedSurfaceId,
-                        orientation: splitDirection.orientation,
-                        insertFirst: splitDirection.insertFirst,
+                    let splitDecision = v2AgentSplitVisibilityDecision(
+                        workspace: workspace,
+                        sourceSurfaceId: requestedSurfaceId,
+                        direction: splitDirection
+                    )
+                    if let splitDecision,
+                       splitDecision.requiresFallback,
+                       let sourcePaneId = workspace.paneId(forPanelId: requestedSurfaceId),
+                       let fallbackPanel = workspace.newMarkdownSurface(
+                        inPane: sourcePaneId,
                         filePath: path ?? "",
                         focus: shouldFocus
-                    )?.id
-                    placement = "split"
+                       ) {
+                        openedPanelId = fallbackPanel.id
+                        placement = "surface"
+                        splitApplied = false
+                        visibilityGuardPayload = splitDecision.payload
+                    } else {
+                        openedPanelId = workspace.newMarkdownSplit(
+                            from: requestedSurfaceId,
+                            orientation: splitDirection.orientation,
+                            insertFirst: splitDirection.insertFirst,
+                            filePath: path ?? "",
+                            focus: shouldFocus
+                        )?.id
+                        placement = "split"
+                        splitApplied = true
+                        visibilityGuardPayload = nil
+                    }
                 } else {
                     guard let requestedPaneId else {
                         result = .err(code: "not_found", message: "Pane not found", data: nil)
@@ -3408,6 +3511,8 @@ class TerminalController {
                         focus: shouldFocus
                     )?.id
                     placement = "surface"
+                    splitApplied = false
+                    visibilityGuardPayload = nil
                 }
 
             default:
@@ -3416,13 +3521,34 @@ class TerminalController {
                         result = .err(code: "not_found", message: "Source surface not found", data: nil)
                         return
                     }
-                    openedPanelId = workspace.newTerminalSplit(
-                        from: requestedSurfaceId,
-                        orientation: splitDirection.orientation,
-                        insertFirst: splitDirection.insertFirst,
-                        focus: shouldFocus
-                    )?.id
-                    placement = "split"
+                    let splitDecision = v2AgentSplitVisibilityDecision(
+                        workspace: workspace,
+                        sourceSurfaceId: requestedSurfaceId,
+                        direction: splitDirection
+                    )
+                    if let splitDecision,
+                       splitDecision.requiresFallback,
+                       let sourcePaneId = workspace.paneId(forPanelId: requestedSurfaceId),
+                       let fallbackPanel = workspace.newTerminalSurface(
+                        inPane: sourcePaneId,
+                        focus: shouldFocus,
+                        workingDirectory: cwd
+                       ) {
+                        openedPanelId = fallbackPanel.id
+                        placement = "surface"
+                        splitApplied = false
+                        visibilityGuardPayload = splitDecision.payload
+                    } else {
+                        openedPanelId = workspace.newTerminalSplit(
+                            from: requestedSurfaceId,
+                            orientation: splitDirection.orientation,
+                            insertFirst: splitDirection.insertFirst,
+                            focus: shouldFocus
+                        )?.id
+                        placement = "split"
+                        splitApplied = true
+                        visibilityGuardPayload = nil
+                    }
                 } else {
                     guard let requestedPaneId else {
                         result = .err(code: "not_found", message: "Pane not found", data: nil)
@@ -3434,6 +3560,8 @@ class TerminalController {
                         workingDirectory: cwd
                     )?.id
                     placement = "surface"
+                    splitApplied = false
+                    visibilityGuardPayload = nil
                 }
             }
 
@@ -3469,10 +3597,17 @@ class TerminalController {
                 "pane_ref": v2Ref(kind: .pane, uuid: openedPaneId),
                 "surface_kind": kind,
                 "placement": placement,
+                "requested_placement": requestedPlacement,
                 "split": v2OrNull(splitRaw?.lowercased()),
+                "split_applied": splitApplied,
                 "focus_requested": focusRequested,
                 "focused": workspace.focusedPanelId == openedPanelId
             ]
+            if let visibilityGuardPayload {
+                payload["opened"] = (payload["opened"] as? [String: Any] ?? [:]).merging([
+                    "visibility_guard": visibilityGuardPayload
+                ]) { _, new in new }
+            }
             result = .ok(payload)
         }
         return result
@@ -4142,7 +4277,6 @@ class TerminalController {
                 startupWindowMs: startupWindowMs
             )
         }()
-
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to run task", data: nil)
         v2MainSync {
             guard let baseContext = v2AgentResolveContext(params: params, session: session) else {
@@ -4152,6 +4286,9 @@ class TerminalController {
 
             let terminalContext: AgentWorkspaceContext
             let terminalPanel: TerminalPanel
+            let placement: String
+            let splitApplied: Bool
+            let visibilityGuardPayload: [String: Any]?
 
             if let explicitSurfaceId = v2UUID(params, "surface_id"),
                let explicitTerminalPanel = baseContext.workspace.terminalPanel(for: explicitSurfaceId) {
@@ -4163,20 +4300,84 @@ class TerminalController {
                     paneId: baseContext.workspace.paneId(forPanelId: explicitSurfaceId)?.id,
                     surfaceId: explicitSurfaceId
                 )
-            } else {
-                let splitDirection = parseSplitDirection(splitRaw ?? "right") ?? .right
+                placement = "surface"
+                splitApplied = false
+                visibilityGuardPayload = nil
+            } else if let reusedSurfaceId = v2AgentReusableTerminalSurfaceId(params: params, context: baseContext),
+                      let reusedPanel = baseContext.workspace.terminalPanel(for: reusedSurfaceId) {
+                terminalPanel = reusedPanel
+                terminalContext = AgentWorkspaceContext(
+                    windowId: baseContext.windowId,
+                    tabManager: baseContext.tabManager,
+                    workspace: baseContext.workspace,
+                    paneId: baseContext.workspace.paneId(forPanelId: reusedSurfaceId)?.id,
+                    surfaceId: reusedSurfaceId
+                )
+                placement = "surface"
+                splitApplied = false
+                visibilityGuardPayload = nil
+            } else if let splitRaw {
+                let splitDirection = parseSplitDirection(splitRaw) ?? .right
                 let sourceSurfaceId = baseContext.surfaceId ?? orderedPanels(in: baseContext.workspace).first?.id
                 guard let sourceSurfaceId else {
                     result = .err(code: "not_found", message: "No source surface available to create task terminal", data: nil)
                     return
                 }
-                guard let createdPanel = baseContext.workspace.newTerminalSplit(
-                    from: sourceSurfaceId,
-                    orientation: splitDirection.orientation,
-                    insertFirst: splitDirection.insertFirst,
-                    focus: false
-                ) else {
-                    result = .err(code: "internal_error", message: "Failed to create task terminal", data: nil)
+                let splitDecision = v2AgentSplitVisibilityDecision(
+                    workspace: baseContext.workspace,
+                    sourceSurfaceId: sourceSurfaceId,
+                    direction: splitDirection
+                )
+                if let splitDecision,
+                   splitDecision.requiresFallback,
+                   let sourcePaneId = baseContext.workspace.paneId(forPanelId: sourceSurfaceId),
+                   let createdPanel = baseContext.workspace.newTerminalSurface(
+                    inPane: sourcePaneId,
+                    focus: false,
+                    workingDirectory: cwd
+                   ) {
+                    terminalPanel = createdPanel
+                    terminalContext = AgentWorkspaceContext(
+                        windowId: baseContext.windowId,
+                        tabManager: baseContext.tabManager,
+                        workspace: baseContext.workspace,
+                        paneId: sourcePaneId.id,
+                        surfaceId: createdPanel.id
+                    )
+                    placement = "surface"
+                    splitApplied = false
+                    visibilityGuardPayload = splitDecision.payload
+                } else {
+                    guard let createdPanel = baseContext.workspace.newTerminalSplit(
+                        from: sourceSurfaceId,
+                        orientation: splitDirection.orientation,
+                        insertFirst: splitDirection.insertFirst,
+                        focus: false
+                    ) else {
+                        result = .err(code: "internal_error", message: "Failed to create task terminal", data: nil)
+                        return
+                    }
+                    terminalPanel = createdPanel
+                    terminalContext = AgentWorkspaceContext(
+                        windowId: baseContext.windowId,
+                        tabManager: baseContext.tabManager,
+                        workspace: baseContext.workspace,
+                        paneId: baseContext.workspace.paneId(forPanelId: createdPanel.id)?.id,
+                        surfaceId: createdPanel.id
+                    )
+                    placement = "split"
+                    splitApplied = true
+                    visibilityGuardPayload = nil
+                }
+            } else {
+                guard let requestedPaneUUID = v2UUID(params, "pane_id") ?? baseContext.paneId,
+                      let requestedPaneId = v2AgentPaneId(for: requestedPaneUUID, workspace: baseContext.workspace),
+                      let createdPanel = baseContext.workspace.newTerminalSurface(
+                        inPane: requestedPaneId,
+                        focus: false,
+                        workingDirectory: cwd
+                      ) else {
+                    result = .err(code: "internal_error", message: "Failed to create task terminal surface", data: nil)
                     return
                 }
                 terminalPanel = createdPanel
@@ -4184,14 +4385,32 @@ class TerminalController {
                     windowId: baseContext.windowId,
                     tabManager: baseContext.tabManager,
                     workspace: baseContext.workspace,
-                    paneId: baseContext.workspace.paneId(forPanelId: createdPanel.id)?.id,
+                    paneId: requestedPaneId.id,
                     surfaceId: createdPanel.id
                 )
+                placement = "surface"
+                splitApplied = false
+                visibilityGuardPayload = nil
             }
 
             let taskId = "job:\(v2AgentNextTaskOrdinal)"
             v2AgentNextTaskOrdinal += 1
             let now = Date()
+            let effectiveCommand: String
+            if let cwd, !cwd.isEmpty {
+                effectiveCommand = "cd \(v2AgentShellQuote(cwd)) && \(command)"
+            } else {
+                effectiveCommand = command
+            }
+            let commandText = v2AgentWrappedTaskCommand(
+                taskId: taskId,
+                command: effectiveCommand
+            ) + "\n"
+            let shellState = terminalContext.workspace.panelShellActivityState(panelId: terminalPanel.id)
+            let shouldQueueUntilPrompt = shellState == .commandRunning
+            let startedAt = shouldQueueUntilPrompt ? nil : now
+            let initialStatus: AgentTaskStatus = shouldQueueUntilPrompt ? .queued : .running
+
             let task = AgentTask(
                 id: taskId,
                 sessionId: sessionId,
@@ -4212,14 +4431,14 @@ class TerminalController {
                 workspaceId: terminalContext.workspace.id,
                 paneId: terminalContext.paneId,
                 surfaceId: terminalContext.surfaceId,
-                status: .running,
-                startedAt: now,
+                status: initialStatus,
+                startedAt: startedAt,
                 completedAt: nil,
                 exitCode: nil
             )
             v2AgentTasks[taskId] = task
             v2AgentAppendEvent(
-                type: "task.started",
+                type: shouldQueueUntilPrompt ? "task.queued" : "task.started",
                 sessionId: sessionId,
                 workspaceId: terminalContext.workspace.id,
                 surfaceId: terminalContext.surfaceId,
@@ -4238,17 +4457,21 @@ class TerminalController {
             )
             v2AgentSyncWorkspaceManagedPresentation(workspace: terminalContext.workspace)
 
-            let effectiveCommand: String
-            if let cwd, !cwd.isEmpty {
-                effectiveCommand = "cd \(v2AgentShellQuote(cwd)) && \(command)"
+            let queued: Bool
+            if shouldQueueUntilPrompt,
+               let surfaceId = terminalContext.surfaceId {
+                v2AgentQueueTaskCommand(
+                    taskId: taskId,
+                    sessionId: sessionId,
+                    workspaceId: terminalContext.workspace.id,
+                    surfaceId: surfaceId,
+                    text: commandText,
+                    terminalPanel: terminalPanel
+                )
+                queued = true
             } else {
-                effectiveCommand = command
+                queued = v2AgentSendText(commandText, terminalPanel: terminalPanel)
             }
-            let commandText = v2AgentWrappedTaskCommand(
-                taskId: taskId,
-                command: effectiveCommand
-            ) + "\n"
-            let queued = v2AgentSendText(commandText, terminalPanel: terminalPanel)
             let updatedSession = v2AgentPersistSession(
                 sessionId: sessionId,
                 session: session,
@@ -4260,6 +4483,12 @@ class TerminalController {
             payload["layout_rev"] = updatedSession.layoutRev
             payload["task"] = v2AgentTaskPayload(task)
             payload["queued"] = queued
+            payload["placement"] = placement
+            payload["requested_split"] = v2OrNull(splitRaw)
+            payload["split_applied"] = splitApplied
+            if let visibilityGuardPayload {
+                payload["visibility_guard"] = visibilityGuardPayload
+            }
             result = .ok(payload)
         }
         return result
@@ -4691,6 +4920,39 @@ class TerminalController {
                     "job_id": taskId,
                     "status": task.status.rawValue,
                     "already_terminal": true
+                ])
+                return
+            }
+
+            if task.status == .queued,
+               let surfaceId = task.surfaceId {
+                self.v2AgentPendingTaskCommandsBySurface.removeValue(forKey: surfaceId)
+                task.status = .cancelled
+                task.updatedAt = Date()
+                task.completedAt = task.updatedAt
+                self.v2AgentTasks[taskId] = task
+                self.v2AgentAppendEvent(
+                    type: "task.cancelled",
+                    sessionId: sessionId,
+                    workspaceId: task.workspaceId,
+                    surfaceId: task.surfaceId,
+                    payload: [
+                        "job_id": task.id,
+                        "status": task.status.rawValue,
+                        "interrupt_delivery": "pending_queue"
+                    ]
+                )
+                self.v2AgentMaybeFinalizeProfileGroup(task: task)
+                if let workspaceId = task.workspaceId,
+                   let workspace = self.tabForSidebarMutation(id: workspaceId) {
+                    self.v2AgentSyncWorkspaceManagedPresentation(workspace: workspace)
+                }
+                result = .ok([
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "status": task.status.rawValue,
+                    "interrupt_delivery": "pending_queue",
+                    "event_cursor": self.v2AgentCurrentEventCursor()
                 ])
                 return
             }
@@ -5567,6 +5829,77 @@ class TerminalController {
         return nil
     }
 
+    private func v2AgentPaneBounds(
+        targetPaneId: String,
+        node: ExternalTreeNode
+    ) -> CGRect? {
+        switch node {
+        case .pane(let pane):
+            guard pane.id == targetPaneId else { return nil }
+            return CGRect(
+                x: pane.frame.x,
+                y: pane.frame.y,
+                width: pane.frame.width,
+                height: pane.frame.height
+            )
+
+        case .split(let split):
+            return v2AgentPaneBounds(targetPaneId: targetPaneId, node: split.first)
+                ?? v2AgentPaneBounds(targetPaneId: targetPaneId, node: split.second)
+        }
+    }
+
+    private func v2AgentPredictedPaneBoundsAfterSplit(
+        sourceBounds: CGRect,
+        direction: SplitDirection
+    ) -> CGRect {
+        let normalizedBounds = sourceBounds.standardized
+        switch direction.orientation {
+        case .horizontal:
+            return CGRect(
+                x: normalizedBounds.origin.x,
+                y: normalizedBounds.origin.y,
+                width: max(normalizedBounds.width * 0.5, 0),
+                height: max(normalizedBounds.height, 0)
+            )
+        case .vertical:
+            return CGRect(
+                x: normalizedBounds.origin.x,
+                y: normalizedBounds.origin.y,
+                width: max(normalizedBounds.width, 0),
+                height: max(normalizedBounds.height * 0.5, 0)
+            )
+        }
+    }
+
+    private func v2AgentSplitVisibilityDecision(
+        workspace: Workspace,
+        sourceSurfaceId: UUID,
+        direction: SplitDirection
+    ) -> AgentSplitVisibilityDecision? {
+        guard let sourcePaneUUID = workspace.paneId(forPanelId: sourceSurfaceId)?.id,
+              let sourceBounds = v2AgentPaneBounds(
+                targetPaneId: sourcePaneUUID.uuidString,
+                node: workspace.bonsplitController.treeSnapshot()
+              ),
+              sourceBounds.width > 1,
+              sourceBounds.height > 1 else {
+            return nil
+        }
+
+        let predictedBounds = v2AgentPredictedPaneBoundsAfterSplit(
+            sourceBounds: sourceBounds,
+            direction: direction
+        )
+        return AgentSplitVisibilityDecision(
+            sourcePaneId: sourcePaneUUID,
+            sourceBounds: sourceBounds,
+            predictedBounds: predictedBounds,
+            minimumVisibleWidth: v2AgentMinimumVisibleSplitWidth,
+            minimumVisibleHeight: v2AgentMinimumVisibleSplitHeight
+        )
+    }
+
     private func v2AgentFocusedPayload(context: AgentWorkspaceContext) -> [String: Any] {
         [
             "window_id": v2OrNull(context.windowId?.uuidString),
@@ -6269,6 +6602,79 @@ class TerminalController {
         terminalPanel.sendText("\u{3}")
         terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded()
         return "queued_text"
+    }
+
+    private func v2AgentQueueTaskCommand(
+        taskId: String,
+        sessionId: String,
+        workspaceId: UUID,
+        surfaceId: UUID,
+        text: String,
+        terminalPanel: TerminalPanel
+    ) {
+        v2AgentPendingTaskCommandsBySurface[surfaceId] = AgentPendingTaskCommand(
+            taskId: taskId,
+            sessionId: sessionId,
+            workspaceId: workspaceId,
+            surfaceId: surfaceId,
+            text: text
+        )
+        terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded()
+    }
+
+    private func v2AgentMaybeDispatchPendingTaskCommand(
+        workspaceId: UUID,
+        surfaceId: UUID
+    ) {
+        guard let pending = v2AgentPendingTaskCommandsBySurface[surfaceId],
+              pending.workspaceId == workspaceId else {
+            return
+        }
+        guard var task = v2AgentTasks[pending.taskId],
+              task.sessionId == pending.sessionId else {
+            v2AgentPendingTaskCommandsBySurface.removeValue(forKey: surfaceId)
+            return
+        }
+        guard task.status == .queued else {
+            if task.status.isTerminal {
+                v2AgentPendingTaskCommandsBySurface.removeValue(forKey: surfaceId)
+            }
+            return
+        }
+        guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: workspaceId),
+              let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }),
+              let terminalPanel = workspace.terminalPanel(for: surfaceId) else {
+            return
+        }
+
+        v2AgentPendingTaskCommandsBySurface.removeValue(forKey: surfaceId)
+        let queuedDelivery = v2AgentSendText(pending.text, terminalPanel: terminalPanel)
+        let now = Date()
+        task.status = .running
+        task.startedAt = now
+        task.updatedAt = now
+        v2AgentTasks[pending.taskId] = task
+
+        v2AgentAppendEvent(
+            type: "task.started",
+            sessionId: pending.sessionId,
+            workspaceId: workspaceId,
+            surfaceId: surfaceId,
+            payload: [
+                "job_id": task.id,
+                "status": task.status.rawValue,
+                "label": task.label,
+                "command": task.command,
+                "group_id": v2OrNull(task.groupId),
+                "profile": v2OrNull(task.profileName),
+                "expected_ports": task.expectedPorts,
+                "execution_class": v2OrNull(task.executionClass),
+                "approval_state": v2OrNull(task.approvalState),
+                "retry": v2OrNull(v2AgentRetryPayload(task)),
+                "queued_delivery": queuedDelivery
+            ]
+        )
+        v2AgentSyncWorkspaceManagedPresentation(workspace: workspace)
     }
 
     private func v2AgentProfileCacheKey(
@@ -7692,10 +8098,8 @@ class TerminalController {
     }
 
     private func v2AgentWrappedTaskCommand(taskId: String, command: String) -> String {
-        let reportPayload = "report_task_result \(taskId) $__bmux_exit --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"
-        let quotedReportPayload = v2AgentShellQuote(reportPayload)
         return """
-        ( \(command) ); __bmux_exit=$?; if [ -n "$CMUX_SOCKET_PATH" ] && [ -n "$CMUX_TAB_ID" ] && [ -n "$CMUX_PANEL_ID" ]; then if command -v _bmux_send_bg >/dev/null 2>&1; then _bmux_send_bg \(quotedReportPayload); elif command -v ncat >/dev/null 2>&1; then printf '%s\\n' \(quotedReportPayload) | ncat -w 1 -U "$CMUX_SOCKET_PATH" --send-only >/dev/null 2>&1 || true; elif command -v socat >/dev/null 2>&1; then printf '%s\\n' \(quotedReportPayload) | socat -T 1 - "UNIX-CONNECT:$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; elif command -v nc >/dev/null 2>&1; then if printf '%s\\n' \(quotedReportPayload) | nc -N -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1; then :; else printf '%s\\n' \(quotedReportPayload) | nc -w 1 -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; fi; fi; fi; ( exit $__bmux_exit )
+        \(command); __bmux_exit=$?; if [ -n "$CMUX_SOCKET_PATH" ] && [ -n "$CMUX_TAB_ID" ] && [ -n "$CMUX_PANEL_ID" ]; then __bmux_payload="report_task_result \(taskId) $__bmux_exit --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"; if command -v _bmux_send_bg >/dev/null 2>&1; then _bmux_send_bg "$__bmux_payload"; elif command -v nc >/dev/null 2>&1; then if printf '%s\\n' "$__bmux_payload" | nc -N -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1; then :; else printf '%s\\n' "$__bmux_payload" | nc -w 1 -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; fi; elif command -v ncat >/dev/null 2>&1; then printf '%s\\n' "$__bmux_payload" | ncat -w 1 -U "$CMUX_SOCKET_PATH" --send-only >/dev/null 2>&1 || true; elif command -v socat >/dev/null 2>&1; then printf '%s\\n' "$__bmux_payload" | socat -T 1 - "UNIX-CONNECT:$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; fi; fi; ( exit $__bmux_exit )
         """
     }
 
@@ -20798,6 +21202,12 @@ class TerminalController {
             DispatchQueue.main.async {
                 guard let tabManager = AppDelegate.shared?.tabManagerFor(tabId: scope.workspaceId) else { return }
                 tabManager.updateSurfaceShellActivity(tabId: scope.workspaceId, surfaceId: scope.panelId, state: state)
+                if state == .promptIdle {
+                    self.v2AgentMaybeDispatchPendingTaskCommand(
+                        workspaceId: scope.workspaceId,
+                        surfaceId: scope.panelId
+                    )
+                }
             }
             return "OK"
         }
@@ -20840,6 +21250,12 @@ class TerminalController {
             }
 
             tabManager.updateSurfaceShellActivity(tabId: tab.id, surfaceId: surfaceId, state: state)
+            if state == .promptIdle {
+                self.v2AgentMaybeDispatchPendingTaskCommand(
+                    workspaceId: tab.id,
+                    surfaceId: surfaceId
+                )
+            }
         }
         return result
     }
@@ -20860,6 +21276,9 @@ class TerminalController {
 
         DispatchQueue.main.async {
             guard var task = self.v2AgentTasks[taskId] else { return }
+            if let surfaceId = task.surfaceId {
+                self.v2AgentPendingTaskCommandsBySurface.removeValue(forKey: surfaceId)
+            }
             if let workspaceId, task.workspaceId == nil {
                 task.workspaceId = workspaceId
             }
