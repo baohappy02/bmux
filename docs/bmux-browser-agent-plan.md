@@ -419,6 +419,10 @@ Priority policies:
 4. `auto_close_on_success`
 5. `reuse_surface`
 6. `max_parallelism`
+7. `package_manager_preference`
+8. `network_access`
+9. `pricing_gate`
+10. `approval_behavior`
 
 ## Batch and Ensure Flows
 
@@ -438,6 +442,7 @@ Rules:
 1. each step should return a compact per-step result
 2. the batch result should stop on the first hard failure unless `continue_on_error` is requested
 3. batch responses must remain smaller than the equivalent sequence of separate calls plus discovery overhead
+4. batch preflight should block before side effects when any step is classified as `billing_risk` or disallowed external work without approval
 
 ### `agent.ensure`
 
@@ -472,6 +477,7 @@ The capability payload should include:
 6. default cwd and title policies for new terminals
 7. whether local semantic search is available, warming, or disabled
 8. persisted user preferences that affect tool choice or research policy
+9. effective execution policy for network access, pricing checks, and approval gates
 
 ## Preference Memory and Research Gates
 
@@ -491,6 +497,27 @@ Rules:
 4. before Codex does deeper research, setup, or prototyping for an external tool or service, it should check pricing first
 5. if pricing is paid, usage-based, or billing-gated for the intended workflow, Codex should stop and ask before going deeper
 6. if pricing cannot be confirmed quickly, Codex should report that pricing is still unclear before continuing
+
+## Execution Classes and Approval Gates
+
+Every task, profile, and batch step should be classifiable before execution.
+
+Recommended execution classes:
+
+1. `local_read`
+2. `local_exec`
+3. `local_verify`
+4. `network_research`
+5. `external_service`
+6. `billing_risk`
+
+Rules:
+
+1. `local_read`, `local_exec`, and `local_verify` should usually proceed without extra approval
+2. `network_research`, `external_service`, and `billing_risk` should be preflighted against pricing and approval policy before execution
+3. `agent.task.run`, `agent.task.run_profile`, and `agent.batch` should surface the execution class before or with execution
+4. if pricing is known to be paid or billing-gated for the intended workflow, bmux should stop before side effects and return an approval-shaped result
+5. if pricing is still unknown, bmux should default to a blocked or warning result instead of silently proceeding into deeper paid research
 
 ## Local-First Semantic Retrieval
 
@@ -829,6 +856,12 @@ Example:
     "preferred_js_package_manager": "bun",
     "pricing_first_research": true,
     "stop_on_paid_option_without_approval": true
+  },
+  "policy": {
+    "default_execution_class": "local_verify",
+    "network_research_requires_pricing_check": true,
+    "block_paid_or_billing_gated_work_without_approval": true,
+    "block_unknown_pricing_before_deeper_research": true
   }
 }
 ```
@@ -926,7 +959,8 @@ Behavior:
 2. runs a command without streaming the full log back to the model
 3. stores full logs on disk and in bmux state
 4. optionally uses a parser adapter or named profile
-5. returns a small job handle immediately
+5. preflights execution class, pricing state, and approval policy before side effects when external work is involved
+6. returns a small job handle immediately when execution is allowed
 
 Recommended fields:
 
@@ -937,6 +971,9 @@ Recommended fields:
 5. `log_path`
 6. `parser`
 7. `policy`
+8. `execution_class`
+9. `approval_state`
+10. `package_manager`
 
 Example:
 
@@ -949,7 +986,10 @@ Example:
   "status": "running",
   "log_path": "/tmp/bmux-jobs/job-3.log",
   "parser": "tsc",
-  "policy": "managed"
+  "policy": "managed",
+  "execution_class": "local_verify",
+  "approval_state": "not_required",
+  "package_manager": "bun"
 }
 ```
 
@@ -996,10 +1036,26 @@ Example response:
   "ok": true,
   "group_id": "group:2",
   "profile": "verify.ts",
+  "execution_class": "local_verify",
+  "approval_state": "not_required",
+  "package_manager": "bun",
   "jobs": [
     {"job_id": "job:7", "label": "typecheck", "status": "running"},
     {"job_id": "job:8", "label": "build", "status": "running"}
   ]
+}
+```
+
+If a profile or command would cross an approval gate, bmux should stop before work starts:
+
+```json
+{
+  "ok": false,
+  "code": "approval_required",
+  "profile": "research.some-paid-tool",
+  "execution_class": "billing_risk",
+  "pricing_state": "paid",
+  "message": "Pricing indicates this workflow is paid or billing-gated. Report this to the user before continuing."
 }
 ```
 
@@ -1534,6 +1590,10 @@ Recommended error codes:
 14. `index_missing`
 15. `index_stale`
 16. `search_backend_unavailable`
+17. `approval_required`
+18. `pricing_unknown`
+19. `paid_option_detected`
+20. `network_disallowed`
 
 Example:
 
@@ -1546,6 +1606,18 @@ Example:
 }
 ```
 
+Approval-gated example:
+
+```json
+{
+  "ok": false,
+  "code": "approval_required",
+  "execution_class": "billing_risk",
+  "pricing_state": "paid",
+  "message": "Pricing indicates this workflow is paid or billing-gated. Report this to the user before continuing."
+}
+```
+
 ## Agent Loop
 
 The expected low-token loop is:
@@ -1553,22 +1625,23 @@ The expected low-token loop is:
 1. `attach`
 2. `layout`
 3. `capabilities`
-4. `ensure` or `open` or `focus`
-5. `batch` for common setup flows
-6. `task.run` for build, test, or verification work
-7. `events` or `task.wait`
-8. `task.result`
-9. `service.wait` when a server or preview must come up
-10. `state.summary`
-11. `search` for concept lookup when exact names are unknown
-12. `surface.read`
-13. `terminal.write` or `browser.agent.observe`
-14. `terminal.capture` or `browser.agent.act`
-15. `wait`
-16. `browser.agent.read`
-17. `artifact.list` only when needed
-18. `logs` only when needed
-19. `artifact` only for debugging or human review
+4. if the next step involves an external tool or service, apply the pricing and approval gate first
+5. `ensure` or `open` or `focus`
+6. `batch` for common setup flows
+7. `task.run` for build, test, or verification work
+8. `events` or `task.wait`
+9. `task.result`
+10. `service.wait` when a server or preview must come up
+11. `state.summary`
+12. `search` for concept lookup when exact names are unknown
+13. `surface.read`
+14. `terminal.write` or `browser.agent.observe`
+15. `terminal.capture` or `browser.agent.act`
+16. `wait`
+17. `browser.agent.read`
+18. `artifact.list` only when needed
+19. `logs` only when needed
+20. `artifact` only for debugging or human review
 
 This replaces the current anti-pattern of:
 
@@ -1642,9 +1715,10 @@ Likely work split:
 3. derive a compact layout tree from existing pane and surface state
 4. add a managed job registry, artifact registry, and event cursor store
 5. add environment discovery and workspace fingerprint helpers
-6. add a local search index and repo-fingerprint invalidation path
-7. reuse browser telemetry and navigation hooks for `page_rev` updates
-8. keep legacy verbose commands for human debugging
+6. add an execution-policy evaluator for package-manager preference, pricing-first research, and approval gates
+7. add a local search index and repo-fingerprint invalidation path
+8. reuse browser telemetry and navigation hooks for `page_rev` updates
+9. keep legacy verbose commands for human debugging
 
 ## Rollout Plan
 
@@ -1656,14 +1730,15 @@ Likely work split:
 4. Add `agent.terminal.write`, `agent.terminal.capture`, and `agent.terminal.wait`.
 5. Add structured diagnostics adapters for the most common tools.
 6. Add `layout_rev`, `page_rev`, `ref_epoch`, log cursors, and event cursors.
-7. Keep responses terse and stable for Codex.
+7. Add execution-class preflight and approval-gate behavior for external or billing-risk workflows.
+8. Keep responses terse and stable for Codex.
 
 ### Milestone 1 Checklist
 
 Server and model state:
 
 1. add an `AgentSession` model keyed by `session_id`
-2. store `window_id`, `workspace_id`, `pane_id`, `surface_id`, `layout_rev`, event cursor, service registry, artifact registry, workspace fingerprint, terminal capture cursors, and user preferences
+2. store `window_id`, `workspace_id`, `pane_id`, `surface_id`, `layout_rev`, event cursor, service registry, artifact registry, workspace fingerprint, terminal capture cursors, user preferences, and effective execution policy
 3. invalidate or refresh session state on split, close, move, focus changes, job churn, and recovery events
 
 Socket methods:
@@ -1698,6 +1773,7 @@ Layout model:
 3. include only agent-relevant surface metadata: `surface_id`, `surface_kind`, `title`, `pane_id`
 4. keep layout responses bounded and deterministic
 5. make duplicate-title disambiguation deterministic within the chosen scope
+6. surface the active package-manager and pricing policy in one cheap discovery call
 
 Terminal model:
 
@@ -1718,6 +1794,7 @@ Task model:
 7. add workspace fingerprint caching for safe profiles
 8. add bounded retry metadata for transient failures
 9. redact secrets before returning tails or diagnostics
+10. block paid or pricing-unknown external workflows before side effects unless policy allows them
 
 CLI:
 
@@ -1762,6 +1839,7 @@ Agent enablement:
 4. document one standard workflow: open split, run server, wait for ready text, open browser
 5. document one standard workflow: attach, inspect capabilities, and use `ensure` instead of recreating resources
 6. document one standard workflow: check pricing first for an external tool and stop immediately when the intended option is paid unless the user approves
+7. document one standard workflow: prefer `bun`, but explain the exact fallback when project constraints force another package manager
 
 App integration:
 
@@ -1781,7 +1859,8 @@ App integration:
 6. Add workspace fingerprint caching for safe verify profiles.
 7. Add secret redaction, transient retry policy, and recovery events.
 8. Add local-first `agent.search`, `agent.search.index`, and `agent.search.status`.
-9. Add documentation and examples for event-driven Codex loops.
+9. Add policy-aware external research flows and approval-shaped responses for paid or pricing-unknown tools.
+10. Add documentation and examples for event-driven Codex loops.
 
 ### Milestone 3
 
@@ -1829,3 +1908,5 @@ Deliverables after the CLI exists:
 13. Which local backend should power `agent.search`: sqlite FTS, a vector index, or a hybrid of both?
 14. Should GitNexus participate as an optional reranker or separate companion path for `agent.search`?
 15. Should user preferences such as package-manager policy and pricing-first research live in bmux app settings, Codex instructions, or both?
+16. Should unknown pricing block by default, or only when a workflow would likely cross a paid external boundary?
+17. Where should pricing metadata come from for external tools: manual profile metadata, web research, or both?

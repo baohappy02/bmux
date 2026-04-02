@@ -127,6 +127,8 @@ class TerminalController {
     ]
 
     private static let focusIntentV2Methods: Set<String> = [
+        "agent.open",
+        "agent.focus",
         "window.focus",
         "workspace.select",
         "workspace.next",
@@ -188,6 +190,26 @@ class TerminalController {
     private static let v2BrowserEvalEnvelopeTypeUndefined = "undefined"
     private static let v2BrowserEvalEnvelopeTypeValue = "value"
 
+    private struct AgentSession {
+        let id: String
+        let createdAt: Date
+        var updatedAt: Date
+        var windowId: UUID?
+        var workspaceId: UUID?
+        var paneId: UUID?
+        var surfaceId: UUID?
+        var layoutRev: Int
+        var layoutSignature: String
+    }
+
+    private struct AgentWorkspaceContext {
+        let windowId: UUID?
+        let tabManager: TabManager
+        let workspace: Workspace
+        let paneId: UUID?
+        let surfaceId: UUID?
+    }
+
     private var v2BrowserNextElementOrdinal: Int = 1
     private var v2BrowserElementRefs: [String: V2BrowserElementRefEntry] = [:]
     private var v2BrowserFrameSelectorBySurface: [UUID: String] = [:]
@@ -198,6 +220,8 @@ class TerminalController {
     private var v2BrowserUnsupportedNetworkRequestsBySurface: [UUID: [[String: Any]]] = [:]
     private let v2BrowserUndefinedSentinel = V2BrowserUndefinedSentinel()
     private var browserDownloadObserver: NSObjectProtocol?
+    private var v2AgentNextSessionOrdinal: Int = 1
+    private var v2AgentSessions: [String: AgentSession] = [:]
 
     private init() {
         browserDownloadObserver = NotificationCenter.default.addObserver(
@@ -2020,6 +2044,20 @@ class TerminalController {
             return v2Ok(id: id, result: ["pong": true])
         case "system.capabilities":
             return v2Ok(id: id, result: v2Capabilities())
+        case "agent.attach":
+            return v2Result(id: id, self.v2AgentAttach(params: params))
+        case "agent.layout":
+            return v2Result(id: id, self.v2AgentLayout(params: params))
+        case "agent.capabilities":
+            return v2Result(id: id, self.v2AgentCapabilities(params: params))
+        case "agent.open":
+            return v2Result(id: id, self.v2AgentOpen(params: params))
+        case "agent.focus":
+            return v2Result(id: id, self.v2AgentFocus(params: params))
+        case "agent.close":
+            return v2Result(id: id, self.v2AgentClose(params: params))
+        case "agent.surface.read":
+            return v2Result(id: id, self.v2AgentSurfaceRead(params: params))
 
         case "system.identify":
             return v2Ok(id: id, result: v2Identify(params: params))
@@ -2425,6 +2463,13 @@ class TerminalController {
         var methods: [String] = [
             "system.ping",
             "system.capabilities",
+            "agent.attach",
+            "agent.layout",
+            "agent.capabilities",
+            "agent.open",
+            "agent.focus",
+            "agent.close",
+            "agent.surface.read",
             "system.identify",
             "system.tree",
             "auth.login",
@@ -2902,6 +2947,939 @@ class TerminalController {
             "pinned": workspace.isPinned,
             "panes": panes
         ]
+    }
+
+    private func v2AgentAttach(params: [String: Any]) -> V2CallResult {
+        guard let context = v2AgentResolveContext(params: params, session: nil) else {
+            return .err(code: "not_found", message: "Workspace not found", data: nil)
+        }
+
+        let sessionId = "ag_\(v2AgentNextSessionOrdinal)"
+        v2AgentNextSessionOrdinal += 1
+
+        let layout = v2AgentLayoutSnapshot(for: context)
+        let now = Date()
+        let session = AgentSession(
+            id: sessionId,
+            createdAt: now,
+            updatedAt: now,
+            windowId: context.windowId,
+            workspaceId: context.workspace.id,
+            paneId: context.paneId,
+            surfaceId: context.surfaceId,
+            layoutRev: 1,
+            layoutSignature: layout.signature
+        )
+        v2AgentSessions[sessionId] = session
+
+        return .ok(v2AgentAttachPayload(session: session, context: context))
+    }
+
+    private func v2AgentLayout(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+        guard let context = v2AgentResolveContext(params: params, session: session) else {
+            return .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+        }
+
+        let layout = v2AgentLayoutSnapshot(for: context)
+        let updatedSession = v2AgentUpdateSession(
+            session,
+            context: context,
+            layoutSignature: layout.signature
+        )
+        v2AgentSessions[sessionId] = updatedSession
+
+        var payload = layout.payload
+        payload["session_id"] = sessionId
+        payload["layout_rev"] = updatedSession.layoutRev
+        return .ok(payload)
+    }
+
+    private func v2AgentCapabilities(params: [String: Any]) -> V2CallResult {
+        let session = v2String(params, "session_id").flatMap { v2AgentSessions[$0] }
+        guard let context = v2AgentResolveContext(params: params, session: session) else {
+            return .err(code: "not_found", message: "Workspace not found", data: nil)
+        }
+
+        let packageManager = v2AgentInferredPackageManager(startingAt: context.workspace.currentDirectory)
+        let preferredPackageManager = v2AgentPreferredJSPackageManager(
+            inferredPackageManager: packageManager
+        )
+        let environment = v2AgentEnvironmentPayload(
+            context: context,
+            inferredPackageManager: packageManager
+        )
+
+        return .ok([
+            "backend_kind": v2AgentBackendKind(surfaceId: context.surfaceId, workspace: context.workspace),
+            "capabilities": v2AgentCapabilityFlags(),
+            "environment": environment,
+            "preferences": [
+                "preferred_js_package_manager": preferredPackageManager,
+                "pricing_first_research": true,
+                "stop_on_paid_option_without_approval": true
+            ],
+            "policy": [
+                "default_execution_class": "local_verify",
+                "network_research_requires_pricing_check": true,
+                "block_paid_or_billing_gated_work_without_approval": true,
+                "block_unknown_pricing_before_deeper_research": true
+            ]
+        ])
+    }
+
+    private func v2AgentOpen(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        let kind = (v2String(params, "kind") ?? "terminal").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let splitRaw = v2String(params, "split") ?? v2String(params, "direction")
+        let focusRequested = v2Bool(params, "focus") ?? true
+        let path = v2String(params, "path")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cwd = v2String(params, "cwd")?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !["terminal", "browser", "markdown"].contains(kind) {
+            return .err(code: "invalid_params", message: "Unsupported kind", data: [
+                "kind": kind,
+                "supported_kinds": ["terminal", "browser", "markdown"]
+            ])
+        }
+        if kind == "markdown", path?.isEmpty != false {
+            return .err(code: "invalid_params", message: "Markdown open requires path", data: nil)
+        }
+
+        let splitDirection: SplitDirection?
+        if let splitRaw {
+            guard let parsed = parseSplitDirection(splitRaw) else {
+                return .err(code: "invalid_params", message: "Missing or invalid split (left|right|up|down)", data: [
+                    "split": splitRaw
+                ])
+            }
+            splitDirection = parsed
+        } else {
+            splitDirection = nil
+        }
+
+        let url: URL?
+        if let urlString = v2String(params, "url")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !urlString.isEmpty {
+            guard let parsedURL = URL(string: urlString) else {
+                return .err(code: "invalid_params", message: "Invalid url", data: ["url": urlString])
+            }
+            url = parsedURL
+        } else {
+            url = nil
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to open agent surface", data: nil)
+        v2MainSync {
+            guard let baseContext = v2AgentResolveContext(params: params, session: session) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+                return
+            }
+
+            let workspace = baseContext.workspace
+            let tabManager = baseContext.tabManager
+            let shouldFocus = v2FocusAllowed(requested: focusRequested)
+            let requestedSurfaceId = v2UUID(params, "surface_id") ?? baseContext.surfaceId
+            let requestedPaneUUID = v2UUID(params, "pane_id") ?? baseContext.paneId
+            let requestedPaneId = requestedPaneUUID.flatMap { v2AgentPaneId(for: $0, workspace: workspace) }
+
+            if shouldFocus {
+                v2MaybeFocusWindow(for: tabManager)
+                v2MaybeSelectWorkspace(tabManager, workspace: workspace)
+            }
+
+            let openedPanelId: UUID?
+            let placement: String
+            switch kind {
+            case "browser":
+                if let splitDirection {
+                    guard let requestedSurfaceId, workspace.panels[requestedSurfaceId] != nil else {
+                        result = .err(code: "not_found", message: "Source surface not found", data: nil)
+                        return
+                    }
+                    openedPanelId = workspace.newBrowserSplit(
+                        from: requestedSurfaceId,
+                        orientation: splitDirection.orientation,
+                        insertFirst: splitDirection.insertFirst,
+                        url: url,
+                        focus: shouldFocus
+                    )?.id
+                    placement = "split"
+                } else {
+                    guard let requestedPaneId else {
+                        result = .err(code: "not_found", message: "Pane not found", data: nil)
+                        return
+                    }
+                    openedPanelId = workspace.newBrowserSurface(
+                        inPane: requestedPaneId,
+                        url: url,
+                        focus: shouldFocus
+                    )?.id
+                    placement = "surface"
+                }
+
+            case "markdown":
+                if let splitDirection {
+                    guard let requestedSurfaceId, workspace.panels[requestedSurfaceId] != nil else {
+                        result = .err(code: "not_found", message: "Source surface not found", data: nil)
+                        return
+                    }
+                    openedPanelId = workspace.newMarkdownSplit(
+                        from: requestedSurfaceId,
+                        orientation: splitDirection.orientation,
+                        insertFirst: splitDirection.insertFirst,
+                        filePath: path ?? "",
+                        focus: shouldFocus
+                    )?.id
+                    placement = "split"
+                } else {
+                    guard let requestedPaneId else {
+                        result = .err(code: "not_found", message: "Pane not found", data: nil)
+                        return
+                    }
+                    openedPanelId = workspace.newMarkdownSurface(
+                        inPane: requestedPaneId,
+                        filePath: path ?? "",
+                        focus: shouldFocus
+                    )?.id
+                    placement = "surface"
+                }
+
+            default:
+                if let splitDirection {
+                    guard let requestedSurfaceId, workspace.panels[requestedSurfaceId] != nil else {
+                        result = .err(code: "not_found", message: "Source surface not found", data: nil)
+                        return
+                    }
+                    openedPanelId = workspace.newTerminalSplit(
+                        from: requestedSurfaceId,
+                        orientation: splitDirection.orientation,
+                        insertFirst: splitDirection.insertFirst,
+                        focus: shouldFocus
+                    )?.id
+                    placement = "split"
+                } else {
+                    guard let requestedPaneId else {
+                        result = .err(code: "not_found", message: "Pane not found", data: nil)
+                        return
+                    }
+                    openedPanelId = workspace.newTerminalSurface(
+                        inPane: requestedPaneId,
+                        focus: shouldFocus,
+                        workingDirectory: cwd
+                    )?.id
+                    placement = "surface"
+                }
+            }
+
+            guard let openedPanelId else {
+                result = .err(code: "internal_error", message: "Failed to open agent surface", data: [
+                    "kind": kind,
+                    "placement": placement
+                ])
+                return
+            }
+
+            let openedPaneId = workspace.paneId(forPanelId: openedPanelId)?.id
+            let sessionContext = AgentWorkspaceContext(
+                windowId: baseContext.windowId,
+                tabManager: tabManager,
+                workspace: workspace,
+                paneId: openedPaneId,
+                surfaceId: openedPanelId
+            )
+            let updatedSession = v2AgentPersistSession(
+                sessionId: sessionId,
+                session: session,
+                context: sessionContext
+            )
+
+            var payload = v2AgentSurfaceSummary(context: sessionContext)
+            payload["session_id"] = sessionId
+            payload["layout_rev"] = updatedSession.layoutRev
+            payload["opened"] = [
+                "surface_id": openedPanelId.uuidString,
+                "surface_ref": v2Ref(kind: .surface, uuid: openedPanelId),
+                "pane_id": v2OrNull(openedPaneId?.uuidString),
+                "pane_ref": v2Ref(kind: .pane, uuid: openedPaneId),
+                "surface_kind": kind,
+                "placement": placement,
+                "split": v2OrNull(splitRaw?.lowercased()),
+                "focus_requested": focusRequested,
+                "focused": workspace.focusedPanelId == openedPanelId
+            ]
+            result = .ok(payload)
+        }
+        return result
+    }
+
+    private func v2AgentFocus(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to focus surface", data: nil)
+        v2MainSync {
+            guard let baseContext = v2AgentResolveContext(params: params, session: session) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+                return
+            }
+            guard let surfaceId = v2UUID(params, "surface_id") ?? baseContext.surfaceId,
+                  baseContext.workspace.panels[surfaceId] != nil else {
+                result = .err(code: "not_found", message: "Surface not found", data: nil)
+                return
+            }
+
+            v2MaybeFocusWindow(for: baseContext.tabManager)
+            v2MaybeSelectWorkspace(baseContext.tabManager, workspace: baseContext.workspace)
+            baseContext.workspace.focusPanel(surfaceId)
+
+            let focusedContext = AgentWorkspaceContext(
+                windowId: baseContext.windowId,
+                tabManager: baseContext.tabManager,
+                workspace: baseContext.workspace,
+                paneId: baseContext.workspace.paneId(forPanelId: surfaceId)?.id,
+                surfaceId: surfaceId
+            )
+            let updatedSession = v2AgentPersistSession(
+                sessionId: sessionId,
+                session: session,
+                context: focusedContext
+            )
+
+            var payload = v2AgentSurfaceSummary(context: focusedContext)
+            payload["session_id"] = sessionId
+            payload["layout_rev"] = updatedSession.layoutRev
+            result = .ok(payload)
+        }
+        return result
+    }
+
+    private func v2AgentClose(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to close surface", data: nil)
+        v2MainSync {
+            guard let baseContext = v2AgentResolveContext(params: params, session: session) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+                return
+            }
+            guard let surfaceId = v2UUID(params, "surface_id") ?? baseContext.surfaceId,
+                  baseContext.workspace.panels[surfaceId] != nil else {
+                result = .err(code: "not_found", message: "Surface not found", data: nil)
+                return
+            }
+            if baseContext.workspace.panels.count <= 1 {
+                result = .err(code: "invalid_state", message: "Cannot close the last surface", data: nil)
+                return
+            }
+
+            let closedContext = AgentWorkspaceContext(
+                windowId: baseContext.windowId,
+                tabManager: baseContext.tabManager,
+                workspace: baseContext.workspace,
+                paneId: baseContext.workspace.paneId(forPanelId: surfaceId)?.id,
+                surfaceId: surfaceId
+            )
+            let closedSummary = v2AgentSurfaceSummary(context: closedContext)
+            _ = baseContext.workspace.closePanel(surfaceId, force: true)
+
+            let survivingSurfaceId: UUID? = {
+                if let currentSessionSurfaceId = session.surfaceId,
+                   currentSessionSurfaceId != surfaceId,
+                   baseContext.workspace.panels[currentSessionSurfaceId] != nil {
+                    return currentSessionSurfaceId
+                }
+                return baseContext.workspace.focusedPanelId ?? orderedPanels(in: baseContext.workspace).first?.id
+            }()
+            let survivingPaneId = survivingSurfaceId.flatMap { baseContext.workspace.paneId(forPanelId: $0)?.id }
+            let survivingContext = AgentWorkspaceContext(
+                windowId: baseContext.windowId,
+                tabManager: baseContext.tabManager,
+                workspace: baseContext.workspace,
+                paneId: survivingPaneId,
+                surfaceId: survivingSurfaceId
+            )
+            let updatedSession = v2AgentPersistSession(
+                sessionId: sessionId,
+                session: session,
+                context: survivingContext
+            )
+
+            var payload = v2AgentSurfaceSummary(context: survivingContext)
+            payload["session_id"] = sessionId
+            payload["layout_rev"] = updatedSession.layoutRev
+            payload["closed"] = closedSummary
+            result = .ok(payload)
+        }
+        return result
+    }
+
+    private func v2AgentSurfaceRead(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to read surface", data: nil)
+        v2MainSync {
+            guard let baseContext = v2AgentResolveContext(params: params, session: session) else {
+                result = .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+                return
+            }
+            guard let surfaceId = v2UUID(params, "surface_id") ?? baseContext.surfaceId,
+                  baseContext.workspace.panels[surfaceId] != nil else {
+                result = .err(code: "not_found", message: "Surface not found", data: nil)
+                return
+            }
+
+            let readContext = AgentWorkspaceContext(
+                windowId: baseContext.windowId,
+                tabManager: baseContext.tabManager,
+                workspace: baseContext.workspace,
+                paneId: baseContext.workspace.paneId(forPanelId: surfaceId)?.id,
+                surfaceId: surfaceId
+            )
+            let updatedSession = v2AgentPersistSession(
+                sessionId: sessionId,
+                session: session,
+                context: readContext
+            )
+
+            var payload = v2AgentSurfaceSummary(context: readContext)
+            payload["session_id"] = sessionId
+            payload["layout_rev"] = updatedSession.layoutRev
+            result = .ok(payload)
+        }
+        return result
+    }
+
+    private func v2AgentResolveContext(
+        params: [String: Any],
+        session: AgentSession?
+    ) -> AgentWorkspaceContext? {
+        var effectiveParams = params
+        if effectiveParams["window_id"] == nil, let windowId = session?.windowId?.uuidString {
+            effectiveParams["window_id"] = windowId
+        }
+        if effectiveParams["workspace_id"] == nil, let workspaceId = session?.workspaceId?.uuidString {
+            effectiveParams["workspace_id"] = workspaceId
+        }
+        if effectiveParams["pane_id"] == nil, let paneId = session?.paneId?.uuidString {
+            effectiveParams["pane_id"] = paneId
+        }
+        if effectiveParams["surface_id"] == nil, let surfaceId = session?.surfaceId?.uuidString {
+            effectiveParams["surface_id"] = surfaceId
+        }
+
+        guard let tabManager = v2ResolveTabManager(params: effectiveParams),
+              let workspace = v2ResolveWorkspace(params: effectiveParams, tabManager: tabManager) else {
+            return nil
+        }
+
+        let requestedPaneUUID = v2UUID(effectiveParams, "pane_id")
+        let requestedPaneId = requestedPaneUUID.flatMap { v2AgentPaneId(for: $0, workspace: workspace) }
+        let requestedSurfaceId = v2UUID(effectiveParams, "surface_id")
+        let resolvedSurfaceId: UUID? = {
+            if let requestedSurfaceId, workspace.panels[requestedSurfaceId] != nil {
+                return requestedSurfaceId
+            }
+            if let requestedPaneId {
+                if let selectedTab = workspace.bonsplitController.selectedTab(inPane: requestedPaneId),
+                   let panelId = workspace.panelIdFromSurfaceId(selectedTab.id) {
+                    return panelId
+                }
+                if let firstTab = workspace.bonsplitController.tabs(inPane: requestedPaneId).first,
+                   let panelId = workspace.panelIdFromSurfaceId(firstTab.id) {
+                    return panelId
+                }
+            }
+            return workspace.focusedPanelId ?? orderedPanels(in: workspace).first?.id
+        }()
+        let resolvedPaneId = requestedPaneId?.id
+            ?? resolvedSurfaceId.flatMap { workspace.paneId(forPanelId: $0)?.id }
+            ?? workspace.bonsplitController.focusedPaneId?.id
+        let windowId = v2ResolveWindowId(tabManager: tabManager)
+
+        return AgentWorkspaceContext(
+            windowId: windowId,
+            tabManager: tabManager,
+            workspace: workspace,
+            paneId: resolvedPaneId,
+            surfaceId: resolvedSurfaceId
+        )
+    }
+
+    private func v2AgentUpdateSession(
+        _ session: AgentSession,
+        context: AgentWorkspaceContext,
+        layoutSignature: String
+    ) -> AgentSession {
+        var updated = session
+        updated.updatedAt = Date()
+        updated.windowId = context.windowId
+        updated.workspaceId = context.workspace.id
+        updated.paneId = context.paneId
+        updated.surfaceId = context.surfaceId
+        if updated.layoutSignature != layoutSignature {
+            updated.layoutRev += 1
+            updated.layoutSignature = layoutSignature
+        }
+        return updated
+    }
+
+    private func v2AgentPersistSession(
+        sessionId: String,
+        session: AgentSession,
+        context: AgentWorkspaceContext
+    ) -> AgentSession {
+        let layout = v2AgentLayoutSnapshot(for: context)
+        let updatedSession = v2AgentUpdateSession(
+            session,
+            context: context,
+            layoutSignature: layout.signature
+        )
+        v2AgentSessions[sessionId] = updatedSession
+        return updatedSession
+    }
+
+    private func v2AgentAttachPayload(
+        session: AgentSession,
+        context: AgentWorkspaceContext
+    ) -> [String: Any] {
+        var payload = v2AgentFocusedPayload(context: context)
+        payload["session_id"] = session.id
+        payload["backend_kind"] = v2AgentBackendKind(surfaceId: context.surfaceId, workspace: context.workspace)
+        payload["layout_rev"] = session.layoutRev
+        payload["title"] = v2AgentFocusedTitle(context: context)
+        payload["url"] = v2OrNull(v2AgentFocusedURL(context: context))
+        payload["ready_state"] = v2AgentReadyState(context: context)
+        payload["capabilities"] = v2AgentCapabilityFlags()
+        return payload
+    }
+
+    private func v2AgentLayoutSnapshot(
+        for context: AgentWorkspaceContext
+    ) -> (payload: [String: Any], signature: String) {
+        let rootNode = v2AgentLayoutNode(
+            node: context.workspace.bonsplitController.treeSnapshot(),
+            workspace: context.workspace
+        )
+        let payload: [String: Any] = [
+            "focused": v2AgentFocusedPayload(context: context),
+            "workspace": [
+                "workspace_id": context.workspace.id.uuidString,
+                "workspace_ref": v2Ref(kind: .workspace, uuid: context.workspace.id),
+                "title": context.workspace.title,
+                "root": rootNode
+            ]
+        ]
+        return (payload, v2AgentStableSignature(payload))
+    }
+
+    private func v2AgentLayoutNode(
+        node: ExternalTreeNode,
+        workspace: Workspace
+    ) -> [String: Any] {
+        switch node {
+        case .split(let split):
+            return [
+                "kind": "split",
+                "axis": split.orientation,
+                "children": [
+                    v2AgentLayoutNode(node: split.first, workspace: workspace),
+                    v2AgentLayoutNode(node: split.second, workspace: workspace)
+                ]
+            ]
+
+        case .pane(let pane):
+            let selectedPanelId = v2AgentSelectedPanelId(for: pane, workspace: workspace)
+            let panel = selectedPanelId.flatMap { workspace.panels[$0] }
+            let paneUUID = UUID(uuidString: pane.id)
+            let title = selectedPanelId.flatMap { workspace.panelTitle(panelId: $0) }
+                ?? panel?.displayTitle
+                ?? pane.tabs.first(where: { $0.id == pane.selectedTabId })?.title
+                ?? pane.tabs.first?.title
+                ?? "Pane"
+
+            return [
+                "kind": "surface",
+                "pane_id": v2OrNull(paneUUID?.uuidString),
+                "pane_ref": v2Ref(kind: .pane, uuid: paneUUID),
+                "surface_id": v2OrNull(selectedPanelId?.uuidString),
+                "surface_ref": v2Ref(kind: .surface, uuid: selectedPanelId),
+                "surface_kind": v2OrNull(panel?.panelType.rawValue),
+                "title": title,
+                "tab_count": pane.tabs.count
+            ]
+        }
+    }
+
+    private func v2AgentSelectedPanelId(
+        for pane: ExternalPaneNode,
+        workspace: Workspace
+    ) -> UUID? {
+        if let selectedTabId = pane.selectedTabId,
+           let selectedUUID = UUID(uuidString: selectedTabId),
+           let panelId = workspace.panelIdFromSurfaceId(TabID(uuid: selectedUUID)) {
+            return panelId
+        }
+
+        for tab in pane.tabs {
+            if let tabUUID = UUID(uuidString: tab.id),
+               let panelId = workspace.panelIdFromSurfaceId(TabID(uuid: tabUUID)) {
+                return panelId
+            }
+        }
+
+        return nil
+    }
+
+    private func v2AgentFocusedPayload(context: AgentWorkspaceContext) -> [String: Any] {
+        [
+            "window_id": v2OrNull(context.windowId?.uuidString),
+            "window_ref": v2Ref(kind: .window, uuid: context.windowId),
+            "workspace_id": context.workspace.id.uuidString,
+            "workspace_ref": v2Ref(kind: .workspace, uuid: context.workspace.id),
+            "pane_id": v2OrNull(context.paneId?.uuidString),
+            "pane_ref": v2Ref(kind: .pane, uuid: context.paneId),
+            "surface_id": v2OrNull(context.surfaceId?.uuidString),
+            "surface_ref": v2Ref(kind: .surface, uuid: context.surfaceId),
+            "surface_kind": v2OrNull(context.surfaceId.flatMap { context.workspace.panels[$0]?.panelType.rawValue })
+        ]
+    }
+
+    private func v2AgentCapabilityFlags() -> [String: Any] {
+        [
+            "native_pointer": false,
+            "file_upload": false,
+            "network_mocking": false,
+            "cross_origin_frames": false
+        ]
+    }
+
+    private func v2AgentFocusedTitle(context: AgentWorkspaceContext) -> String {
+        guard let surfaceId = context.surfaceId,
+              let panel = context.workspace.panels[surfaceId] else {
+            return context.workspace.title
+        }
+        return context.workspace.panelTitle(panelId: surfaceId) ?? panel.displayTitle
+    }
+
+    private func v2AgentPaneId(for paneUUID: UUID, workspace: Workspace) -> PaneID? {
+        workspace.bonsplitController.allPaneIds.first(where: { $0.id == paneUUID })
+    }
+
+    private func v2AgentSurfaceSummary(context: AgentWorkspaceContext) -> [String: Any] {
+        var payload: [String: Any] = [
+            "window_id": v2OrNull(context.windowId?.uuidString),
+            "window_ref": v2Ref(kind: .window, uuid: context.windowId),
+            "workspace_id": context.workspace.id.uuidString,
+            "workspace_ref": v2Ref(kind: .workspace, uuid: context.workspace.id)
+        ]
+
+        guard let surfaceId = context.surfaceId,
+              let panel = context.workspace.panels[surfaceId] else {
+            payload["pane_id"] = v2OrNull(context.paneId?.uuidString)
+            payload["pane_ref"] = v2Ref(kind: .pane, uuid: context.paneId)
+            payload["surface_id"] = NSNull()
+            payload["surface_ref"] = NSNull()
+            payload["surface_kind"] = NSNull()
+            payload["title"] = context.workspace.title
+            payload["focused"] = false
+            payload["selected_in_pane"] = false
+            payload["tab_count"] = 0
+            return payload
+        }
+
+        let paneUUID = context.workspace.paneId(forPanelId: surfaceId)?.id ?? context.paneId
+        let paneId = paneUUID.flatMap { v2AgentPaneId(for: $0, workspace: context.workspace) }
+        let selectedInPane: Bool = {
+            guard let paneId,
+                  let selectedTab = context.workspace.bonsplitController.selectedTab(inPane: paneId),
+                  let selectedPanelId = context.workspace.panelIdFromSurfaceId(selectedTab.id) else {
+                return false
+            }
+            return selectedPanelId == surfaceId
+        }()
+
+        payload["pane_id"] = v2OrNull(paneUUID?.uuidString)
+        payload["pane_ref"] = v2Ref(kind: .pane, uuid: paneUUID)
+        payload["surface_id"] = surfaceId.uuidString
+        payload["surface_ref"] = v2Ref(kind: .surface, uuid: surfaceId)
+        payload["surface_kind"] = panel.panelType.rawValue
+        payload["title"] = context.workspace.panelTitle(panelId: surfaceId) ?? panel.displayTitle
+        payload["focused"] = context.workspace.focusedPanelId == surfaceId
+        payload["selected_in_pane"] = selectedInPane
+        payload["tab_count"] = v2OrNull(paneId.map { context.workspace.bonsplitController.tabs(inPane: $0).count })
+
+        if let terminalPanel = context.workspace.terminalPanel(for: surfaceId) {
+            payload["terminal"] = [
+                "cwd": v2OrNull(context.workspace.panelDirectories[surfaceId]),
+                "tty": v2OrNull(context.workspace.surfaceTTYNames[surfaceId]),
+                "requested_cwd": v2OrNull(terminalPanel.requestedWorkingDirectory)
+            ]
+        } else if let browserPanel = context.workspace.browserPanel(for: surfaceId) {
+            payload["browser"] = [
+                "url": v2OrNull(browserPanel.currentURL?.absoluteString),
+                "page_title": browserPanel.pageTitle,
+                "is_loading": browserPanel.isLoading,
+                "ready_state": v2AgentReadyState(context: context),
+                "developer_tools_visible": browserPanel.isDeveloperToolsVisible()
+            ]
+        } else if let markdownPanel = context.workspace.markdownPanel(for: surfaceId) {
+            payload["markdown"] = [
+                "file_path": markdownPanel.filePath,
+                "is_file_unavailable": markdownPanel.isFileUnavailable
+            ]
+        }
+
+        return payload
+    }
+
+    private func v2AgentFocusedURL(context: AgentWorkspaceContext) -> String? {
+        guard let surfaceId = context.surfaceId,
+              let browserPanel = context.workspace.panels[surfaceId] as? BrowserPanel else {
+            return nil
+        }
+        return browserPanel.currentURL?.absoluteString
+    }
+
+    private func v2AgentReadyState(context: AgentWorkspaceContext) -> String {
+        guard let surfaceId = context.surfaceId,
+              let panel = context.workspace.panels[surfaceId] else {
+            return "ready"
+        }
+        if let browserPanel = panel as? BrowserPanel {
+            if browserPanel.isLoading {
+                return "loading"
+            }
+            return browserPanel.shouldRenderWebView ? "complete" : "new_tab"
+        }
+        return "ready"
+    }
+
+    private func v2AgentBackendKind(surfaceId: UUID?, workspace: Workspace) -> String {
+        guard let surfaceId,
+              workspace.panels[surfaceId]?.panelType == .browser else {
+            return "bmux_native"
+        }
+        return "wk_dom"
+    }
+
+    private func v2AgentStableSignature(_ payload: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            return UUID().uuidString
+        }
+        return text
+    }
+
+    private func v2AgentEnvironmentPayload(
+        context: AgentWorkspaceContext,
+        inferredPackageManager: String?
+    ) -> [String: Any] {
+        let cwd = context.workspace.currentDirectory
+        let repoRoot = v2AgentRepositoryRoot(startingAt: cwd)
+        let availableTools = v2AgentAvailableTools()
+        let parserNames = v2AgentAvailableParsers(from: availableTools)
+        let profileNames = v2AgentAvailableProfiles(
+            repoRoot: repoRoot,
+            availableTools: availableTools
+        )
+
+        var payload: [String: Any] = [
+            "repo_root": v2OrNull(repoRoot),
+            "package_manager": v2OrNull(inferredPackageManager),
+            "tools": availableTools,
+            "parsers": parserNames,
+            "profiles": profileNames,
+            "default_new_terminal_cwd": bmuxDefaultWorkingDirectoryPath(),
+            "search_backend": "none",
+            "search_index_ready": false
+        ]
+        if let repoRoot {
+            payload["cwd"] = repoRoot
+        }
+        return payload
+    }
+
+    private func v2AgentAvailableTools() -> [String] {
+        let candidates = [
+            "bun",
+            "node",
+            "tsc",
+            "pytest",
+            "python3",
+            "flutter",
+            "xcodebuild"
+        ]
+
+        return candidates.filter { v2AgentResolvedCommandPath($0) != nil }
+    }
+
+    private func v2AgentAvailableParsers(from availableTools: [String]) -> [String] {
+        var parsers: [String] = []
+        if availableTools.contains("tsc") { parsers.append("tsc") }
+        if availableTools.contains("pytest") { parsers.append("pytest") }
+        if availableTools.contains("flutter") { parsers.append("flutter_test") }
+        if availableTools.contains("xcodebuild") { parsers.append("xcodebuild") }
+        return parsers
+    }
+
+    private func v2AgentAvailableProfiles(
+        repoRoot: String?,
+        availableTools: [String]
+    ) -> [String] {
+        guard let repoRoot else { return [] }
+        let fileManager = FileManager.default
+        var profiles: [String] = []
+
+        if availableTools.contains("node") || availableTools.contains("bun") {
+            let packageJSONPath = URL(fileURLWithPath: repoRoot, isDirectory: true)
+                .appendingPathComponent("package.json")
+                .path
+            if fileManager.fileExists(atPath: packageJSONPath) {
+                profiles.append("verify.ts")
+                profiles.append("dev.web")
+            }
+        }
+
+        if availableTools.contains("flutter") {
+            let pubspecPath = URL(fileURLWithPath: repoRoot, isDirectory: true)
+                .appendingPathComponent("pubspec.yaml")
+                .path
+            if fileManager.fileExists(atPath: pubspecPath) {
+                profiles.append("verify.flutter")
+            }
+        }
+
+        return profiles
+    }
+
+    private func v2AgentPreferredJSPackageManager(inferredPackageManager: String?) -> String {
+        if v2AgentResolvedCommandPath("bun") != nil {
+            return "bun"
+        }
+        return inferredPackageManager ?? "npm"
+    }
+
+    private func v2AgentInferredPackageManager(startingAt directory: String?) -> String? {
+        guard let repoRoot = v2AgentRepositoryRoot(startingAt: directory) else {
+            return v2AgentResolvedCommandPath("bun") != nil ? "bun" : nil
+        }
+
+        let rootURL = URL(fileURLWithPath: repoRoot, isDirectory: true)
+        let fileManager = FileManager.default
+
+        let candidates: [(String, String)] = [
+            ("bun.lock", "bun"),
+            ("bun.lockb", "bun"),
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+            ("package-lock.json", "npm"),
+            ("npm-shrinkwrap.json", "npm")
+        ]
+
+        for (filename, manager) in candidates {
+            let candidate = rootURL.appendingPathComponent(filename).path
+            if fileManager.fileExists(atPath: candidate) {
+                return manager
+            }
+        }
+
+        let packageJSON = rootURL.appendingPathComponent("package.json").path
+        if fileManager.fileExists(atPath: packageJSON) {
+            if v2AgentResolvedCommandPath("bun") != nil {
+                return "bun"
+            }
+            if v2AgentResolvedCommandPath("npm") != nil {
+                return "npm"
+            }
+        }
+
+        return nil
+    }
+
+    private func v2AgentRepositoryRoot(startingAt directory: String?) -> String? {
+        guard let directory else { return nil }
+
+        let normalized = URL(fileURLWithPath: directory).standardizedFileURL.path
+        let fileManager = FileManager.default
+        var currentURL = URL(fileURLWithPath: normalized, isDirectory: true)
+
+        while true {
+            let gitURL = currentURL.appendingPathComponent(".git")
+            if fileManager.fileExists(atPath: gitURL.path) {
+                return currentURL.path
+            }
+
+            let parentURL = currentURL.deletingLastPathComponent()
+            if parentURL.path == currentURL.path {
+                break
+            }
+            currentURL = parentURL
+        }
+
+        return nil
+    }
+
+    private func v2AgentResolvedCommandPath(_ executable: String) -> String? {
+        guard !executable.isEmpty else { return nil }
+
+        let fileManager = FileManager.default
+        let environment = ProcessInfo.processInfo.environment
+        var searchDirectories: [String] = []
+        var seenDirectories = Set<String>()
+
+        func appendSearchPath(_ path: String?) {
+            guard let path else { return }
+            for rawComponent in path.split(separator: ":") {
+                let component = String(rawComponent).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !component.isEmpty,
+                      seenDirectories.insert(component).inserted else {
+                    continue
+                }
+                searchDirectories.append(component)
+            }
+        }
+
+        appendSearchPath(environment["PATH"])
+        appendSearchPath(getenv("PATH").map { String(cString: $0) })
+        appendSearchPath("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+
+        for directory in searchDirectories {
+            let candidate = URL(fileURLWithPath: directory, isDirectory: true)
+                .appendingPathComponent(executable)
+                .path
+            if fileManager.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+
+        return nil
     }
 
     // MARK: - V2 Helpers (encoding + result plumbing)

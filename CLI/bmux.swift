@@ -2356,6 +2356,8 @@ struct CMUXCLI {
             print(usage())
 
         // Browser commands
+        case "agent":
+            try runAgentCommand(commandArgs: commandArgs, client: client, jsonOutput: jsonOutput, idFormat: idFormat)
         case "browser":
             try runBrowserCommand(commandArgs: commandArgs, client: client, jsonOutput: jsonOutput, idFormat: idFormat)
 
@@ -4625,6 +4627,312 @@ struct CMUXCLI {
             timeout: timeout
         )
         return (result.status, result.stdout, result.stderr)
+    }
+
+    private func runAgentCommand(
+        commandArgs: [String],
+        client: SocketClient,
+        jsonOutput: Bool,
+        idFormat: CLIIDFormat
+    ) throws {
+        guard let subcommandRaw = commandArgs.first else {
+            throw CLIError(message: "agent requires a subcommand")
+        }
+
+        let subcommand = subcommandRaw.lowercased()
+        let subArgs = Array(commandArgs.dropFirst())
+
+        func output(_ payload: [String: Any], fallback: String) {
+            if jsonOutput {
+                print(jsonString(formatIDs(payload, mode: idFormat)))
+            } else {
+                print(fallback)
+            }
+        }
+
+        switch subcommand {
+        case "attach":
+            let (workspaceOpt, rem1) = parseOption(subArgs, name: "--workspace")
+            let (surfaceOpt, rem2) = parseOption(rem1, name: "--surface")
+            let (windowOpt, remaining) = parseOption(rem2, name: "--window")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent attach: unknown flag '\(unknown)'")
+            }
+
+            var params: [String: Any] = [:]
+            if let workspaceOpt,
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt,
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let windowOpt,
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+
+            let payload = try client.sendV2(method: "agent.attach", params: params)
+            let sessionId = (payload["session_id"] as? String) ?? "unknown"
+            let workspaceText = formatHandle(payload, kind: "workspace", idFormat: idFormat) ?? "unknown"
+            let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+            output(payload, fallback: "OK session=\(sessionId) workspace=\(workspaceText) surface=\(surfaceText)")
+
+        case "layout":
+            guard let sessionId = optionValue(subArgs, name: "--session") ?? optionValue(subArgs, name: "--session-id") else {
+                throw CLIError(message: "agent layout requires --session <id>")
+            }
+
+            var params: [String: Any] = ["session_id": sessionId]
+            if let workspaceOpt = optionValue(subArgs, name: "--workspace"),
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt = optionValue(subArgs, name: "--surface"),
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let windowOpt = optionValue(subArgs, name: "--window"),
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+
+            let payload = try client.sendV2(method: "agent.layout", params: params)
+            let workspacePayload = payload["workspace"] as? [String: Any] ?? [:]
+            let workspaceText = formatHandle([
+                "workspace_id": workspacePayload["workspace_id"] as Any,
+                "workspace_ref": workspacePayload["workspace_ref"] as Any
+            ], kind: "workspace", idFormat: idFormat) ?? "unknown"
+            let layoutRev = intFromAny(payload["layout_rev"]) ?? 0
+            output(payload, fallback: "OK session=\(sessionId) workspace=\(workspaceText) layout_rev=\(layoutRev)")
+
+        case "capabilities":
+            var params: [String: Any] = [:]
+            if let sessionId = optionValue(subArgs, name: "--session") ?? optionValue(subArgs, name: "--session-id") {
+                params["session_id"] = sessionId
+            }
+            if let workspaceOpt = optionValue(subArgs, name: "--workspace"),
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt = optionValue(subArgs, name: "--surface"),
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let windowOpt = optionValue(subArgs, name: "--window"),
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+
+            let payload = try client.sendV2(method: "agent.capabilities", params: params)
+            let backendKind = (payload["backend_kind"] as? String) ?? "unknown"
+            let packageManager = ((payload["environment"] as? [String: Any])?["package_manager"] as? String) ?? "unknown"
+            output(payload, fallback: "OK backend=\(backendKind) package_manager=\(packageManager)")
+
+        case "open":
+            var effectiveArgs = subArgs
+            let kindPositional: String? = {
+                guard let first = effectiveArgs.first, !first.hasPrefix("--") else { return nil }
+                effectiveArgs = Array(effectiveArgs.dropFirst())
+                return first
+            }()
+
+            let (sessionOptA, rem0) = parseOption(effectiveArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (kindOpt, rem2) = parseOption(rem1, name: "--kind")
+            let (workspaceOpt, rem3) = parseOption(rem2, name: "--workspace")
+            let (surfaceOpt, rem4) = parseOption(rem3, name: "--surface")
+            let (paneOpt, rem5) = parseOption(rem4, name: "--pane")
+            let (windowOpt, rem6) = parseOption(rem5, name: "--window")
+            let (splitOptA, rem7) = parseOption(rem6, name: "--split")
+            let (splitOptB, rem8) = parseOption(rem7, name: "--direction")
+            let (urlOpt, rem9) = parseOption(rem8, name: "--url")
+            let (pathOpt, rem10) = parseOption(rem9, name: "--path")
+            let (cwdOpt, rem11) = parseOption(rem10, name: "--cwd")
+            let (focusOpt, remaining) = parseOption(rem11, name: "--focus")
+
+            guard let sessionId = sessionOptA ?? sessionOptB else {
+                throw CLIError(message: "agent open requires --session <id>")
+            }
+
+            let kind = (kindPositional ?? kindOpt ?? "terminal").lowercased()
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent open: unknown flag '\(unknown)'")
+            }
+            let positionalArgs = remaining.filter { !$0.hasPrefix("--") }
+            var params: [String: Any] = [
+                "session_id": sessionId,
+                "kind": kind
+            ]
+
+            if let workspaceOpt,
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt,
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let paneOpt,
+               let paneId = try normalizePaneHandle(paneOpt, client: client) {
+                params["pane_id"] = paneId
+            }
+            if let windowOpt,
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+            if let split = splitOptA ?? splitOptB {
+                params["split"] = split
+            }
+            if let focusOpt {
+                guard let focus = parseBoolString(focusOpt) else {
+                    throw CLIError(message: "agent open: --focus must be true|false")
+                }
+                params["focus"] = focus
+            }
+
+            switch kind {
+            case "browser":
+                if urlOpt != nil, !positionalArgs.isEmpty {
+                    throw CLIError(message: "agent open browser: specify the URL either positionally or with --url, not both")
+                }
+                if positionalArgs.count > 1 {
+                    throw CLIError(message: "agent open browser: unexpected extra arguments")
+                }
+                if let url = urlOpt ?? positionalArgs.first {
+                    params["url"] = url
+                }
+            case "markdown":
+                if pathOpt != nil, !positionalArgs.isEmpty {
+                    throw CLIError(message: "agent open markdown: specify the path either positionally or with --path, not both")
+                }
+                if positionalArgs.count > 1 {
+                    throw CLIError(message: "agent open markdown: unexpected extra arguments")
+                }
+                let rawPath = pathOpt ?? positionalArgs.first
+                guard let rawPath else {
+                    throw CLIError(message: "agent open markdown requires --path <file> or a positional path")
+                }
+                params["path"] = resolvePath(rawPath)
+            case "terminal":
+                if !positionalArgs.isEmpty {
+                    throw CLIError(message: "agent open terminal: unexpected positional arguments")
+                }
+                if let cwdOpt {
+                    params["cwd"] = resolvePath(cwdOpt)
+                }
+            default:
+                throw CLIError(message: "agent open: unsupported kind '\(kind)'")
+            }
+
+            let payload = try client.sendV2(method: "agent.open", params: params)
+            let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+            let kindText = (payload["surface_kind"] as? String)
+                ?? ((payload["opened"] as? [String: Any])?["surface_kind"] as? String)
+                ?? kind
+            output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText) kind=\(kindText)")
+
+        case "focus":
+            let (sessionOptA, rem0) = parseOption(subArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+            let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+            let (windowOpt, remaining) = parseOption(rem3, name: "--window")
+
+            guard let sessionId = sessionOptA ?? sessionOptB else {
+                throw CLIError(message: "agent focus requires --session <id>")
+            }
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent focus: unknown flag '\(unknown)'")
+            }
+
+            var params: [String: Any] = ["session_id": sessionId]
+            if let workspaceOpt,
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt,
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let windowOpt,
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+
+            let payload = try client.sendV2(method: "agent.focus", params: params)
+            let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+            output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText)")
+
+        case "close":
+            let (sessionOptA, rem0) = parseOption(subArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+            let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+            let (windowOpt, remaining) = parseOption(rem3, name: "--window")
+
+            guard let sessionId = sessionOptA ?? sessionOptB else {
+                throw CLIError(message: "agent close requires --session <id>")
+            }
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent close: unknown flag '\(unknown)'")
+            }
+
+            var params: [String: Any] = ["session_id": sessionId]
+            if let workspaceOpt,
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt,
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let windowOpt,
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+
+            let payload = try client.sendV2(method: "agent.close", params: params)
+            let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+            output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText)")
+
+        case "surface-read", "read":
+            let (sessionOptA, rem0) = parseOption(subArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+            let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+            let (windowOpt, remaining) = parseOption(rem3, name: "--window")
+
+            guard let sessionId = sessionOptA ?? sessionOptB else {
+                throw CLIError(message: "agent surface-read requires --session <id>")
+            }
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent surface-read: unknown flag '\(unknown)'")
+            }
+
+            var params: [String: Any] = ["session_id": sessionId]
+            if let workspaceOpt,
+               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                params["workspace_id"] = workspaceId
+            }
+            if let surfaceOpt,
+               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                params["surface_id"] = surfaceId
+            }
+            if let windowOpt,
+               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                params["window_id"] = windowId
+            }
+
+            let payload = try client.sendV2(method: "agent.surface.read", params: params)
+            let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
+            let kind = (payload["surface_kind"] as? String) ?? "unknown"
+            output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText) kind=\(kind)")
+
+        default:
+            throw CLIError(message: "Unsupported agent subcommand: \(subcommand)")
+        }
     }
 
     private func runBrowserCommand(
@@ -7188,6 +7496,28 @@ struct CMUXCLI {
             Flags:
               --workspace <id|ref>   Target workspace (default: $CMUX_WORKSPACE_ID)
               --surface <id|ref>     Target surface (default: $CMUX_SURFACE_ID)
+            """
+        case "agent":
+            return """
+            Usage: bmux agent <attach|layout|capabilities|open|focus|close|surface-read> [flags]
+
+            Compact agent-oriented commands for coding agents such as Codex.
+
+            Subcommands:
+              attach [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
+              layout --session <session-id> [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
+              capabilities [--session <session-id>] [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
+              open <terminal|browser|markdown> --session <session-id> [--split <left|right|up|down>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--url <url>] [--path <file>] [--cwd <path>] [--focus <true|false>]
+              focus --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
+              close --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
+              surface-read --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
+
+            Notes:
+              - `attach` creates a lightweight bmux agent session and returns focused context.
+              - `layout` returns a compact split tree for the selected workspace.
+              - `capabilities` returns backend, environment, and preference metadata.
+              - `open` opens a compact agent-managed terminal/browser/markdown surface.
+              - `surface-read` returns a compact metadata snapshot for the target surface.
             """
         case "browser":
             return """
@@ -13259,6 +13589,7 @@ struct CMUXCLI {
           claude-teams [claude-args...]
           omo [opencode-args...]
           codex <install-hooks|uninstall-hooks>
+          agent <attach|layout|capabilities|open|focus|close|surface-read>
           ping
           version
           capabilities
