@@ -1724,6 +1724,8 @@ Likely work split:
 
 ## Rollout Plan
 
+Spark-ready implementation slices for the remaining work live in [docs/agent-plan-slices/README.md](/Users/macbook/Desktop/Me/TOOLs/bmux/docs/agent-plan-slices/README.md).
+
 ### Milestone 1
 
 1. Add `agent.attach`, `agent.layout`, `agent.capabilities`, `agent.open`, `agent.ensure`, `agent.batch`, `agent.focus`, and `agent.surface.read`.

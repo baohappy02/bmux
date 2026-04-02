@@ -59,6 +59,54 @@ Recommended ownership split:
 
 This avoids turning the bmux app repo into a second monorepo and keeps it possible to swap the backend later if needed.
 
+## Upstream Inspection Notes
+
+GitNexus upstream was cloned locally for inspection at `/tmp/GitNexus-upstream`.
+
+Important findings from the current upstream layout:
+
+1. the repo is a monorepo with a small core package in `gitnexus/` and a lot of extra surface in `gitnexus-web/`, editor integrations, eval harnesses, and skills
+2. the published `gitnexus` package license is `PolyForm-Noncommercial-1.0.0`
+3. the actual CLI shell is thin; the real weight sits in the ingestion pipeline, local backend, LadybugDB adapter, and search modules
+4. the current search stack is conceptually simple: LadybugDB FTS for lexical retrieval plus optional semantic reranking merged with Reciprocal Rank Fusion
+
+Practical consequence for bmux:
+
+1. use the upstream repo as architecture input
+2. do not vendor or lightly rewrite upstream code into bmux without reviewing license impact first
+3. prefer a clean-room implementation of the small useful ideas
+
+## Minimal Slice To Rebuild
+
+After inspecting upstream, bmux does not need most of the monorepo.
+
+The useful slice to replicate in bmux form is:
+
+1. thin CLI command routing
+2. local index registry and freshness metadata
+3. lexical search over files and symbols
+4. compact snippet extraction
+5. optional semantic reranking
+6. optional graph companion integration
+
+The upstream files worth studying as design references are:
+
+1. `gitnexus/src/cli/index.ts`
+2. `gitnexus/src/cli/tool.ts`
+3. `gitnexus/src/storage/repo-manager.ts`
+4. `gitnexus/src/core/search/bm25-index.ts`
+5. `gitnexus/src/core/search/hybrid-search.ts`
+6. `gitnexus/src/mcp/local/local-backend.ts`
+
+The upstream files bmux should ignore for the first iteration are:
+
+1. `gitnexus-web/`
+2. `.claude/`, packaged skills, and plugin integrations
+3. `eval/`
+4. wiki generation
+5. HTTP bridge mode
+6. broad MCP compatibility surface unrelated to bmux `agent.search`
+
 ## Target bmux Retrieval Model
 
 `agent.search` should be built as a layered local backend.
@@ -191,6 +239,7 @@ Rules:
 3. implement lexical retrieval with compact snippets
 4. add `rg` fallback when the index is cold
 5. measure token usage on real bmux tasks
+6. keep the first implementation clean-room and bmux-native rather than importing upstream code
 
 ### Phase 2: add graph fusion
 
@@ -208,6 +257,7 @@ Then:
 2. add bmux-focused Swift improvements
 3. trim unused upstream product surface
 4. keep the fork usable from Codex without large prompt instructions
+5. resolve licensing before any code reuse beyond architecture inspiration
 
 ## What Not To Do
 
