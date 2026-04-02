@@ -2889,6 +2889,50 @@ struct CMUXCLI {
         }
     }
 
+    private func agentRunManyParams(
+        from object: Any,
+        sessionId: String,
+        workspaceId: String?,
+        surfaceId: String?,
+        windowId: String?
+    ) throws -> [String: Any] {
+        let jobsPayload: [[String: Any]]
+        var params: [String: Any] = ["session_id": sessionId]
+
+        switch object {
+        case let jobs as [[String: Any]]:
+            jobsPayload = jobs
+
+        case let dict as [String: Any]:
+            guard let jobs = dict["jobs"] as? [[String: Any]] else {
+                throw CLIError(message: "agent run-many input object must be a JSON array of jobs or an object containing jobs")
+            }
+            jobsPayload = jobs
+            params = dict
+            if params["session_id"] == nil { params["session_id"] = sessionId }
+        default:
+            throw CLIError(message: "agent run-many input must be a JSON array of jobs or an object containing jobs")
+        }
+
+        if params["jobs"] == nil {
+            params["jobs"] = jobsPayload
+        }
+        if params["session_id"] == nil {
+            params["session_id"] = sessionId
+        }
+        if params["workspace_id"] == nil, let workspaceId {
+            params["workspace_id"] = workspaceId
+        }
+        if params["surface_id"] == nil, let surfaceId {
+            params["surface_id"] = surfaceId
+        }
+        if params["window_id"] == nil, let windowId {
+            params["window_id"] = windowId
+        }
+
+        return params
+    }
+
     private func doubleFromAny(_ value: Any?) -> Double? {
         if let d = value as? Double { return d }
         if let f = value as? Float { return Double(f) }
@@ -5388,6 +5432,55 @@ struct CMUXCLI {
                 let jobId = (taskPayload["job_id"] as? String) ?? "unknown"
                 output(payload, fallback: "OK session=\(sessionId) job=\(jobId)")
 
+            case "run-many":
+                let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+                let (jobsOpt, rem5) = parseOption(rem4, name: "--jobs")
+                let (jobsFileOpt, rem6) = parseOption(rem5, name: "--jobs-file")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent task run-many requires --session <id>")
+                }
+                if jobsOpt != nil, jobsFileOpt != nil {
+                    throw CLIError(message: "agent task run-many: use either --jobs or --jobs-file, not both")
+                }
+                if let unknown = rem6.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent task run-many: unknown flag '\(unknown)'")
+                }
+
+                let runManyObject: Any
+                if let jobsOpt {
+                    runManyObject = try decodeJSONValue(jobsOpt, label: "agent task run-many --jobs")
+                } else if let jobsFileOpt {
+                    runManyObject = try decodeJSONFile(jobsFileOpt, label: "agent task run-many --jobs-file")
+                } else if let raw = rem6.first {
+                    guard rem6.count == 1 else {
+                        throw CLIError(message: "agent task run-many accepts one positional JSON payload at most")
+                    }
+                    runManyObject = try decodeJSONValue(raw, label: "agent task run-many payload")
+                } else {
+                    throw CLIError(message: "agent task run-many requires --jobs <payload>, --jobs-file <path>, or a positional JSON payload")
+                }
+
+                let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client)
+                let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client)
+                let windowId = try normalizeWindowHandle(windowOpt, client: client)
+                let params = try agentRunManyParams(
+                    from: runManyObject,
+                    sessionId: sessionId,
+                    workspaceId: workspaceId,
+                    surfaceId: surfaceId,
+                    windowId: windowId
+                )
+
+                let payload = try client.sendV2(method: "agent.task.run_many", params: params)
+                let groupId = (payload["group_id"] as? String) ?? "unknown"
+                let jobCount = intFromAny(payload["job_count"]) ?? 0
+                output(payload, fallback: "OK session=\(sessionId) group=\(groupId) jobs=\(jobCount)")
+
             case "run-profile":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
                 let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
@@ -5425,6 +5518,75 @@ struct CMUXCLI {
                 let payload = try client.sendV2(method: "agent.task.run_profile", params: params)
                 let groupId = (payload["group_id"] as? String) ?? "unknown"
                 output(payload, fallback: "OK session=\(sessionId) group=\(groupId) profile=\(profile)")
+
+            case "logs":
+                let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (jobOptA, rem2) = parseOption(rem1, name: "--job")
+                let (jobOptB, rem3) = parseOption(rem2, name: "--job-id")
+                let (modeOpt, rem4) = parseOption(rem3, name: "--mode")
+                let (linesOpt, rem5) = parseOption(rem4, name: "--lines")
+                let (bytesOpt, rem6) = parseOption(rem5, name: "--bytes")
+                let (cursorOpt, remaining) = parseOption(rem6, name: "--cursor")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent task logs requires --session <id>")
+                }
+                guard let jobId = jobOptA ?? jobOptB else {
+                    throw CLIError(message: "agent task logs requires --job <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent task logs: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId, "job_id": jobId]
+                if let modeOpt { params["mode"] = modeOpt }
+                if let linesOpt {
+                    guard let lines = Int(linesOpt), lines > 0 else {
+                        throw CLIError(message: "agent task logs: --lines must be > 0")
+                    }
+                    params["lines"] = lines
+                }
+                if let bytesOpt {
+                    guard let bytes = Int(bytesOpt), bytes > 0 else {
+                        throw CLIError(message: "agent task logs: --bytes must be > 0")
+                    }
+                    params["bytes"] = bytes
+                }
+                if let cursorOpt {
+                    guard let cursor = Int(cursorOpt), cursor >= 0 else {
+                        throw CLIError(message: "agent task logs: --cursor must be >= 0")
+                    }
+                    params["cursor"] = cursor
+                }
+
+                let payload = try client.sendV2(method: "agent.task.logs", params: params)
+                let status = (payload["status"] as? String) ?? "unknown"
+                let mode = (payload["mode"] as? String) ?? "tail"
+                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status) mode=\(mode)")
+
+            case "cancel":
+                let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (jobOptA, rem2) = parseOption(rem1, name: "--job")
+                let (jobOptB, rem3) = parseOption(rem2, name: "--job-id")
+                if let unknown = rem3.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent task cancel: unknown flag '\(unknown)'")
+                }
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent task cancel requires --session <id>")
+                }
+                guard let jobId = jobOptA ?? jobOptB else {
+                    throw CLIError(message: "agent task cancel requires --job <id>")
+                }
+
+                let payload = try client.sendV2(method: "agent.task.cancel", params: [
+                    "session_id": sessionId,
+                    "job_id": jobId
+                ])
+                let status = (payload["status"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status)")
 
             case "wait":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
@@ -8195,7 +8357,10 @@ struct CMUXCLI {
               terminal capture --session <session-id> [--surface <id|ref|index>] [--mode tail|full|delta] [--lines <n>] [--scrollback <true|false>]
               terminal wait --session <session-id> [--surface <id|ref|index>] [--state prompt|running] [--timeout-ms <ms>]
               task run --session <session-id> [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--cmd <command> | <command>]
+              task run-many --session <session-id> (--jobs '<json>' | --jobs-file <path> | <json>) [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
               task run-profile --session <session-id> --profile <name>
+              task logs --session <session-id> --job <job-id> [--mode tail|delta|path-only] [--lines <n>] [--bytes <n>] [--cursor <n>]
+              task cancel --session <session-id> --job <job-id>
               task wait --session <session-id> --job <job-id> [--timeout-ms <ms>]
               task result --session <session-id> --job <job-id> [--tail-lines <n>]
               events --session <session-id> [--since <cursor>] [--limit <n>]

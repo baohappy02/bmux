@@ -227,6 +227,9 @@ class TerminalController {
         var updatedAt: Date
         var label: String
         var command: String
+        var groupId: String?
+        var profileName: String?
+        var expectedPorts: [Int]
         var windowId: UUID?
         var workspaceId: UUID?
         var paneId: UUID?
@@ -2146,8 +2149,14 @@ class TerminalController {
             return v2Result(id: id, self.v2AgentTerminalWait(params: params))
         case "agent.task.run":
             return v2Result(id: id, self.v2AgentTaskRun(params: params))
+        case "agent.task.logs":
+            return v2Result(id: id, self.v2AgentTaskLogs(params: params))
         case "agent.task.run_profile":
             return v2Result(id: id, self.v2AgentTaskRunProfile(params: params))
+        case "agent.task.run_many":
+            return v2Result(id: id, self.v2AgentTaskRunMany(params: params))
+        case "agent.task.cancel":
+            return v2Result(id: id, self.v2AgentTaskCancel(params: params))
         case "agent.task.wait":
             return v2Result(id: id, self.v2AgentTaskWait(params: params))
         case "agent.task.result":
@@ -2577,6 +2586,9 @@ class TerminalController {
             "agent.terminal.wait",
             "agent.task.run",
             "agent.task.run_profile",
+            "agent.task.logs",
+            "agent.task.run_many",
+            "agent.task.cancel",
             "agent.task.wait",
             "agent.task.result",
             "agent.events",
@@ -3356,10 +3368,7 @@ class TerminalController {
 
         switch target {
         case "terminal":
-            let reusedSurfaceId = v2UUID(params, "surface_id")
-                .flatMap { context.workspace.terminalPanel(for: $0) != nil ? $0 : nil }
-                ?? context.surfaceId.flatMap { context.workspace.terminalPanel(for: $0) != nil ? $0 : nil }
-                ?? orderedPanels(in: context.workspace).first(where: { context.workspace.terminalPanel(for: $0.id) != nil })?.id
+            let reusedSurfaceId = v2AgentReusableTerminalSurfaceId(params: params, context: context)
             if let reusedSurfaceId {
                 let reusedContext = AgentWorkspaceContext(
                     windowId: context.windowId,
@@ -3368,10 +3377,16 @@ class TerminalController {
                     paneId: context.workspace.paneId(forPanelId: reusedSurfaceId)?.id,
                     surfaceId: reusedSurfaceId
                 )
+                let updatedSession = v2AgentPersistSession(
+                    sessionId: sessionId,
+                    session: session,
+                    context: reusedContext
+                )
                 var payload = v2AgentSurfaceSummary(context: reusedContext)
                 payload["session_id"] = sessionId
                 payload["target"] = "terminal"
                 payload["created"] = false
+                payload["layout_rev"] = updatedSession.layoutRev
                 return .ok(payload)
             }
 
@@ -3391,11 +3406,11 @@ class TerminalController {
 
         case "browser":
             let requestedURL = v2String(params, "url")?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let existingBrowserId = orderedPanels(in: context.workspace).first { panel in
-                guard let browserPanel = context.workspace.browserPanel(for: panel.id) else { return false }
-                guard let requestedURL, !requestedURL.isEmpty else { return true }
-                return browserPanel.currentURL?.absoluteString == requestedURL
-            }?.id
+            let existingBrowserId = v2AgentReusableBrowserSurfaceId(
+                params: params,
+                context: context,
+                requestedURL: requestedURL
+            )
             if let existingBrowserId {
                 let browserContext = AgentWorkspaceContext(
                     windowId: context.windowId,
@@ -3404,10 +3419,16 @@ class TerminalController {
                     paneId: context.workspace.paneId(forPanelId: existingBrowserId)?.id,
                     surfaceId: existingBrowserId
                 )
+                let updatedSession = v2AgentPersistSession(
+                    sessionId: sessionId,
+                    session: session,
+                    context: browserContext
+                )
                 var payload = v2AgentSurfaceSummary(context: browserContext)
                 payload["session_id"] = sessionId
                 payload["target"] = "browser"
                 payload["created"] = false
+                payload["layout_rev"] = updatedSession.layoutRev
                 return .ok(payload)
             }
 
@@ -3440,7 +3461,7 @@ class TerminalController {
 
             guard let profileName = v2String(params, "profile")?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !profileName.isEmpty,
-                  let profile = v2AgentResolveProfile(name: profileName, context: context) else {
+                  v2AgentResolveProfile(name: profileName, context: context) != nil else {
                 return .err(code: "not_found", message: "No matching service and no runnable profile provided", data: [
                     "port": port,
                     "session_id": sessionId
@@ -3453,7 +3474,7 @@ class TerminalController {
                       !task.status.isTerminal else {
                     return false
                 }
-                return profile.jobs.contains(where: { $0.command == task.command })
+                return v2AgentTask(task, matchesServicePort: port, in: context.workspace)
             }
             if !runningTasks.isEmpty {
                 return .ok([
@@ -3465,6 +3486,7 @@ class TerminalController {
                     "port": port,
                     "job_ids": runningTasks.map(\.id),
                     "profile": profileName,
+                    "expected_ports": Array(Set(runningTasks.flatMap(\.expectedPorts))).sorted(),
                     "event_cursor": v2AgentCurrentEventCursor()
                 ])
             }
@@ -3962,10 +3984,16 @@ class TerminalController {
         }
         let cwd = v2String(params, "cwd")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let splitRaw = v2String(params, "split")?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let groupId = v2String(params, "group_id")
+        let profileName = v2String(params, "profile_name") ?? v2String(params, "profile")
+        let expectedPorts = v2StrictIntArray(params, "expected_ports") ?? []
         if let splitRaw, parseSplitDirection(splitRaw) == nil {
             return .err(code: "invalid_params", message: "Missing or invalid split (left|right|up|down)", data: [
                 "split": splitRaw
             ])
+        }
+        if expectedPorts.contains(where: { $0 <= 0 || $0 > 65535 }) {
+            return .err(code: "invalid_params", message: "expected_ports must contain valid TCP ports", data: nil)
         }
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to run task", data: nil)
@@ -4024,6 +4052,9 @@ class TerminalController {
                 updatedAt: now,
                 label: label,
                 command: command,
+                groupId: groupId,
+                profileName: profileName,
+                expectedPorts: Array(Set(expectedPorts)).sorted(),
                 windowId: terminalContext.windowId,
                 workspaceId: terminalContext.workspace.id,
                 paneId: terminalContext.paneId,
@@ -4043,7 +4074,10 @@ class TerminalController {
                     "job_id": taskId,
                     "status": task.status.rawValue,
                     "label": label,
-                    "command": command
+                    "command": command,
+                    "group_id": v2OrNull(groupId),
+                    "profile": v2OrNull(profileName),
+                    "expected_ports": task.expectedPorts
                 ]
             )
 
@@ -4105,6 +4139,9 @@ class TerminalController {
         for (index, job) in profile.jobs.enumerated() {
             var jobParams = params
             jobParams["session_id"] = sessionId
+            jobParams["group_id"] = groupId
+            jobParams["profile_name"] = profile.name
+            jobParams["expected_ports"] = profile.expectedPorts
             jobParams["label"] = job.label
             jobParams["command"] = job.command
             jobParams["cwd"] = profile.repoRoot ?? context.workspace.currentDirectory
@@ -4152,6 +4189,436 @@ class TerminalController {
             "jobs": jobPayloads,
             "event_cursor": v2AgentCurrentEventCursor()
         ])
+    }
+
+    private func v2AgentTaskRunMany(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard v2AgentSessions[sessionId] != nil else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        guard let jobs = v2AgentJobsArray(from: params["jobs"]) else {
+            return .err(code: "invalid_params", message: "Missing or invalid jobs payload", data: [
+                "session_id": sessionId
+            ])
+        }
+        guard !jobs.isEmpty else {
+            return .err(code: "invalid_state", message: "jobs must not be empty", data: ["session_id": sessionId])
+        }
+
+        let groupId = "group:\(v2AgentNextGroupOrdinal)"
+        v2AgentNextGroupOrdinal += 1
+
+        var jobPayloads: [[String: Any]] = []
+        for (index, job) in jobs.enumerated() {
+            guard let command = v2AgentString(job["command"]) else {
+                return .err(code: "invalid_params", message: "Job command is required", data: [
+                    "session_id": sessionId,
+                    "group_id": groupId,
+                    "job_index": index
+                ])
+            }
+            let label = v2AgentString(job["label"]) ?? v2AgentDefaultTaskLabel(for: command)
+            var jobParams = params
+            jobParams["session_id"] = sessionId
+            jobParams["group_id"] = groupId
+            jobParams["command"] = command
+            jobParams["label"] = label
+
+            if let splitRaw = v2AgentString(job["split"]) {
+                jobParams["split"] = splitRaw
+            }
+            if let cwd = v2AgentString(job["cwd"]) {
+                jobParams["cwd"] = cwd
+            }
+            if let surface = v2AgentString(job["surface_id"]) {
+                jobParams["surface_id"] = surface
+            }
+            if let pane = v2AgentString(job["pane_id"]) {
+                jobParams["pane_id"] = pane
+            }
+            if let workspace = v2AgentString(job["workspace_id"]) {
+                jobParams["workspace_id"] = workspace
+            }
+            if let window = v2AgentString(job["window_id"]) {
+                jobParams["window_id"] = window
+            }
+            if let profileName = v2AgentString(job["profile_name"]) {
+                jobParams["profile_name"] = profileName
+            }
+            if let expectedPorts = v2StrictIntArrayAny(job["expected_ports"]) {
+                jobParams["expected_ports"] = expectedPorts
+            }
+
+            if index > 0, jobParams["split"] == nil {
+                jobParams["split"] = "right"
+            }
+
+            let runResult = v2AgentTaskRun(params: jobParams)
+            switch runResult {
+            case .ok(let value):
+                guard let dict = value as? [String: Any],
+                      let taskPayload = dict["task"] as? [String: Any] else {
+                    return .err(code: "internal_error", message: "run_many job returned malformed payload", data: [
+                        "session_id": sessionId,
+                        "group_id": groupId,
+                        "job_index": index
+                    ])
+                }
+                jobPayloads.append(taskPayload)
+            case .err(let code, let message, let data):
+                return .err(code: code, message: message, data: data)
+            }
+        }
+
+        return .ok([
+            "ok": true,
+            "session_id": sessionId,
+            "group_id": groupId,
+            "jobs": jobPayloads,
+            "job_count": jobPayloads.count,
+            "event_cursor": v2AgentCurrentEventCursor()
+        ])
+    }
+
+    private func v2AgentJobsArray(from raw: Any?) -> [[String: Any]]? {
+        if let jobs = raw as? [[String: Any]] {
+            return jobs
+        }
+
+        guard let rawDict = raw as? [String: Any],
+              let jobs = rawDict["jobs"] as? [[String: Any]] else {
+            return nil
+        }
+        return jobs
+    }
+
+    private func v2AgentTaskLogs(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let taskId = v2String(params, "job_id") ?? v2String(params, "task_id") else {
+            return .err(code: "invalid_params", message: "Missing job_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        let mode = (v2String(params, "mode") ?? "tail").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !["tail", "delta", "path-only"].contains(mode) {
+            return .err(code: "invalid_params", message: "Unsupported logs mode", data: [
+                "session_id": sessionId,
+                "job_id": taskId,
+                "mode": mode,
+                "supported_modes": ["tail", "delta", "path-only"]
+            ])
+        }
+
+        let requestedLines = v2Int(params, "lines")
+        if let requestedLines, requestedLines <= 0 {
+            return .err(code: "invalid_params", message: "lines must be greater than 0", data: nil)
+        }
+        let requestedBytes = v2Int(params, "bytes")
+        if let requestedBytes, requestedBytes <= 0 {
+            return .err(code: "invalid_params", message: "bytes must be greater than 0", data: nil)
+        }
+        let cursor = max(0, v2Int(params, "cursor") ?? 0)
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to read task logs", data: nil)
+        v2MainSync {
+            guard let task = self.v2AgentTasks[taskId], task.sessionId == sessionId else {
+                result = .err(code: "not_found", message: "Task not found", data: [
+                    "session_id": sessionId,
+                    "job_id": taskId
+                ])
+                return
+            }
+            let savedLogPath = self.v2AgentTaskLogPath(taskId: task.id)
+            let savedLogText = savedLogPath.flatMap {
+                try? String(contentsOfFile: $0, encoding: .utf8)
+            }
+            let (logPath, capturedText): (String?, String)
+            if let taskTarget = self.v2AgentTaskTerminalTarget(task: task, session: session) {
+                let terminalPanel = taskTarget.terminalPanel
+                let loaded = self.v2AgentLoadTaskLog(task: task, terminalPanel: terminalPanel)
+                logPath = loaded.path
+                capturedText = loaded.text
+            } else if let savedLogText {
+                logPath = savedLogPath
+                capturedText = savedLogText
+            } else if mode == "path-only" {
+                result = .ok([
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "mode": mode,
+                    "status": task.status.rawValue,
+                    "log_path": v2OrNull(savedLogPath),
+                    "bytes": 0,
+                    "cursor": 0,
+                    "event_cursor": self.v2AgentCurrentEventCursor()
+                ])
+                return
+            } else {
+                result = .err(code: "invalid_state", message: "Task has no terminal target", data: [
+                    "session_id": sessionId,
+                    "job_id": taskId
+                ])
+                return
+            }
+
+            let fullText = capturedText
+            let availableBytes = fullText.utf8.count
+            let currentCursor = min(cursor, availableBytes)
+
+            switch mode {
+            case "path-only":
+                var payload: [String: Any] = [
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "mode": mode,
+                    "status": task.status.rawValue,
+                    "log_path": v2OrNull(logPath),
+                    "bytes": availableBytes,
+                    "cursor": availableBytes,
+                    "event_cursor": self.v2AgentCurrentEventCursor()
+                ]
+                if requestedBytes == nil {
+                    result = .ok(payload)
+                    return
+                }
+                payload["bytes"] = requestedBytes.flatMap { min($0, availableBytes) }
+                payload["bytes_returned"] = requestedBytes
+                result = .ok(payload)
+
+            case "delta":
+                let payloadText = self.v2AgentLimitedDeltaText(
+                    fullText: fullText,
+                    fromCursor: currentCursor,
+                    lineLimit: requestedLines,
+                    byteLimit: requestedBytes
+                )
+                result = .ok([
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "mode": mode,
+                    "status": task.status.rawValue,
+                    "log_path": v2OrNull(logPath),
+                    "cursor": availableBytes,
+                    "tail": payloadText.lines,
+                    "tail_lines": payloadText.lines.count,
+                    "bytes": payloadText.payloadBytes,
+                    "event_cursor": self.v2AgentCurrentEventCursor()
+                ])
+
+            default:
+                let payloadText = self.v2AgentLimitedTailText(
+                    fullText: fullText,
+                    lineLimit: requestedLines,
+                    byteLimit: requestedBytes
+                )
+                result = .ok([
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "mode": mode,
+                    "status": task.status.rawValue,
+                    "log_path": v2OrNull(logPath),
+                    "cursor": availableBytes,
+                    "tail": payloadText.lines,
+                    "tail_lines": payloadText.lines.count,
+                    "bytes": payloadText.payloadBytes,
+                    "event_cursor": self.v2AgentCurrentEventCursor()
+                ])
+            }
+        }
+        return result
+    }
+
+    private func v2AgentTaskCancel(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let taskId = v2String(params, "job_id") ?? v2String(params, "task_id") else {
+            return .err(code: "invalid_params", message: "Missing job_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        var result: V2CallResult = .err(code: "internal_error", message: "Failed to cancel task", data: nil)
+        v2MainSync {
+            guard var task = self.v2AgentTasks[taskId], task.sessionId == sessionId else {
+                result = .err(code: "not_found", message: "Task not found", data: [
+                    "session_id": sessionId,
+                    "job_id": taskId
+                ])
+                return
+            }
+            if task.status == .cancelled {
+                let payload: [String: Any] = [
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "status": task.status.rawValue,
+                    "already_cancelled": true
+                ]
+                result = .ok(payload)
+                return
+            }
+            if task.status.isTerminal {
+                result = .ok([
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "status": task.status.rawValue,
+                    "already_terminal": true
+                ])
+                return
+            }
+
+            guard let target = self.v2AgentTaskTerminalTarget(task: task, session: session) else {
+                result = .err(code: "invalid_state", message: "Task has no terminal target", data: [
+                    "session_id": sessionId,
+                    "job_id": taskId,
+                    "status": task.status.rawValue
+                ])
+                return
+            }
+            let interruptDelivery = self.v2AgentSendInterrupt(terminalPanel: target.terminalPanel)
+
+            task.status = .cancelled
+            task.updatedAt = Date()
+            task.completedAt = task.updatedAt
+            self.v2AgentTasks[taskId] = task
+
+            self.v2AgentAppendEvent(
+                type: "task.cancelled",
+                sessionId: sessionId,
+                workspaceId: task.workspaceId,
+                surfaceId: task.surfaceId,
+                payload: [
+                    "job_id": task.id,
+                    "status": task.status.rawValue,
+                    "interrupt_delivery": interruptDelivery
+                ]
+            )
+            result = .ok([
+                "session_id": sessionId,
+                "job_id": taskId,
+                "status": task.status.rawValue,
+                "interrupt_delivery": interruptDelivery,
+                "event_cursor": self.v2AgentCurrentEventCursor()
+            ])
+        }
+        return result
+    }
+
+    private func v2AgentTaskTerminalTarget(
+        task: AgentTask,
+        session: AgentSession
+    ) -> (context: AgentWorkspaceContext, terminalPanel: TerminalPanel)? {
+        guard let workspaceId = task.workspaceId else { return nil }
+
+        var contextParams: [String: Any] = [
+            "session_id": session.id,
+            "workspace_id": workspaceId.uuidString
+        ]
+        if let windowId = task.windowId {
+            contextParams["window_id"] = windowId.uuidString
+        }
+        if let surfaceId = task.surfaceId {
+            contextParams["surface_id"] = surfaceId.uuidString
+        }
+        if let paneId = task.paneId {
+            contextParams["pane_id"] = paneId.uuidString
+        }
+
+        guard let resolvedContext = v2AgentResolveContext(params: contextParams, session: session) else {
+            return nil
+        }
+
+        let selectedSurfaceId = task.surfaceId ?? resolvedContext.surfaceId
+        guard let surfaceId = selectedSurfaceId,
+              let terminalPanel = resolvedContext.workspace.terminalPanel(for: surfaceId) else {
+            return nil
+        }
+        let paneId = resolvedContext.workspace.paneId(forPanelId: surfaceId)?.id
+        return (
+            context: AgentWorkspaceContext(
+                windowId: resolvedContext.windowId,
+                tabManager: resolvedContext.tabManager,
+                workspace: resolvedContext.workspace,
+                paneId: paneId,
+                surfaceId: surfaceId
+            ),
+            terminalPanel: terminalPanel
+        )
+    }
+
+    private func v2AgentLoadTaskLog(
+        task: AgentTask,
+        terminalPanel: TerminalPanel
+    ) -> (path: String?, text: String) {
+        let logPath = v2AgentTaskLogPath(taskId: task.id)
+        if let logPath,
+           let persisted = try? String(contentsOfFile: logPath, encoding: .utf8) {
+            return (path: logPath, text: persisted)
+        }
+
+        let captured = v2AgentReadTerminalText(terminalPanel: terminalPanel, includeScrollback: true, lineLimit: nil) ?? ""
+        let persisted = v2AgentWriteTaskLog(taskId: task.id, text: captured)
+        return (path: persisted, text: captured)
+    }
+
+    private func v2AgentLimitedTailText(
+        fullText: String,
+        lineLimit: Int?,
+        byteLimit: Int?
+    ) -> (lines: [String], payloadBytes: Int) {
+        let bounded = v2AgentBoundText(
+            fullText,
+            lineLimit: lineLimit ?? 80,
+            byteLimit: byteLimit
+        )
+        let lines = v2AgentCompactTailLines(from: bounded, limit: lineLimit ?? 80)
+        return (lines: lines, payloadBytes: bounded.utf8.count)
+    }
+
+    private func v2AgentLimitedDeltaText(
+        fullText: String,
+        fromCursor: Int,
+        lineLimit: Int?,
+        byteLimit: Int?
+    ) -> (lines: [String], payloadBytes: Int) {
+        let fullBytes = Array(fullText.utf8)
+        let cursor = min(max(0, fromCursor), fullBytes.count)
+        let deltaText = String(decoding: fullBytes[cursor...], as: UTF8.self)
+        let bounded = v2AgentBoundText(
+            deltaText,
+            lineLimit: lineLimit,
+            byteLimit: byteLimit
+        )
+        let lines = v2AgentCompactTailLines(from: bounded, limit: lineLimit ?? 80)
+        return (lines: lines, payloadBytes: bounded.utf8.count)
+    }
+
+    private func v2AgentBoundText(_ text: String, lineLimit: Int?, byteLimit: Int?) -> String {
+        var bounded = text
+        if let byteLimit, byteLimit > 0 {
+            let bytes = Array(bounded.utf8)
+            if bytes.count > byteLimit {
+                bounded = String(decoding: bytes.suffix(byteLimit), as: UTF8.self)
+            }
+        }
+        if let lineLimit, lineLimit > 0 {
+            bounded = v2AgentCompactTailLines(from: bounded, limit: lineLimit).joined(separator: "\n")
+        }
+        return bounded
+    }
+
+    private func v2AgentString(_ value: Any?) -> String? {
+        guard let raw = value as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func v2AgentTaskWait(params: [String: Any]) -> V2CallResult {
@@ -4789,6 +5256,16 @@ class TerminalController {
         return true
     }
 
+    private func v2AgentSendInterrupt(terminalPanel: TerminalPanel) -> String {
+        if let surface = terminalPanel.surface.surface {
+            _ = sendNamedKey(surface, keyName: "ctrl-c")
+            return "live_surface"
+        }
+        terminalPanel.sendText("\u{3}")
+        terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded()
+        return "queued_text"
+    }
+
     private func v2AgentDefaultTaskLabel(for command: String) -> String {
         let singleLine = command
             .replacingOccurrences(of: "\n", with: " ")
@@ -4809,6 +5286,9 @@ class TerminalController {
             "job_id": task.id,
             "label": task.label,
             "command": task.command,
+            "group_id": v2OrNull(task.groupId),
+            "profile": v2OrNull(task.profileName),
+            "expected_ports": task.expectedPorts,
             "status": task.status.rawValue,
             "window_id": v2OrNull(task.windowId?.uuidString),
             "window_ref": v2Ref(kind: .window, uuid: task.windowId),
@@ -4931,6 +5411,78 @@ class TerminalController {
             return Int(groups[1])
         }
         return Array(Set(ports)).sorted()
+    }
+
+    private func v2AgentShouldReuseExistingSurface(params: [String: Any]) -> Bool {
+        v2String(params, "split") == nil && v2String(params, "direction") == nil
+    }
+
+    private func v2AgentPanePanelIds(
+        paneUUID: UUID?,
+        workspace: Workspace
+    ) -> [UUID] {
+        guard let paneUUID,
+              let paneId = v2AgentPaneId(for: paneUUID, workspace: workspace) else {
+            return []
+        }
+
+        var panelIds: [UUID] = []
+        if let selectedPanelId = workspace.effectiveSelectedPanelId(inPane: paneId) {
+            panelIds.append(selectedPanelId)
+        }
+        for tab in workspace.bonsplitController.tabs(inPane: paneId) {
+            guard let panelId = workspace.panelIdFromSurfaceId(tab.id),
+                  !panelIds.contains(panelId) else { continue }
+            panelIds.append(panelId)
+        }
+        return panelIds
+    }
+
+    private func v2AgentReusableTerminalSurfaceId(
+        params: [String: Any],
+        context: AgentWorkspaceContext
+    ) -> UUID? {
+        guard v2AgentShouldReuseExistingSurface(params: params) else { return nil }
+
+        let workspace = context.workspace
+        if let explicitSurfaceId = v2UUID(params, "surface_id"),
+           workspace.terminalPanel(for: explicitSurfaceId) != nil {
+            return explicitSurfaceId
+        }
+
+        let candidatePaneUUID = v2UUID(params, "pane_id") ?? context.paneId
+        return v2AgentPanePanelIds(paneUUID: candidatePaneUUID, workspace: workspace)
+            .first(where: { workspace.terminalPanel(for: $0) != nil })
+    }
+
+    private func v2AgentBrowserMatchesURL(
+        _ browserPanel: BrowserPanel,
+        requestedURL: String?
+    ) -> Bool {
+        guard let requestedURL, !requestedURL.isEmpty else { return true }
+        return browserPanel.currentURL?.absoluteString == requestedURL
+    }
+
+    private func v2AgentReusableBrowserSurfaceId(
+        params: [String: Any],
+        context: AgentWorkspaceContext,
+        requestedURL: String?
+    ) -> UUID? {
+        guard v2AgentShouldReuseExistingSurface(params: params) else { return nil }
+
+        let workspace = context.workspace
+        if let explicitSurfaceId = v2UUID(params, "surface_id"),
+           let browserPanel = workspace.browserPanel(for: explicitSurfaceId),
+           v2AgentBrowserMatchesURL(browserPanel, requestedURL: requestedURL) {
+            return explicitSurfaceId
+        }
+
+        let candidatePaneUUID = v2UUID(params, "pane_id") ?? context.paneId
+        return v2AgentPanePanelIds(paneUUID: candidatePaneUUID, workspace: workspace)
+            .first(where: { panelId in
+                guard let browserPanel = workspace.browserPanel(for: panelId) else { return false }
+                return v2AgentBrowserMatchesURL(browserPanel, requestedURL: requestedURL)
+            })
     }
 
     private func v2AgentResolveProfile(
@@ -5181,6 +5733,18 @@ class TerminalController {
             payload["diagnostics"] = diagnostics
         }
         return payload
+    }
+
+    private func v2AgentTask(
+        _ task: AgentTask,
+        matchesServicePort port: Int,
+        in workspace: Workspace
+    ) -> Bool {
+        if task.expectedPorts.contains(port) {
+            return true
+        }
+        guard let surfaceId = task.surfaceId else { return false }
+        return workspace.surfaceListeningPorts[surfaceId]?.contains(port) == true
     }
 
     private func v2AgentTaskResultPayloadMain(
@@ -5436,10 +6000,13 @@ class TerminalController {
     }
 
     private func v2AgentPreferredJSPackageManager(inferredPackageManager: String?) -> String {
+        if let inferredPackageManager {
+            return inferredPackageManager
+        }
         if v2AgentResolvedCommandPath("bun") != nil {
             return "bun"
         }
-        return inferredPackageManager ?? "npm"
+        return "npm"
     }
 
     private func v2AgentInferredPackageManager(startingAt directory: String?) -> String? {
@@ -5686,6 +6253,29 @@ class TerminalController {
             return normalized
         }
         if let single = v2String(params, key) {
+            return [single]
+        }
+        return nil
+    }
+
+    private func v2StrictIntArray(_ params: [String: Any], _ key: String) -> [Int]? {
+        v2StrictIntArrayAny(params[key])
+    }
+
+    private func v2StrictIntArrayAny(_ raw: Any?) -> [Int]? {
+        guard let raw else { return nil }
+        if let values = raw as? [Int] {
+            return values
+        }
+        if let values = raw as? [NSNumber] {
+            let resolved = values.compactMap { v2StrictIntAny($0) }
+            return resolved.count == values.count ? resolved : nil
+        }
+        if let values = raw as? [Any] {
+            let resolved = values.compactMap { v2StrictIntAny($0) }
+            return resolved.count == values.count ? resolved : nil
+        }
+        if let single = v2StrictIntAny(raw) {
             return [single]
         }
         return nil
@@ -17836,6 +18426,10 @@ class TerminalController {
             }
             task.updatedAt = completedAt
             task.completedAt = completedAt
+            if task.status == .cancelled {
+                self.v2AgentTasks[taskId] = task
+                return
+            }
             task.exitCode = exitCode
             task.status = exitCode == 0 ? .succeeded : .failed
             self.v2AgentTasks[taskId] = task

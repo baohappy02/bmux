@@ -1,6 +1,6 @@
 # Slice 01 - Milestone 1 Task Ops
 
-Status: TODO
+Status: DONE
 
 Branch: `spark/s01-task-ops`
 
@@ -11,6 +11,8 @@ PR title: `Complete agent task logs cancel and run-many`
 Suggested commit: `Add agent task logs cancel and run-many`
 
 ## Goal
+
+This slice has already landed and is kept here as review history.
 
 Close the remaining task-control gaps in Milestone 1:
 
