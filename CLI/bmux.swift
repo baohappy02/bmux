@@ -5183,6 +5183,94 @@ struct CMUXCLI {
                 throw CLIError(message: "Unsupported agent task subcommand: \(taskSubcommand)")
             }
 
+        case "events":
+            let (sessionOptA, rem0) = parseOption(subArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (sinceOpt, rem2) = parseOption(rem1, name: "--since")
+            let (cursorOpt, rem3) = parseOption(rem2, name: "--cursor")
+            let (limitOpt, remaining) = parseOption(rem3, name: "--limit")
+
+            guard let sessionId = sessionOptA ?? sessionOptB else {
+                throw CLIError(message: "agent events requires --session <id>")
+            }
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent events: unknown flag '\(unknown)'")
+            }
+
+            var params: [String: Any] = ["session_id": sessionId]
+            if let sinceText = sinceOpt ?? cursorOpt {
+                guard let since = Int(sinceText), since >= 0 else {
+                    throw CLIError(message: "agent events: --since must be >= 0")
+                }
+                params["since"] = since
+            }
+            if let limitOpt {
+                guard let limit = Int(limitOpt), limit > 0 else {
+                    throw CLIError(message: "agent events: --limit must be > 0")
+                }
+                params["limit"] = limit
+            }
+
+            let payload = try client.sendV2(method: "agent.events", params: params)
+            let eventCursor = intFromAny(payload["event_cursor"]) ?? 0
+            let count = (payload["events"] as? [[String: Any]])?.count ?? 0
+            output(payload, fallback: "OK session=\(sessionId) cursor=\(eventCursor) events=\(count)")
+
+        case "service":
+            guard let serviceSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "agent service requires a subcommand")
+            }
+            let serviceSubcommand = serviceSubcommandRaw.lowercased()
+            let serviceArgs = Array(subArgs.dropFirst())
+
+            switch serviceSubcommand {
+            case "wait":
+                let (sessionOptA, rem0) = parseOption(serviceArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
+                let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
+                let (windowOpt, rem4) = parseOption(rem3, name: "--window")
+                let (portOpt, rem5) = parseOption(rem4, name: "--port")
+                let (timeoutMsOpt, remaining) = parseOption(rem5, name: "--timeout-ms")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent service wait requires --session <id>")
+                }
+                guard let portText = portOpt, let port = Int(portText), port > 0, port <= 65535 else {
+                    throw CLIError(message: "agent service wait requires --port <1-65535>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent service wait: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId, "port": port]
+                if let workspaceOpt,
+                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
+                    params["workspace_id"] = workspaceId
+                }
+                if let surfaceOpt,
+                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
+                    params["surface_id"] = surfaceId
+                }
+                if let windowOpt,
+                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
+                    params["window_id"] = windowId
+                }
+                if let timeoutMsOpt {
+                    guard let timeoutMs = Int(timeoutMsOpt), timeoutMs >= 0 else {
+                        throw CLIError(message: "agent service wait: --timeout-ms must be >= 0")
+                    }
+                    params["timeout_ms"] = timeoutMs
+                }
+
+                let payload = try client.sendV2(method: "agent.service.wait", params: params)
+                let url = (payload["url"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) port=\(port) url=\(url)")
+
+            default:
+                throw CLIError(message: "Unsupported agent service subcommand: \(serviceSubcommand)")
+            }
+
         default:
             throw CLIError(message: "Unsupported agent subcommand: \(subcommand)")
         }
@@ -7752,7 +7840,7 @@ struct CMUXCLI {
             """
         case "agent":
             return """
-            Usage: bmux agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task> [flags]
+            Usage: bmux agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task|events|service> [flags]
 
             Compact agent-oriented commands for coding agents such as Codex.
 
@@ -7770,6 +7858,8 @@ struct CMUXCLI {
               task run --session <session-id> [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--cmd <command> | <command>]
               task wait --session <session-id> --job <job-id> [--timeout-ms <ms>]
               task result --session <session-id> --job <job-id> [--tail-lines <n>]
+              events --session <session-id> [--since <cursor>] [--limit <n>]
+              service wait --session <session-id> --port <port> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>] [--timeout-ms <ms>]
 
             Notes:
               - `attach` creates a lightweight bmux agent session and returns focused context.
@@ -7779,6 +7869,8 @@ struct CMUXCLI {
               - `surface-read` returns a compact metadata snapshot for the target surface.
               - `terminal` wraps low-token terminal input/capture/wait primitives.
               - `task` runs managed shell commands in bmux terminals and returns compact status.
+              - `events` streams cursor-based task and service events.
+              - `service wait` blocks on listening-port readiness instead of parsing boot logs.
             """
         case "browser":
             return """
@@ -13850,7 +13942,7 @@ struct CMUXCLI {
           claude-teams [claude-args...]
           omo [opencode-args...]
           codex <install-hooks|uninstall-hooks>
-          agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task>
+          agent <attach|layout|capabilities|open|focus|close|surface-read|terminal|task|events|service>
           ping
           version
           capabilities

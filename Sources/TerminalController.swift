@@ -237,6 +237,16 @@ class TerminalController {
         var exitCode: Int?
     }
 
+    private struct AgentEvent {
+        let seq: Int
+        let createdAt: Date
+        let type: String
+        let sessionId: String?
+        let workspaceId: UUID?
+        let surfaceId: UUID?
+        let payload: [String: Any]
+    }
+
     private struct AgentWorkspaceContext {
         let windowId: UUID?
         let tabManager: TabManager
@@ -259,6 +269,8 @@ class TerminalController {
     private var v2AgentSessions: [String: AgentSession] = [:]
     private var v2AgentNextTaskOrdinal: Int = 1
     private var v2AgentTasks: [String: AgentTask] = [:]
+    private var v2AgentNextEventOrdinal: Int = 1
+    private var v2AgentEventLog: [AgentEvent] = []
 
     private init() {
         browserDownloadObserver = NotificationCenter.default.addObserver(
@@ -1085,8 +1097,15 @@ class TerminalController {
             guard let workspace = tabManager.tabs.first(where: { $0.id == workspaceId }) else { return }
             let validSurfaceIds = Set(workspace.panels.keys)
             guard validSurfaceIds.contains(panelId) else { return }
+            let previousPorts = workspace.surfaceListeningPorts[panelId] ?? []
             workspace.surfaceListeningPorts[panelId] = ports.isEmpty ? nil : ports
             workspace.recomputeListeningPorts()
+            self.v2AgentAppendServiceEvents(
+                workspace: workspace,
+                surfaceId: panelId,
+                previousPorts: previousPorts,
+                currentPorts: ports
+            )
         }
 
         // Accept connections in background thread
@@ -2110,6 +2129,10 @@ class TerminalController {
             return v2Result(id: id, self.v2AgentTaskWait(params: params))
         case "agent.task.result":
             return v2Result(id: id, self.v2AgentTaskResult(params: params))
+        case "agent.events":
+            return v2Result(id: id, self.v2AgentReadEvents(params: params))
+        case "agent.service.wait":
+            return v2Result(id: id, self.v2AgentServiceWait(params: params))
 
         case "system.identify":
             return v2Ok(id: id, result: v2Identify(params: params))
@@ -2528,6 +2551,8 @@ class TerminalController {
             "agent.task.run",
             "agent.task.wait",
             "agent.task.result",
+            "agent.events",
+            "agent.service.wait",
             "system.identify",
             "system.tree",
             "auth.login",
@@ -3077,6 +3102,7 @@ class TerminalController {
             "backend_kind": v2AgentBackendKind(surfaceId: context.surfaceId, workspace: context.workspace),
             "capabilities": v2AgentCapabilityFlags(),
             "environment": environment,
+            "event_cursor": v2AgentCurrentEventCursor(),
             "preferences": [
                 "preferred_js_package_manager": preferredPackageManager,
                 "pricing_first_research": true,
@@ -3719,6 +3745,18 @@ class TerminalController {
                 exitCode: nil
             )
             v2AgentTasks[taskId] = task
+            v2AgentAppendEvent(
+                type: "task.started",
+                sessionId: sessionId,
+                workspaceId: terminalContext.workspace.id,
+                surfaceId: terminalContext.surfaceId,
+                payload: [
+                    "job_id": taskId,
+                    "status": task.status.rawValue,
+                    "label": label,
+                    "command": command
+                ]
+            )
 
             let effectiveCommand: String
             if let cwd, !cwd.isEmpty {
@@ -3802,6 +3840,114 @@ class TerminalController {
             )
         }
         return result
+    }
+
+    private func v2AgentReadEvents(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+
+        let since = max(0, v2Int(params, "since") ?? v2Int(params, "cursor") ?? 0)
+        let limit = min(max(1, v2Int(params, "limit") ?? 50), 200)
+        let events = v2AgentEventLog
+            .filter { event in
+                guard event.seq > since else { return false }
+                if event.sessionId == session.id { return true }
+                if let sessionWorkspaceId = session.workspaceId,
+                   event.workspaceId == sessionWorkspaceId {
+                    return true
+                }
+                return false
+            }
+            .prefix(limit)
+            .map(v2AgentEventPayload)
+
+        return .ok([
+            "session_id": sessionId,
+            "event_cursor": v2AgentCurrentEventCursor(),
+            "events": events
+        ])
+    }
+
+    private func v2AgentServiceWait(params: [String: Any]) -> V2CallResult {
+        guard let sessionId = v2String(params, "session_id") else {
+            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        }
+        guard let session = v2AgentSessions[sessionId] else {
+            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        }
+        guard let port = v2Int(params, "port"), port > 0, port <= 65535 else {
+            return .err(code: "invalid_params", message: "Missing or invalid port", data: nil)
+        }
+
+        let timeoutMs = max(0, v2Int(params, "timeout_ms") ?? 300_000)
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        var lastKickAt: Date?
+
+        while true {
+            var waitResult: V2CallResult?
+            v2MainSync {
+                guard let context = v2AgentResolveContext(params: params, session: session) else {
+                    waitResult = .err(code: "not_found", message: "Workspace not found", data: ["session_id": sessionId])
+                    return
+                }
+
+                let explicitSurfaceId = v2UUID(params, "surface_id")
+                let resolvedSurfaceId: UUID? = {
+                    if let explicitSurfaceId { return explicitSurfaceId }
+                    if let sessionSurfaceId = session.surfaceId,
+                       context.workspace.surfaceListeningPorts[sessionSurfaceId]?.contains(port) == true {
+                        return sessionSurfaceId
+                    }
+                    return context.workspace.surfaceListeningPorts.first(where: { $0.value.contains(port) })?.key
+                }()
+
+                let serviceReady: Bool = {
+                    if let resolvedSurfaceId {
+                        return context.workspace.surfaceListeningPorts[resolvedSurfaceId]?.contains(port) == true
+                    }
+                    return context.workspace.listeningPorts.contains(port)
+                }()
+
+                if serviceReady {
+                    var payload = v2AgentServicePayload(
+                        sessionId: sessionId,
+                        workspace: context.workspace,
+                        port: port,
+                        surfaceId: resolvedSurfaceId
+                    )
+                    payload["event_cursor"] = v2AgentCurrentEventCursor()
+                    waitResult = .ok(payload)
+                    return
+                }
+
+                if Date() >= deadline {
+                    waitResult = .err(code: "timeout", message: "Timed out waiting for service", data: [
+                        "session_id": sessionId,
+                        "port": port,
+                        "ready": false,
+                        "event_cursor": v2AgentCurrentEventCursor(),
+                        "ports": context.workspace.listeningPorts.sorted()
+                    ])
+                    return
+                }
+
+                if let targetSurfaceId = explicitSurfaceId ?? session.surfaceId,
+                   context.workspace.terminalPanel(for: targetSurfaceId) != nil,
+                   lastKickAt == nil || Date().timeIntervalSince(lastKickAt!) >= 1.0 {
+                    PortScanner.shared.kick(workspaceId: context.workspace.id, panelId: targetSurfaceId)
+                    lastKickAt = Date()
+                }
+            }
+
+            if let waitResult {
+                return waitResult
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
     }
 
     private func v2AgentResolveContext(
@@ -3905,6 +4051,7 @@ class TerminalController {
         payload["url"] = v2OrNull(v2AgentFocusedURL(context: context))
         payload["ready_state"] = v2AgentReadyState(context: context)
         payload["capabilities"] = v2AgentCapabilityFlags()
+        payload["event_cursor"] = v2AgentCurrentEventCursor()
         return payload
     }
 
@@ -3917,6 +4064,7 @@ class TerminalController {
         )
         let payload: [String: Any] = [
             "focused": v2AgentFocusedPayload(context: context),
+            "event_cursor": v2AgentCurrentEventCursor(),
             "workspace": [
                 "workspace_id": context.workspace.id.uuidString,
                 "workspace_ref": v2Ref(kind: .workspace, uuid: context.workspace.id),
@@ -4025,7 +4173,8 @@ class TerminalController {
             "window_id": v2OrNull(context.windowId?.uuidString),
             "window_ref": v2Ref(kind: .window, uuid: context.windowId),
             "workspace_id": context.workspace.id.uuidString,
-            "workspace_ref": v2Ref(kind: .workspace, uuid: context.workspace.id)
+            "workspace_ref": v2Ref(kind: .workspace, uuid: context.workspace.id),
+            "event_cursor": v2AgentCurrentEventCursor()
         ]
 
         guard let surfaceId = context.surfaceId,
@@ -4058,6 +4207,7 @@ class TerminalController {
         payload["surface_id"] = surfaceId.uuidString
         payload["surface_ref"] = v2Ref(kind: .surface, uuid: surfaceId)
         payload["surface_kind"] = panel.panelType.rawValue
+        payload["event_cursor"] = v2AgentCurrentEventCursor()
         payload["title"] = context.workspace.panelTitle(panelId: surfaceId) ?? panel.displayTitle
         payload["focused"] = context.workspace.focusedPanelId == surfaceId
         payload["selected_in_pane"] = selectedInPane
@@ -4085,6 +4235,93 @@ class TerminalController {
         }
 
         return payload
+    }
+
+    private func v2AgentCurrentEventCursor() -> Int {
+        max(0, v2AgentNextEventOrdinal - 1)
+    }
+
+    private func v2AgentAppendEvent(
+        type: String,
+        sessionId: String? = nil,
+        workspaceId: UUID? = nil,
+        surfaceId: UUID? = nil,
+        payload: [String: Any] = [:]
+    ) {
+        let event = AgentEvent(
+            seq: v2AgentNextEventOrdinal,
+            createdAt: Date(),
+            type: type,
+            sessionId: sessionId,
+            workspaceId: workspaceId,
+            surfaceId: surfaceId,
+            payload: payload
+        )
+        v2AgentNextEventOrdinal += 1
+        v2AgentEventLog.append(event)
+        if v2AgentEventLog.count > 500 {
+            v2AgentEventLog.removeFirst(v2AgentEventLog.count - 500)
+        }
+    }
+
+    private func v2AgentAppendServiceEvents(
+        workspace: Workspace,
+        surfaceId: UUID?,
+        previousPorts: [Int],
+        currentPorts: [Int]
+    ) {
+        let previous = Set(previousPorts)
+        let current = Set(currentPorts)
+        for port in current.subtracting(previous).sorted() {
+            v2AgentAppendEvent(
+                type: "service.ready",
+                workspaceId: workspace.id,
+                surfaceId: surfaceId,
+                payload: [
+                    "service_id": "service:\(port)",
+                    "port": port,
+                    "url": "http://localhost:\(port)",
+                    "ready": true
+                ]
+            )
+        }
+    }
+
+    private func v2AgentEventPayload(_ event: AgentEvent) -> [String: Any] {
+        var payload: [String: Any] = [
+            "seq": event.seq,
+            "type": event.type,
+            "at": v2AgentISO8601String(event.createdAt),
+            "session_id": v2OrNull(event.sessionId),
+            "workspace_id": v2OrNull(event.workspaceId?.uuidString),
+            "workspace_ref": v2Ref(kind: .workspace, uuid: event.workspaceId),
+            "surface_id": v2OrNull(event.surfaceId?.uuidString),
+            "surface_ref": v2Ref(kind: .surface, uuid: event.surfaceId)
+        ]
+        for (key, value) in event.payload {
+            payload[key] = value
+        }
+        return payload
+    }
+
+    private func v2AgentServicePayload(
+        sessionId: String,
+        workspace: Workspace,
+        port: Int,
+        surfaceId: UUID?
+    ) -> [String: Any] {
+        [
+            "ok": true,
+            "session_id": sessionId,
+            "service_id": "service:\(port)",
+            "port": port,
+            "url": "http://localhost:\(port)",
+            "ready": true,
+            "workspace_id": workspace.id.uuidString,
+            "workspace_ref": v2Ref(kind: .workspace, uuid: workspace.id),
+            "surface_id": v2OrNull(surfaceId?.uuidString),
+            "surface_ref": v2Ref(kind: .surface, uuid: surfaceId)
+        ]
     }
 
     private func v2AgentResolveTerminalTarget(
@@ -4173,6 +4410,217 @@ class TerminalController {
         return max(0, Int(endDate.timeIntervalSince(startDate) * 1000.0))
     }
 
+    private func v2AgentReadTerminalText(
+        terminalPanel: TerminalPanel,
+        includeScrollback: Bool,
+        lineLimit: Int?
+    ) -> String? {
+        let response = readTerminalTextBase64(
+            terminalPanel: terminalPanel,
+            includeScrollback: includeScrollback,
+            lineLimit: lineLimit
+        )
+        guard response.hasPrefix("OK ") else { return nil }
+        let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    private func v2AgentTaskLogPath(taskId: String) -> String? {
+        let sanitizedId = taskId.replacingOccurrences(
+            of: "[^A-Za-z0-9._-]",
+            with: "_",
+            options: .regularExpression
+        )
+        let directoryURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("bmux-agent-jobs", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            return directoryURL.appendingPathComponent("\(sanitizedId).log").path
+        } catch {
+            return nil
+        }
+    }
+
+    private func v2AgentWriteTaskLog(taskId: String, text: String) -> String? {
+        guard let path = v2AgentTaskLogPath(taskId: taskId) else { return nil }
+        do {
+            try text.write(toFile: path, atomically: true, encoding: .utf8)
+            return path
+        } catch {
+            return nil
+        }
+    }
+
+    private func v2AgentCompactTailLines(from text: String, limit: Int) -> [String] {
+        guard limit > 0 else { return [] }
+        return text
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .suffix(limit)
+            .map { $0 }
+    }
+
+    private func v2AgentDetectedParser(command: String, output: String) -> String? {
+        let normalizedCommand = command.lowercased()
+        if normalizedCommand.contains("tsc") { return "tsc" }
+        if normalizedCommand.contains("pytest") { return "pytest" }
+        if normalizedCommand.contains("flutter") && normalizedCommand.contains("test") { return "flutter_test" }
+        if normalizedCommand.contains("xcodebuild") { return "xcodebuild" }
+
+        if output.range(of: #"(?m)^.+\(\d+,\s*\d+\):\s*error\s+TS\d+:"#,
+                        options: [.regularExpression]) != nil {
+            return "tsc"
+        }
+        if output.range(of: #"(?m)^FAILED\s+.+\s+-\s+.+$"#,
+                        options: [.regularExpression]) != nil {
+            return "pytest"
+        }
+        if output.range(of: #"(?m)^.+:\d+:\d+:\s*(error|warning|Error|Warning):\s+.+$"#,
+                        options: [.regularExpression]) != nil {
+            if normalizedCommand.contains("flutter") {
+                return "flutter_test"
+            }
+            return "xcodebuild"
+        }
+        return nil
+    }
+
+    private func v2AgentMakeDiagnostic(
+        file: String?,
+        line: Int?,
+        column: Int?,
+        code: String?,
+        severity: String,
+        message: String,
+        isRootCause: Bool
+    ) -> [String: Any] {
+        [
+            "file": v2OrNull(file),
+            "line": v2OrNull(line),
+            "column": v2OrNull(column),
+            "code": v2OrNull(code),
+            "severity": severity,
+            "message": message,
+            "is_root_cause": isRootCause
+        ]
+    }
+
+    private func v2AgentRegexCaptureGroups(
+        pattern: String,
+        text: String
+    ) -> [[String]] {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) else {
+            return []
+        }
+        let nsText = text as NSString
+        return regex.matches(in: text, range: NSRange(location: 0, length: nsText.length)).map { match in
+            (0..<match.numberOfRanges).map { index in
+                let range = match.range(at: index)
+                guard range.location != NSNotFound else { return "" }
+                return nsText.substring(with: range)
+            }
+        }
+    }
+
+    private func v2AgentAnalyzeTaskFailure(task: AgentTask, output: String) -> [String: Any] {
+        let tool = v2AgentDetectedParser(command: task.command, output: output)
+        var diagnostics: [[String: Any]] = []
+        var summary: String?
+
+        switch tool {
+        case "tsc":
+            let matches = v2AgentRegexCaptureGroups(
+                pattern: #"^(.+?)(?:\((\d+),\s*(\d+)\)|:(\d+):(\d+)\s*-\s*)(error|warning)\s+(TS\d+):\s+(.+)$"#,
+                text: output
+            )
+            diagnostics = matches.prefix(10).enumerated().map { index, match in
+                let file = match[1]
+                let line = Int(match[2].isEmpty ? match[4] : match[2])
+                let column = Int(match[3].isEmpty ? match[5] : match[3])
+                let severity = match[6].lowercased()
+                let code = match[7]
+                let message = match[8]
+                return v2AgentMakeDiagnostic(
+                    file: file,
+                    line: line,
+                    column: column,
+                    code: code,
+                    severity: severity,
+                    message: message,
+                    isRootCause: index == 0
+                )
+            }
+            if !diagnostics.isEmpty {
+                summary = "tsc found \(diagnostics.count) error\(diagnostics.count == 1 ? "" : "s")"
+            }
+
+        case "pytest":
+            let matches = v2AgentRegexCaptureGroups(
+                pattern: #"^FAILED\s+(.+?)(?:::([^\s]+))?\s+-\s+(.+)$"#,
+                text: output
+            )
+            diagnostics = matches.prefix(10).enumerated().map { index, match in
+                let file = match[1]
+                let testName = match[2]
+                let message = testName.isEmpty ? match[3] : "\(testName): \(match[3])"
+                return v2AgentMakeDiagnostic(
+                    file: file,
+                    line: nil,
+                    column: nil,
+                    code: nil,
+                    severity: "error",
+                    message: message,
+                    isRootCause: index == 0
+                )
+            }
+            if !diagnostics.isEmpty {
+                summary = "pytest reported \(diagnostics.count) failing test\(diagnostics.count == 1 ? "" : "s")"
+            }
+
+        case "flutter_test", "xcodebuild":
+            let matches = v2AgentRegexCaptureGroups(
+                pattern: #"^(.+?):(\d+):(\d+):\s*(error|warning|Error|Warning):\s+(.+)$"#,
+                text: output
+            )
+            diagnostics = matches.prefix(10).enumerated().map { index, match in
+                let severity = match[4].lowercased()
+                return v2AgentMakeDiagnostic(
+                    file: match[1],
+                    line: Int(match[2]),
+                    column: Int(match[3]),
+                    code: nil,
+                    severity: severity,
+                    message: match[5],
+                    isRootCause: index == 0
+                )
+            }
+            if !diagnostics.isEmpty {
+                let toolName = tool == "flutter_test" ? "flutter test" : "xcodebuild"
+                summary = "\(toolName) emitted \(diagnostics.count) compiler error\(diagnostics.count == 1 ? "" : "s")"
+            }
+
+        default:
+            break
+        }
+
+        let tail = v2AgentCompactTailLines(from: output, limit: diagnostics.isEmpty ? 8 : 5)
+        let fallbackSummary = tail.last ?? "command failed"
+
+        var payload: [String: Any] = [
+            "summary": summary ?? fallbackSummary,
+            "root_cause_count": diagnostics.isEmpty ? 0 : 1,
+            "tail": tail
+        ]
+        if let tool {
+            payload["tool"] = tool
+        }
+        if !diagnostics.isEmpty {
+            payload["diagnostics"] = diagnostics
+        }
+        return payload
+    }
+
     private func v2AgentTaskResultPayloadMain(
         taskId: String,
         session: AgentSession,
@@ -4187,26 +4635,117 @@ class TerminalController {
 
         var payload = v2AgentTaskPayload(task)
         payload["session_id"] = session.id
+        payload["event_cursor"] = v2AgentCurrentEventCursor()
+
+        let detectedTool = v2AgentDetectedParser(command: task.command, output: "")
+        if let detectedTool {
+            payload["tool"] = detectedTool
+        }
 
         if let workspaceId = task.workspaceId,
            let workspaceTabManager = AppDelegate.shared?.tabManagerFor(tabId: workspaceId),
            let workspace = workspaceTabManager.tabs.first(where: { $0.id == workspaceId }),
            let surfaceId = task.surfaceId,
-           let terminalPanel = workspace.terminalPanel(for: surfaceId),
-           task.status == .failed || includeTailLines != nil {
-            let requestedLines = includeTailLines ?? 40
-            if requestedLines > 0 {
-                let response = readTerminalTextBase64(
+           let terminalPanel = workspace.terminalPanel(for: surfaceId) {
+            if task.status == .failed,
+               let fullText = v2AgentReadTerminalText(
+                    terminalPanel: terminalPanel,
+                    includeScrollback: true,
+                    lineLimit: nil
+               ) {
+                let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: fullText)
+                for (key, value) in failurePayload {
+                    payload[key] = value
+                }
+                if let logPath = v2AgentWriteTaskLog(taskId: task.id, text: fullText) {
+                    payload["log_path"] = logPath
+                }
+            }
+
+            if let requestedLines = includeTailLines, requestedLines > 0,
+               let tailText = v2AgentReadTerminalText(
                     terminalPanel: terminalPanel,
                     includeScrollback: true,
                     lineLimit: requestedLines
-                )
-                if response.hasPrefix("OK ") {
-                    let base64 = String(response.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let tail = Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-                    payload["tail"] = tail
-                    payload["tail_lines"] = requestedLines
-                }
+               ) {
+                payload["tail"] = v2AgentCompactTailLines(from: tailText, limit: requestedLines)
+                payload["tail_lines"] = requestedLines
+            } else if task.status == .failed,
+                      payload["tail"] == nil,
+                      let tailText = v2AgentReadTerminalText(
+                        terminalPanel: terminalPanel,
+                        includeScrollback: true,
+                        lineLimit: 8
+                      ) {
+                payload["tail"] = v2AgentCompactTailLines(from: tailText, limit: 8)
+                payload["tail_lines"] = 8
+            }
+        }
+
+        switch task.status {
+        case .succeeded:
+            payload["ok"] = true
+            if let tool = payload["tool"] as? String {
+                payload["summary"] = "\(tool == "flutter_test" ? "flutter test" : tool) passed"
+            } else {
+                payload["summary"] = "command completed successfully"
+            }
+            payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "root_cause_count")
+            payload.removeValue(forKey: "log_path")
+            if includeTailLines == nil {
+                payload.removeValue(forKey: "tail")
+                payload.removeValue(forKey: "tail_lines")
+            }
+
+        case .failed:
+            payload["ok"] = false
+            if payload["summary"] == nil {
+                payload["summary"] = "command failed"
+            }
+            if payload["diagnostics"] == nil {
+                payload["diagnostics"] = []
+                payload["root_cause_count"] = 0
+            }
+            if payload["tail"] == nil {
+                payload["tail"] = []
+            }
+            if payload["log_path"] == nil,
+               let fallbackPath = v2AgentTaskLogPath(taskId: task.id) {
+                payload["log_path"] = fallbackPath
+            }
+
+        case .cancelled:
+            payload["ok"] = false
+            payload["summary"] = "command was cancelled"
+            payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "root_cause_count")
+            payload.removeValue(forKey: "log_path")
+            if includeTailLines == nil {
+                payload.removeValue(forKey: "tail")
+                payload.removeValue(forKey: "tail_lines")
+            }
+
+        case .queued:
+            payload["ok"] = false
+            payload["summary"] = "command is queued"
+            payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "root_cause_count")
+            payload.removeValue(forKey: "log_path")
+            if includeTailLines == nil {
+                payload.removeValue(forKey: "tail")
+                payload.removeValue(forKey: "tail_lines")
+            }
+
+        case .running:
+            payload["ok"] = false
+            payload["summary"] = "command is still running"
+            payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "root_cause_count")
+            payload.removeValue(forKey: "log_path")
+            if includeTailLines == nil {
+                payload.removeValue(forKey: "tail")
+                payload.removeValue(forKey: "tail_lines")
             }
         }
 
@@ -16571,8 +17110,15 @@ class TerminalController {
                 return
             }
 
+            let previousPorts = tab.surfaceListeningPorts[surfaceId] ?? []
             tab.surfaceListeningPorts[surfaceId] = ports
             tab.recomputeListeningPorts()
+            self.v2AgentAppendServiceEvents(
+                workspace: tab,
+                surfaceId: surfaceId,
+                previousPorts: previousPorts,
+                currentPorts: ports
+            )
         }
         return result
     }
@@ -16731,6 +17277,17 @@ class TerminalController {
             task.exitCode = exitCode
             task.status = exitCode == 0 ? .succeeded : .failed
             self.v2AgentTasks[taskId] = task
+            self.v2AgentAppendEvent(
+                type: "task.completed",
+                sessionId: task.sessionId,
+                workspaceId: task.workspaceId,
+                surfaceId: task.surfaceId,
+                payload: [
+                    "job_id": task.id,
+                    "status": task.status.rawValue,
+                    "exit_code": exitCode
+                ]
+            )
         }
         return "OK"
     }
