@@ -5,10 +5,13 @@ import { readFileSync } from "node:fs";
 import {
   createEvaluation,
   databaseStatus,
+  ingestQueuedRuns,
   insertRun,
   listEvaluations,
   openDatabase,
+  proposeEvaluations,
   recordSkillUsage,
+  seedDefaultSkills,
   searchSkills,
   upsertSkill,
 } from "./db";
@@ -18,13 +21,16 @@ function usage(): never {
   console.error(`bmux agent-intel
 
 Usage:
-  bun run tools/agent-intel/cli.ts status [--db PATH]
+  bun run tools/agent-intel/cli.ts status [--db PATH] [--queue PATH]
+  bun run tools/agent-intel/cli.ts ingest-queue [--db PATH] [--queue PATH]
   bun run tools/agent-intel/cli.ts record-run [--db PATH] [--input FILE]
   bun run tools/agent-intel/cli.ts upsert-skill [--db PATH] [--input FILE]
+  bun run tools/agent-intel/cli.ts seed-default-skills [--db PATH]
   bun run tools/agent-intel/cli.ts record-usage [--db PATH] [--input FILE]
   bun run tools/agent-intel/cli.ts create-evaluation [--db PATH] [--input FILE]
-  bun run tools/agent-intel/cli.ts list-evaluations [--db PATH] [--repo-root PATH] [--limit N]
-  bun run tools/agent-intel/cli.ts search-skills --query TEXT [--db PATH] [--repo-root PATH] [--limit N]
+  bun run tools/agent-intel/cli.ts propose-evaluations [--db PATH] [--queue PATH] [--repo-root PATH] [--limit N] [--min-occurrences N]
+  bun run tools/agent-intel/cli.ts list-evaluations [--db PATH] [--queue PATH] [--repo-root PATH] [--limit N]
+  bun run tools/agent-intel/cli.ts search-skills --query TEXT [--db PATH] [--queue PATH] [--repo-root PATH] [--limit N]
 
 Input JSON commands read --input FILE or stdin.`);
   process.exit(1);
@@ -85,17 +91,38 @@ function numberFlag(flags: Map<string, string>, key: string, fallback: number): 
 async function main(): Promise<void> {
   const { command, flags } = parseArgs(Bun.argv.slice(2));
   const db = openDatabase(flags.get("db"));
+  const queuePath = flags.get("queue");
+
+  function ingest(): ReturnType<typeof ingestQueuedRuns> {
+    return ingestQueuedRuns(db, queuePath);
+  }
 
   switch (command) {
     case "status": {
-      console.log(JSON.stringify(databaseStatus(db), null, 2));
+      const ingestResult = ingest();
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            ingest: ingestResult,
+            status: databaseStatus(db, { queuePath }),
+          },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
+    case "ingest-queue": {
+      console.log(JSON.stringify({ ok: true, ...ingest() }, null, 2));
       return;
     }
 
     case "record-run": {
       const input = await readJsonMaybeAsync<RunRecordInput>(flags);
-      const runId = insertRun(db, input);
-      console.log(JSON.stringify({ ok: true, runId }, null, 2));
+      const result = insertRun(db, input);
+      console.log(JSON.stringify({ ok: true, ...result }, null, 2));
       return;
     }
 
@@ -121,6 +148,13 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "seed-default-skills": {
+      const ingestResult = ingest();
+      const result = seedDefaultSkills(db);
+      console.log(JSON.stringify({ ok: true, ingest: ingestResult, ...result }, null, 2));
+      return;
+    }
+
     case "create-evaluation": {
       const input = await readJsonMaybeAsync<EvaluationInput>(flags);
       const evaluationId = createEvaluation(db, input);
@@ -128,15 +162,39 @@ async function main(): Promise<void> {
       return;
     }
 
+    case "propose-evaluations": {
+      const ingestResult = ingest();
+      const repoRoot = flags.get("repo-root") || null;
+      const limit = numberFlag(flags, "limit", 20);
+      const minOccurrences = numberFlag(flags, "min-occurrences", 2);
+      const proposals = proposeEvaluations(db, { repoRoot, limit, minOccurrences });
+      console.log(
+        JSON.stringify(
+          { ok: true, ingest: ingestResult, count: proposals.length, proposals },
+          null,
+          2
+        )
+      );
+      return;
+    }
+
     case "list-evaluations": {
+      const ingestResult = ingest();
       const repoRoot = flags.get("repo-root") || null;
       const limit = numberFlag(flags, "limit", 20);
       const evaluations = listEvaluations(db, { repoRoot, limit });
-      console.log(JSON.stringify({ ok: true, count: evaluations.length, evaluations }, null, 2));
+      console.log(
+        JSON.stringify(
+          { ok: true, ingest: ingestResult, count: evaluations.length, evaluations },
+          null,
+          2
+        )
+      );
       return;
     }
 
     case "search-skills": {
+      const ingestResult = ingest();
       const query = flags.get("query");
       if (!query) {
         throw new Error("Missing --query");
@@ -144,7 +202,9 @@ async function main(): Promise<void> {
       const repoRoot = flags.get("repo-root") || null;
       const limit = numberFlag(flags, "limit", 5);
       const hits = searchSkills(db, { query, repoRoot, limit });
-      console.log(JSON.stringify({ ok: true, count: hits.length, hits }, null, 2));
+      console.log(
+        JSON.stringify({ ok: true, ingest: ingestResult, count: hits.length, hits }, null, 2)
+      );
       return;
     }
 

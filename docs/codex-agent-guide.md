@@ -16,9 +16,25 @@ Use `agent.*` first. Use legacy `list-*` and full browser snapshots only for deb
 1. `bmux agent attach --json`
 2. `bmux agent capabilities --session <sid> --json`
 3. `bmux agent layout --session <sid> --json`
-4. `bmux agent ensure ...` or `bmux agent batch ...`
-5. `bmux agent events --session <sid> --since <cursor> --json`
-6. `bmux agent state summary --session <sid> --json`
+4. `bmux agent intel search --session <sid> --query "<task>" --json`
+5. `bmux agent ensure ...` or `bmux agent batch ...`
+6. `bmux agent events --session <sid> --since <cursor> --json`
+7. `bmux agent state summary --session <sid> --json`
+
+## Skill Loop
+
+```bash
+bmux agent intel seed-defaults --json
+bmux agent intel search --session <sid> --query "verify existing build fix" --json
+bmux agent intel propose --session <sid> --json
+bmux agent intel evaluations --session <sid> --json
+```
+
+Rules:
+
+1. search for a compact skill card before widening search or reading long logs
+2. let `task result` and `state summary` drive the next step
+3. treat `propose` output as reviewable candidates, not auto-active behavior
 
 ## Verify Loop
 

@@ -53,6 +53,7 @@ export interface EvaluationInput {
 export interface SkillSearchResult {
   skillId: string;
   versionId: string;
+  versionLabel: string | null;
   slug: string;
   title: string;
   scope: SkillScope;
@@ -60,8 +61,27 @@ export interface SkillSearchResult {
   status: SkillStatus;
   origin: SkillOrigin;
   summary: string;
+  contentMarkdown: string;
   changeSummary: string | null;
   tags: string[];
   score: number;
   reasons: string[];
+}
+
+export interface QueuedRunIngestResult {
+  queuePath: string;
+  ingested: number;
+  skipped: number;
+  errorCount: number;
+  errors: Array<{ line: number; error: string }>;
+}
+
+export interface ProposedEvaluation {
+  evaluationId: string;
+  type: EvaluationType;
+  repoRoot: string | null;
+  proposedSlug: string | null;
+  summary: string;
+  evidenceCount: number | null;
+  created: boolean;
 }

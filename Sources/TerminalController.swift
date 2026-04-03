@@ -51,6 +51,7 @@ class TerminalController {
     private var clientHandlers: [Int32: Thread] = [:]
     private var tabManager: TabManager?
     private var accessMode: SocketControlMode = .bmuxOnly
+    private let v2AgentIntelRecorderQueue = DispatchQueue(label: "bmux.agent-intel.recorder", qos: .utility)
     private let myPid = getpid()
     private nonisolated(unsafe) static var socketCommandPolicyDepth: Int = 0
     private nonisolated(unsafe) static var socketCommandFocusAllowanceStack: [Bool] = []
@@ -253,6 +254,7 @@ class TerminalController {
         var startedAt: Date?
         var completedAt: Date?
         var exitCode: Int?
+        var workingDirectory: String?
     }
 
     private struct AgentPendingTaskCommand {
@@ -4409,6 +4411,7 @@ class TerminalController {
             let shellState = terminalContext.workspace.panelShellActivityState(panelId: terminalPanel.id)
             let shouldQueueUntilPrompt = shellState == .commandRunning
             let startedAt = shouldQueueUntilPrompt ? nil : now
+            let taskWorkingDirectory = cwd ?? v2AgentEffectiveDirectory(context: terminalContext)
             let initialStatus: AgentTaskStatus = shouldQueueUntilPrompt ? .queued : .running
 
             let task = AgentTask(
@@ -4434,7 +4437,8 @@ class TerminalController {
                 status: initialStatus,
                 startedAt: startedAt,
                 completedAt: nil,
-                exitCode: nil
+                exitCode: nil,
+                workingDirectory: taskWorkingDirectory
             )
             v2AgentTasks[taskId] = task
             v2AgentAppendEvent(
@@ -8003,14 +8007,18 @@ class TerminalController {
         return nil
     }
 
-    private func v2AgentNormalizedDirectoryPath(_ directory: String?) -> String? {
-        guard let directory else { return nil }
-        let trimmed = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func v2AgentNormalizedPath(_ path: String?) -> String? {
+        guard let path else { return nil }
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let expanded = (trimmed as NSString).expandingTildeInPath
         let standardized = (expanded as NSString).standardizingPath
         guard !standardized.isEmpty else { return nil }
         return standardized
+    }
+
+    private func v2AgentNormalizedDirectoryPath(_ directory: String?) -> String? {
+        v2AgentNormalizedPath(directory)
     }
 
     private func v2AgentRepositoryRoot(startingAt directory: String?) -> String? {
@@ -8031,6 +8039,152 @@ class TerminalController {
         }
 
         return nil
+    }
+
+    private func v2AgentIntelStateDirectoryPath() -> String? {
+        if let explicit = v2AgentNormalizedPath(ProcessInfo.processInfo.environment["BMUX_AGENT_INTEL_STATE_DIR"]) {
+            return explicit
+        }
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return appSupport
+            .appendingPathComponent("bmux", isDirectory: true)
+            .appendingPathComponent("agent-intel", isDirectory: true)
+            .path
+    }
+
+    private func v2AgentIntelQueuePath() -> String? {
+        if let explicit = v2AgentNormalizedPath(ProcessInfo.processInfo.environment["BMUX_AGENT_INTEL_QUEUE_PATH"]) {
+            return explicit
+        }
+        guard let stateDirectory = v2AgentIntelStateDirectoryPath() else {
+            return nil
+        }
+        return (stateDirectory as NSString).appendingPathComponent("run-queue.ndjson")
+    }
+
+    private func v2AgentIntelFailureSignature(
+        task: AgentTask,
+        resultPayload: [String: Any]
+    ) -> String? {
+        guard task.status == .failed else { return nil }
+        let diagnostics = ((resultPayload["diagnostics"] as? [[String: Any]]) ?? []).prefix(3).map { diagnostic in
+            [
+                "file": v2OrNull(diagnostic["file"]),
+                "line": v2OrNull(diagnostic["line"]),
+                "code": v2OrNull(diagnostic["code"]),
+                "message": v2OrNull(diagnostic["message"])
+            ]
+        }
+        return "fail:" + v2AgentShortHash([
+            "tool": v2OrNull(resultPayload["tool"]),
+            "summary": v2OrNull(resultPayload["summary"]),
+            "exit_code": v2OrNull(task.exitCode),
+            "diagnostics": Array(diagnostics)
+        ])
+    }
+
+    private func v2AgentIntelRunPayload(
+        task: AgentTask,
+        resultPayload: [String: Any]
+    ) -> [String: Any] {
+        let repoRoot = v2AgentRepositoryRoot(startingAt: task.workingDirectory)
+        let diagnostics = Array(((resultPayload["diagnostics"] as? [[String: Any]]) ?? []).prefix(5))
+        let tail = Array(((resultPayload["tail"] as? [String]) ?? []).prefix(5))
+
+        var metadata: [String: Any] = [
+            "label": task.label,
+            "command": task.command,
+            "status": task.status.rawValue,
+            "summary": v2OrNull(resultPayload["summary"]),
+            "tool": v2OrNull(resultPayload["tool"]),
+            "profile": v2OrNull(task.profileName),
+            "approval_state": v2OrNull(task.approvalState),
+            "group_id": v2OrNull(task.groupId),
+            "session_id": task.sessionId,
+            "window_id": v2OrNull(task.windowId?.uuidString),
+            "workspace_id": v2OrNull(task.workspaceId?.uuidString),
+            "surface_id": v2OrNull(task.surfaceId?.uuidString),
+            "working_directory": v2OrNull(task.workingDirectory),
+            "exit_code": v2OrNull(task.exitCode),
+            "log_path": v2OrNull(resultPayload["log_path"]),
+            "root_cause_count": v2OrNull(resultPayload["root_cause_count"]),
+            "event_cursor": v2OrNull(resultPayload["event_cursor"])
+        ]
+
+        if !task.expectedPorts.isEmpty {
+            metadata["expected_ports"] = task.expectedPorts
+        }
+        if let retryPayload = v2AgentRetryPayload(task) {
+            metadata["retry"] = retryPayload
+        }
+        if task.cacheEligible {
+            metadata["cache_eligible"] = true
+        }
+        if !diagnostics.isEmpty {
+            metadata["diagnostics"] = diagnostics
+        }
+        if !tail.isEmpty {
+            metadata["tail"] = tail
+        }
+
+        return [
+            "id": task.id,
+            "repoRoot": v2OrNull(repoRoot),
+            "workspaceFingerprint": v2OrNull(task.workspaceFingerprint),
+            "taskText": task.label,
+            "executionClass": v2OrNull(task.executionClass),
+            "success": task.status == .succeeded,
+            "durationMs": v2OrNull(v2AgentTaskDurationMs(task)),
+            "failureSignature": v2OrNull(v2AgentIntelFailureSignature(task: task, resultPayload: resultPayload)),
+            "metadata": metadata
+        ]
+    }
+
+    private func v2AgentIntelAppendRunPayload(_ payload: [String: Any]) {
+        guard let queuePath = v2AgentIntelQueuePath(),
+              JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+
+        let lineData = data + Data([0x0a])
+        v2AgentIntelRecorderQueue.async {
+            let url = URL(fileURLWithPath: queuePath)
+            do {
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(),
+                    withIntermediateDirectories: true,
+                    attributes: nil
+                )
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                }
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: lineData)
+            } catch {
+#if DEBUG
+                dlog("agent.intel.record.failed path=\(queuePath) error=\(error)")
+#endif
+            }
+        }
+    }
+
+    private func v2AgentIntelRecordTaskCompletion(taskId: String, session: AgentSession) {
+        guard let task = v2AgentTasks[taskId] else { return }
+        guard case .ok(let payloadAny) = v2AgentTaskResultPayloadMain(
+            taskId: taskId,
+            session: session,
+            includeTailLines: nil
+        ),
+        let payload = payloadAny as? [String: Any] else {
+            return
+        }
+
+        v2AgentIntelAppendRunPayload(v2AgentIntelRunPayload(task: task, resultPayload: payload))
     }
 
     private func v2AgentResolvedCommandPath(_ executable: String) -> String? {
@@ -21319,6 +21473,9 @@ class TerminalController {
                     "exit_code": exitCode
                 ]
             )
+            if let session = self.v2AgentSessions[task.sessionId] {
+                self.v2AgentIntelRecordTaskCompletion(taskId: task.id, session: session)
+            }
             self.v2AgentMaybeFinalizeProfileGroup(task: task)
             if let workspaceId = task.workspaceId,
                let workspace = self.tabForSidebarMutation(id: workspaceId) {
