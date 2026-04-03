@@ -15171,6 +15171,13 @@ struct CMUXCLI {
         }
     }
 
+    private func codexReadyStatus(cwd: String?) -> String {
+        if let projectName = hookProjectName(cwd: cwd) {
+            return "Ready in \(projectName)"
+        }
+        return "Ready"
+    }
+
     private func codexIdleStatus(
         parsedInput: ClaudeHookParsedInput,
         sessionRecord: ClaudeHookSessionRecord?
@@ -15209,6 +15216,39 @@ struct CMUXCLI {
         return (subtitle, "Codex session completed")
     }
 
+    private func printHookResult(
+        source: String,
+        event: String,
+        summary: String,
+        detail: String? = nil,
+        skipped: Bool = false,
+        extra: [String: Any] = [:]
+    ) {
+        var payload: [String: Any] = [
+            "ok": true,
+            "source": source,
+            "event": event,
+            "summary": summary,
+            "skipped": skipped
+        ]
+
+        if let detail, !detail.isEmpty {
+            payload["detail"] = detail
+        }
+
+        for (key, value) in extra {
+            payload[key] = value
+        }
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            print("{}")
+            return
+        }
+        print(text)
+    }
+
     private func socketCommandQuote(_ value: String) -> String {
         let escaped = value
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -15223,14 +15263,20 @@ struct CMUXCLI {
         telemetry: CLISocketSentryTelemetry
     ) throws {
         let env = ProcessInfo.processInfo.environment
+        let subcommand = commandArgs.first?.lowercased() ?? "help"
 
         // Graceful no-op: if not inside bmux, exit silently with valid JSON
         guard env["CMUX_SURFACE_ID"] != nil else {
-            print("{}")
+            printHookResult(
+                source: "bmux",
+                event: subcommand.replacingOccurrences(of: "-", with: "_"),
+                summary: "Skipped outside bmux",
+                detail: "No CMUX_SURFACE_ID was present for the hook.",
+                skipped: true
+            )
             return
         }
 
-        let subcommand = commandArgs.first?.lowercased() ?? "help"
         let hookArgs = Array(commandArgs.dropFirst())
         let hookWsFlag = optionValue(hookArgs, name: "--workspace")
         let workspaceArg = hookWsFlag ?? env["CMUX_WORKSPACE_ID"]
@@ -15273,7 +15319,25 @@ struct CMUXCLI {
                     cwd: parsedInput.cwd
                 )
             }
-            print("{}")
+            let statusValue = codexReadyStatus(cwd: parsedInput.cwd)
+            try? setCodexStatus(
+                client: client,
+                workspaceId: workspaceId,
+                value: statusValue,
+                icon: "sparkles",
+                color: "#36C275"
+            )
+            printHookResult(
+                source: "bmux",
+                event: "session_start",
+                summary: "Registered Codex session",
+                detail: statusValue,
+                extra: [
+                    "workspaceId": workspaceId,
+                    "surfaceId": surfaceId,
+                    "status": statusValue
+                ]
+            )
 
         case "prompt-submit":
             telemetry.breadcrumb("codex-hook.prompt-submit")
@@ -15300,18 +15364,30 @@ struct CMUXCLI {
                 )
             }
             _ = try? sendV1Command("clear_notifications --tab=\(workspaceId)", client: client)
+            let statusValue = codexRunningStatus(
+                parsedInput: parsedInput,
+                sessionRecord: mappedSession,
+                requestSummary: requestSummary
+            )
             try setCodexStatus(
                 client: client,
                 workspaceId: workspaceId,
-                value: codexRunningStatus(
-                    parsedInput: parsedInput,
-                    sessionRecord: mappedSession,
-                    requestSummary: requestSummary
-                ),
+                value: statusValue,
                 icon: "bolt.fill",
                 color: "#4C8DFF"
             )
-            print("{}")
+            printHookResult(
+                source: "bmux",
+                event: "prompt_submit",
+                summary: statusValue,
+                detail: requestSummary ?? "Prompt captured and bmux status updated.",
+                extra: [
+                    "workspaceId": workspaceId,
+                    "surfaceId": surfaceId,
+                    "status": statusValue,
+                    "requestSummary": requestSummary ?? ""
+                ]
+            )
 
         case "stop":
             telemetry.breadcrumb("codex-hook.stop")
@@ -15346,24 +15422,48 @@ struct CMUXCLI {
                     )
                 }
 
-                let payload = "Codex|\(sanitizeNotificationField(stopSummary.subtitle))|\(sanitizeNotificationField(stopSummary.body))"
-                _ = try? sendV1Command("notify_target \(workspaceId) \(surfaceId) \(payload)", client: client)
+                _ = try? client.sendV2(
+                    method: "notification.create_for_target",
+                    params: [
+                        "workspace_id": workspaceId,
+                        "surface_id": surfaceId,
+                        "title": "Codex",
+                        "subtitle": sanitizeNotificationField(stopSummary.subtitle),
+                        "body": sanitizeNotificationField(stopSummary.body)
+                    ]
+                )
 
+                let statusValue = stopSummary.subtitle
                 try? setCodexStatus(
                     client: client,
                     workspaceId: workspaceId,
-                    value: codexIdleStatus(
-                        parsedInput: parsedInput,
-                        sessionRecord: mappedSession
-                    ),
-                    icon: "pause.circle.fill",
-                    color: "#8E8E93"
+                    value: statusValue,
+                    icon: "checkmark.circle.fill",
+                    color: "#36C275"
                 )
-                print("{}")
+                printHookResult(
+                    source: "bmux",
+                    event: "stop",
+                    summary: stopSummary.subtitle,
+                    detail: stopSummary.body,
+                    extra: [
+                        "workspaceId": workspaceId,
+                        "surfaceId": surfaceId,
+                        "status": statusValue,
+                        "notificationSubtitle": stopSummary.subtitle,
+                        "notificationBody": stopSummary.body
+                    ]
+                )
             } catch {
                 if shouldIgnoreClaudeHookTeardownError(error) {
                     telemetry.breadcrumb("codex-hook.stop.ignored", data: ["error": String(describing: error)])
-                    print("{}")
+                    printHookResult(
+                        source: "bmux",
+                        event: "stop",
+                        summary: "Skipped stop cleanup",
+                        detail: "Workspace or surface was already torn down.",
+                        skipped: true
+                    )
                     return
                 }
                 throw error

@@ -53,7 +53,7 @@ def run_codex_hook(
     subcommand: str,
     payload: dict,
     env: dict[str, str],
-) -> str:
+) -> dict:
     proc = subprocess.run(
         [cli_path, "--socket", socket_path, "codex-hook", subcommand],
         input=json.dumps(payload),
@@ -67,25 +67,10 @@ def run_codex_hook(
             f"bmux codex-hook {subcommand} failed:\n"
             f"exit={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
         )
-    return proc.stdout.strip()
-
-
-def wait_for_notification_count(client: bmux, minimum: int, timeout: float = 4.0) -> list[dict]:
-    start = time.time()
-    items: list[dict] = []
-    while time.time() - start < timeout:
-        items = client.list_notifications()
-        if len(items) >= minimum:
-            return items
-        time.sleep(0.05)
-    return items
-
-
-def latest_notification_with_subtitle(items: list[dict], subtitle: str) -> dict | None:
-    for item in items:
-        if item.get("subtitle") == subtitle:
-            return item
-    return None
+    try:
+        return json.loads(proc.stdout.strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bmux codex-hook {subcommand} returned non-JSON stdout: {proc.stdout!r}") from exc
 
 
 def wait_for_sidebar_fragment(client: bmux, workspace_id: str, fragment: str, timeout: float = 4.0) -> str:
@@ -146,7 +131,7 @@ def main() -> int:
             hook_env["CMUX_SURFACE_ID"] = surface_id
             hook_env["CMUX_CLAUDE_HOOK_STATE_PATH"] = str(state_path)
 
-            run_codex_hook(
+            session_start_output = run_codex_hook(
                 cli_path,
                 client.socket_path,
                 "session-start",
@@ -156,6 +141,11 @@ def main() -> int:
                 },
                 hook_env,
             )
+            if session_start_output.get("summary") != "Registered Codex session":
+                return fail(f"Expected session-start summary, got {session_start_output!r}")
+            ready_status = f"Ready in {project_dir.name}"
+            if session_start_output.get("status") != ready_status:
+                return fail(f"Expected ready status in session-start output, got {session_start_output!r}")
 
             if not state_path.exists():
                 return fail(f"Expected state file at {state_path}")
@@ -169,8 +159,12 @@ def main() -> int:
                 return fail("Mapped workspaceId did not match active workspace")
             if session_row.get("surfaceId") != surface_id:
                 return fail("Mapped surfaceId did not match active surface")
+            expected_ready = f"codex={ready_status}"
+            sidebar_state = wait_for_sidebar_fragment(client, workspace_id, expected_ready)
+            if expected_ready not in sidebar_state:
+                return fail(f"Expected ready status fragment. sidebar_state={sidebar_state!r}")
 
-            run_codex_hook(
+            prompt_submit_output = run_codex_hook(
                 cli_path,
                 client.socket_path,
                 "prompt-submit",
@@ -183,6 +177,10 @@ def main() -> int:
             )
 
             expected_running = f"codex=Running in {project_dir.name}: {prompt_message}"
+            if prompt_submit_output.get("summary") != expected_running.replace("codex=", "", 1):
+                return fail(f"Expected prompt-submit summary to match running status, got {prompt_submit_output!r}")
+            if prompt_submit_output.get("requestSummary") != prompt_message:
+                return fail(f"Expected prompt-submit request summary in output, got {prompt_submit_output!r}")
             sidebar_state = wait_for_sidebar_fragment(client, workspace_id, expected_running)
             if expected_running not in sidebar_state:
                 return fail(f"Expected running status fragment. sidebar_state={sidebar_state!r}")
@@ -193,7 +191,7 @@ def main() -> int:
             if prompt_row.get("lastRequest") != prompt_message:
                 return fail("Expected prompt-submit to persist lastRequest summary")
 
-            run_codex_hook(
+            stop_output = run_codex_hook(
                 cli_path,
                 client.socket_path,
                 "stop",
@@ -205,20 +203,15 @@ def main() -> int:
                 hook_env,
             )
 
-            items = wait_for_notification_count(client, minimum=1)
             subtitle = f"Completed in {project_dir.name}"
-            completed_notification = latest_notification_with_subtitle(items, subtitle)
-            if completed_notification is None:
-                return fail(f"Expected a {subtitle!r} notification on stop")
-            if assistant_message not in completed_notification.get("body", ""):
-                return fail("Expected completion notification body to include last assistant message")
-            if completed_notification.get("surface_id") != surface_id:
-                return fail("Expected completion notification to target mapped surface")
-
-            expected_idle = f"codex=Idle in {project_dir.name}"
-            sidebar_state = wait_for_sidebar_fragment(client, workspace_id, expected_idle)
-            if expected_idle not in sidebar_state:
-                return fail(f"Expected idle status fragment. sidebar_state={sidebar_state!r}")
+            if stop_output.get("summary") != subtitle:
+                return fail(f"Expected stop summary to match notification subtitle, got {stop_output!r}")
+            if assistant_message not in str(stop_output.get("detail", "")):
+                return fail(f"Expected stop detail to include assistant message, got {stop_output!r}")
+            expected_completed = f"codex={subtitle}"
+            sidebar_state = wait_for_sidebar_fragment(client, workspace_id, expected_completed)
+            if expected_completed not in sidebar_state:
+                return fail(f"Expected completed status fragment. sidebar_state={sidebar_state!r}")
 
             with state_path.open("r", encoding="utf-8") as f:
                 stop_state = json.load(f)
