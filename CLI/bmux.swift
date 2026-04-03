@@ -326,6 +326,7 @@ private struct ClaudeHookSessionRecord: Codable {
     var pid: Int?
     var lastSubtitle: String?
     var lastBody: String?
+    var lastRequest: String?
     var startedAt: TimeInterval
     var updatedAt: TimeInterval
 }
@@ -373,7 +374,8 @@ private final class ClaudeHookSessionStore {
         cwd: String?,
         pid: Int? = nil,
         lastSubtitle: String? = nil,
-        lastBody: String? = nil
+        lastBody: String? = nil,
+        lastRequest: String? = nil
     ) throws {
         let normalized = normalizeSessionId(sessionId)
         guard !normalized.isEmpty else { return }
@@ -387,6 +389,7 @@ private final class ClaudeHookSessionStore {
                 pid: nil,
                 lastSubtitle: nil,
                 lastBody: nil,
+                lastRequest: nil,
                 startedAt: now,
                 updatedAt: now
             )
@@ -405,6 +408,9 @@ private final class ClaudeHookSessionStore {
             }
             if let body = normalizeOptional(lastBody) {
                 record.lastBody = body
+            }
+            if let request = normalizeOptional(lastRequest) {
+                record.lastRequest = request
             }
             record.updatedAt = now
             state.sessions[normalized] = record
@@ -14027,10 +14033,11 @@ struct CMUXCLI {
         color: String,
         pid: Int? = nil
     ) throws {
-        var cmd = "set_status claude_code \(value) --icon=\(icon) --color=\(color) --tab=\(workspaceId)"
+        var cmd = "set_status claude_code --icon=\(icon) --color=\(color) --tab=\(workspaceId)"
         if let pid {
             cmd += " --pid=\(pid)"
         }
+        cmd += " -- \(socketCommandQuote(value))"
         _ = try client.send(command: cmd)
     }
 
@@ -14736,42 +14743,44 @@ struct CMUXCLI {
     // MARK: - Codex hooks
 
     /// The hooks.json content that bmux installs into ~/.codex/.
-    /// Each hook calls `bmux codex-hook <event>` which gracefully no-ops
-    /// when not running inside bmux. The command checks for bmux on PATH
-    /// first so it silently succeeds even when bmux is not installed
-    /// (e.g. user opened codex in a non-bmux terminal).
-    private static func codexHookCommand(_ event: String) -> String {
-        "[ -n \"$CMUX_SURFACE_ID\" ] && command -v bmux >/dev/null 2>&1 && bmux codex-hook \(event) || echo '{}'"
+    /// Each hook calls the current bmux CLI path directly so Codex does not
+    /// accidentally pick up a stale or unrelated `bmux` binary earlier on PATH.
+    private func codexHookCommand(_ event: String) -> String {
+        let cliPath = resolvedExecutableURL()?.path ?? "bmux"
+        let quotedPath = shellQuote(cliPath)
+        return "[ -n \"$CMUX_SURFACE_ID\" ] && [ -x \(quotedPath) ] && \(quotedPath) codex-hook \(event) || echo '{}'"
     }
 
-    private static let codexHooksJSON: [String: Any] = [
-        "hooks": [
-            "SessionStart": [[
-                "hooks": [[
-                    "type": "command",
-                    "command": codexHookCommand("session-start"),
-                    "timeout": 10
+    private func codexHooksJSON() -> [String: Any] {
+        [
+            "hooks": [
+                "SessionStart": [[
+                    "hooks": [[
+                        "type": "command",
+                        "command": codexHookCommand("session-start"),
+                        "timeout": 10
+                    ] as [String: Any]]
+                ] as [String: Any]],
+                "UserPromptSubmit": [[
+                    "hooks": [[
+                        "type": "command",
+                        "command": codexHookCommand("prompt-submit"),
+                        "timeout": 10
+                    ] as [String: Any]]
+                ] as [String: Any]],
+                "Stop": [[
+                    "hooks": [[
+                        "type": "command",
+                        "command": codexHookCommand("stop"),
+                        "timeout": 10
+                    ] as [String: Any]]
                 ] as [String: Any]]
-            ] as [String: Any]],
-            "UserPromptSubmit": [[
-                "hooks": [[
-                    "type": "command",
-                    "command": codexHookCommand("prompt-submit"),
-                    "timeout": 10
-                ] as [String: Any]]
-            ] as [String: Any]],
-            "Stop": [[
-                "hooks": [[
-                    "type": "command",
-                    "command": codexHookCommand("stop"),
-                    "timeout": 10
-                ] as [String: Any]]
-            ] as [String: Any]]
-        ] as [String: Any]
-    ]
+            ] as [String: Any]
+        ]
+    }
 
     /// Identifier used to detect bmux-owned hooks during uninstall.
-    private static let codexHookCommandMarker = "bmux codex-hook"
+    private static let codexHookCommandMarker = "codex-hook"
 
     private func runCodexInstallHooks() throws {
         let skipConfirm = ProcessInfo.processInfo.arguments.contains("--yes")
@@ -14799,7 +14808,7 @@ struct CMUXCLI {
         }
 
         var hooks = existing["hooks"] as? [String: Any] ?? [:]
-        let bmuxHooks = Self.codexHooksJSON["hooks"] as! [String: Any]
+        let bmuxHooks = codexHooksJSON()["hooks"] as! [String: Any]
         for (eventName, bmuxGroups) in bmuxHooks {
             guard let bmuxGroupArray = bmuxGroups as? [[String: Any]] else { continue }
             var eventGroups = hooks[eventName] as? [[String: Any]] ?? []
@@ -15118,6 +15127,95 @@ struct CMUXCLI {
         return rest.hasPrefix("=")
     }
 
+    private func hookProjectName(cwd: String?) -> String? {
+        guard let cwd = cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty else {
+            return nil
+        }
+        let path = NSString(string: cwd).expandingTildeInPath
+        let tail = URL(fileURLWithPath: path).lastPathComponent
+        return tail.isEmpty ? path : tail
+    }
+
+    private func codexHookPromptSummary(_ parsedInput: ClaudeHookParsedInput) -> String? {
+        if let object = parsedInput.object {
+            let nested = (object["data"] as? [String: Any]) ?? (object["notification"] as? [String: Any]) ?? [:]
+            let summary = [
+                firstString(in: object, keys: ["message", "prompt", "text", "body", "description"]),
+                firstString(in: nested, keys: ["message", "prompt", "text", "body", "description"])
+            ].compactMap { $0 }.first
+            if let summary, !summary.isEmpty {
+                return truncate(normalizedSingleLine(summary), maxLength: 90)
+            }
+        }
+        if let fallback = parsedInput.rawFallback, !fallback.isEmpty {
+            return truncate(fallback, maxLength: 90)
+        }
+        return nil
+    }
+
+    private func codexRunningStatus(
+        parsedInput: ClaudeHookParsedInput,
+        sessionRecord: ClaudeHookSessionRecord?,
+        requestSummary: String?
+    ) -> String {
+        let projectName = hookProjectName(cwd: parsedInput.cwd ?? sessionRecord?.cwd)
+        switch (projectName, requestSummary) {
+        case let (.some(projectName), .some(requestSummary)):
+            return truncate("Running in \(projectName): \(requestSummary)", maxLength: 120)
+        case let (.some(projectName), nil):
+            return "Running in \(projectName)"
+        case let (nil, .some(requestSummary)):
+            return truncate("Running: \(requestSummary)", maxLength: 120)
+        default:
+            return "Running"
+        }
+    }
+
+    private func codexIdleStatus(
+        parsedInput: ClaudeHookParsedInput,
+        sessionRecord: ClaudeHookSessionRecord?
+    ) -> String {
+        if let projectName = hookProjectName(cwd: parsedInput.cwd ?? sessionRecord?.cwd) {
+            return "Idle in \(projectName)"
+        }
+        return "Idle"
+    }
+
+    private func summarizeCodexHookStop(
+        parsedInput: ClaudeHookParsedInput,
+        sessionRecord: ClaudeHookSessionRecord?
+    ) -> (subtitle: String, body: String) {
+        let projectName = hookProjectName(cwd: parsedInput.cwd ?? sessionRecord?.cwd)
+        let subtitle = projectName.map { "Completed in \($0)" } ?? "Completed"
+
+        let assistantSummary = [
+            parsedInput.object?["last_assistant_message"] as? String,
+            parsedInput.object?["lastAssistantMessage"] as? String,
+            parsedInput.object?["message"] as? String
+        ]
+        .compactMap { $0 }
+        .map(normalizedSingleLine)
+        .first { !$0.isEmpty }
+
+        if let assistantSummary {
+            return (subtitle, truncate(assistantSummary, maxLength: 200))
+        }
+        if let lastRequest = sessionRecord?.lastRequest, !lastRequest.isEmpty {
+            return (subtitle, truncate("Finished: \(lastRequest)", maxLength: 200))
+        }
+        if let projectName {
+            return (subtitle, "Codex session completed in \(projectName)")
+        }
+        return (subtitle, "Codex session completed")
+    }
+
+    private func socketCommandQuote(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\""
+    }
+
     /// Codex hook handler. Gracefully no-ops when not running inside bmux.
     private func runCodexHook(
         commandArgs: [String],
@@ -15142,7 +15240,7 @@ struct CMUXCLI {
         let sessionStore = ClaudeHookSessionStore(
             processEnv: env.merging(
                 ["CMUX_CLAUDE_HOOK_STATE_PATH": "~/.bmuxterm/codex-hook-sessions.json"],
-                uniquingKeysWith: { _, new in new }
+                uniquingKeysWith: { current, _ in current }
             )
         )
         telemetry.breadcrumb(
@@ -15185,11 +15283,31 @@ struct CMUXCLI {
                 fallback: workspaceArg,
                 client: client
             )
+            let surfaceId = try resolvePreferredSurfaceIdForClaudeHook(
+                preferred: mappedSession?.surfaceId,
+                fallback: surfaceArg,
+                workspaceId: workspaceId,
+                client: client
+            )
+            let requestSummary = codexHookPromptSummary(parsedInput)
+            if let sessionId = parsedInput.sessionId {
+                try? sessionStore.upsert(
+                    sessionId: sessionId,
+                    workspaceId: workspaceId,
+                    surfaceId: surfaceId,
+                    cwd: parsedInput.cwd ?? mappedSession?.cwd,
+                    lastRequest: requestSummary
+                )
+            }
             _ = try? sendV1Command("clear_notifications --tab=\(workspaceId)", client: client)
             try setCodexStatus(
                 client: client,
                 workspaceId: workspaceId,
-                value: "Running",
+                value: codexRunningStatus(
+                    parsedInput: parsedInput,
+                    sessionRecord: mappedSession,
+                    requestSummary: requestSummary
+                ),
                 icon: "bolt.fill",
                 color: "#4C8DFF"
             )
@@ -15211,14 +15329,11 @@ struct CMUXCLI {
                     client: client
                 )
 
-                // Build completion notification from Codex stop payload
-                let lastMessage = parsedInput.object?["last_assistant_message"] as? String
-                    ?? parsedInput.object?["lastAssistantMessage"] as? String
                 let cwd = parsedInput.cwd ?? mappedSession?.cwd
-                let projectName: String? = {
-                    guard let cwd, !cwd.isEmpty else { return nil }
-                    return URL(fileURLWithPath: NSString(string: cwd).expandingTildeInPath).lastPathComponent
-                }()
+                let stopSummary = summarizeCodexHookStop(
+                    parsedInput: parsedInput,
+                    sessionRecord: mappedSession
+                )
 
                 if let sessionId = parsedInput.sessionId {
                     try? sessionStore.upsert(
@@ -15226,27 +15341,21 @@ struct CMUXCLI {
                         workspaceId: workspaceId,
                         surfaceId: surfaceId,
                         cwd: cwd,
-                        lastSubtitle: "Completed",
-                        lastBody: lastMessage.map { truncate($0, maxLength: 200) }
+                        lastSubtitle: stopSummary.subtitle,
+                        lastBody: stopSummary.body
                     )
                 }
 
-                // Send completion notification
-                var subtitle = "Completed"
-                if let projectName, !projectName.isEmpty {
-                    subtitle = "Completed in \(projectName)"
-                }
-                let body = sanitizeNotificationField(
-                    lastMessage.map { truncate(normalizedSingleLine($0), maxLength: 200) }
-                        ?? "Codex session completed"
-                )
-                let payload = "Codex|\(sanitizeNotificationField(subtitle))|\(body)"
+                let payload = "Codex|\(sanitizeNotificationField(stopSummary.subtitle))|\(sanitizeNotificationField(stopSummary.body))"
                 _ = try? sendV1Command("notify_target \(workspaceId) \(surfaceId) \(payload)", client: client)
 
                 try? setCodexStatus(
                     client: client,
                     workspaceId: workspaceId,
-                    value: "Idle",
+                    value: codexIdleStatus(
+                        parsedInput: parsedInput,
+                        sessionRecord: mappedSession
+                    ),
                     icon: "pause.circle.fill",
                     color: "#8E8E93"
                 )
@@ -15275,7 +15384,7 @@ struct CMUXCLI {
         icon: String,
         color: String
     ) throws {
-        let cmd = "set_status codex \(value) --icon=\(icon) --color=\(color) --tab=\(workspaceId)"
+        let cmd = "set_status codex --icon=\(icon) --color=\(color) --tab=\(workspaceId) -- \(socketCommandQuote(value))"
         _ = try client.send(command: cmd)
     }
 
