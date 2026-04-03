@@ -129,6 +129,9 @@ echo "Release app:"
 echo "  ${APP_PATH}"
 echo "Installed app:"
 echo "  ${APPLICATIONS_APP_PATH}"
+rm -rf "$APP_PATH"
+echo "Pruned staging release app:"
+echo "  ${APP_PATH}"
 
 # Dev shells (including CI/Codex) often force-disable paging by exporting these.
 # Don't leak that into bmux, otherwise `git diff` won't page even with PAGER=less.

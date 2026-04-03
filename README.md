@@ -119,6 +119,11 @@ Keep two local app variants only:
 - `/Applications/bmux.app` for the installed app
 - one dev build from `./scripts/reload.sh --tag dev`
 
+Normal cleanup targets:
+
+- While actively testing: `./scripts/prune-local-apps.sh --keep-tag dev`
+- After testing is finished: `./scripts/prune-local-apps.sh --main-only`
+
 Rebuild the dev app:
 
 ```bash
@@ -131,6 +136,8 @@ Rebuild the dev app and replace `/Applications/bmux.app` with the matching Relea
 ```bash
 ./scripts/reload.sh --tag dev --launch --install-applications
 ```
+
+`reload.sh --install-applications` and `reloadp.sh` prune the temporary Release `bmux.app` from `DerivedData` after copying it into `/Applications`, so Spotlight should not accumulate extra installed-looking app bundles. Tagged dev rebuilds also prune the fallback untagged `bmux DEV.app`, leaving the tagged app as the only local test bundle.
 
 ## Why cmux?
 

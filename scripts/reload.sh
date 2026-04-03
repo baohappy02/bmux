@@ -212,6 +212,9 @@ install_release_app_to_applications() {
 
   echo "Installed app:"
   echo "  $APPLICATIONS_APP_PATH"
+  rm -rf "$release_app"
+  echo "Pruned staging release app:"
+  echo "  $release_app"
 }
 
 usage() {
@@ -483,6 +486,7 @@ if [[ -n "${TAG_SLUG:-}" ]]; then
 fi
 
 if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
+  SOURCE_APP_PATH="$APP_PATH"
   TAG_APP_PATH="$(dirname "$APP_PATH")/${APP_NAME}.app"
   rm -rf "$TAG_APP_PATH"
   cp -R "$APP_PATH" "$TAG_APP_PATH"
@@ -529,6 +533,9 @@ if [[ -n "$TAG" && "$APP_NAME" != "$SEARCH_APP_NAME" ]]; then
     /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$TAG_APP_PATH" >/dev/null 2>&1 || true
   fi
   APP_PATH="$TAG_APP_PATH"
+  if [[ -n "${SOURCE_APP_PATH:-}" && "$SOURCE_APP_PATH" != "$TAG_APP_PATH" ]]; then
+    rm -rf "$SOURCE_APP_PATH"
+  fi
 fi
 
 CLI_PATH="$(dirname "$APP_PATH")/bmux"

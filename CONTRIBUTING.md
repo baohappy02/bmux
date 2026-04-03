@@ -32,6 +32,14 @@
    ```bash
    ./scripts/reload.sh --tag dev --launch --install-applications
    ```
+   Keep the local machine clean with:
+   ```bash
+   ./scripts/prune-local-apps.sh --keep-tag dev
+   ```
+   When you are done testing and want only the installed app left:
+   ```bash
+   ./scripts/prune-local-apps.sh --main-only
+   ```
 
 ## Development Scripts
 
@@ -41,6 +49,8 @@
 | `./scripts/reload.sh --tag dev` | Build the single dev app variant |
 | `./scripts/reload.sh --tag dev --launch --install-applications` | Build dev, launch it, and replace `/Applications/bmux.app` with the matching Release build |
 | `./scripts/reloadp.sh` | Rebuild, install, and launch `/Applications/bmux.app` |
+| `./scripts/prune-local-apps.sh --keep-tag dev` | Keep `/Applications/bmux.app` plus one tagged dev app, remove release staging bundles and stray debug leftovers |
+| `./scripts/prune-local-apps.sh --main-only` | Remove all local dev app bundles and keep only `/Applications/bmux.app` |
 | `./scripts/rebuild.sh` | Clean rebuild |
 
 ## Rebuilding GhosttyKit

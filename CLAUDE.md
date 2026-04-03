@@ -34,8 +34,20 @@ Rules:
 - `reload.sh` is the canonical local dev loop.
 - `--launch` opens the tagged dev app after the build succeeds.
 - `--install-applications` also builds Release and replaces `/Applications/bmux.app` so the installed app matches current source.
+- `reload.sh` prunes the fallback untagged `bmux DEV.app` after cloning the tagged app.
+- `reload.sh --install-applications` and `reloadp.sh` prune the temporary Release `bmux.app` from `DerivedData` after copying into `/Applications`.
 - Do not keep multiple tagged dev apps around. Reuse one tag and replace the installed app when you want the stable copy updated.
 - Never `open` an untagged debug app from DerivedData manually.
+
+Cleanup commands:
+
+```bash
+./scripts/prune-local-apps.sh --keep-tag dev
+./scripts/prune-local-apps.sh --main-only
+```
+
+- `--keep-tag dev` keeps `/Applications/bmux.app` and one test app: `bmux DEV dev.app`
+- `--main-only` removes all local test apps and leaves only `/Applications/bmux.app`
 
 `reload.sh` prints an `App path:` line with the absolute path to the built dev `.app`. Use that path to build a cmd-clickable `file://` URL. Steps:
 
