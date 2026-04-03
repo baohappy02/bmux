@@ -1515,6 +1515,33 @@ struct CMUXCLI {
             }
         }
 
+        let idFormat = try resolvedIDFormat(jsonOutput: jsonOutput, raw: idFormatArg)
+        if command == "agent",
+           commandArgs.first?.lowercased() == "intel",
+           !hasFlag(commandArgs, name: "--session"),
+           !hasFlag(commandArgs, name: "--session-id") {
+            var standaloneAgentArgs = commandArgs
+            while !standaloneAgentArgs.isEmpty {
+                if standaloneAgentArgs.last == "--json" {
+                    standaloneAgentArgs.removeLast()
+                    continue
+                }
+                if standaloneAgentArgs.count >= 2,
+                   standaloneAgentArgs[standaloneAgentArgs.count - 2] == "--id-format" {
+                    standaloneAgentArgs.removeLast(2)
+                    continue
+                }
+                break
+            }
+            try runAgentIntelCommand(
+                commandArgs: Array(standaloneAgentArgs.dropFirst()),
+                client: nil,
+                jsonOutput: jsonOutput,
+                idFormat: idFormat
+            )
+            return
+        }
+
         let client = SocketClient(path: resolvedSocketPath)
         if resolvedSocketPath != socketPath {
             cliTelemetry.breadcrumb(
@@ -1547,8 +1574,6 @@ struct CMUXCLI {
             explicitPassword: socketPasswordArg,
             socketPath: resolvedSocketPath
         )
-
-        let idFormat = try resolvedIDFormat(jsonOutput: jsonOutput, raw: idFormatArg)
 
         // If the user explicitly targets a window, focus it first so commands route correctly.
         if let windowId {
@@ -4859,12 +4884,15 @@ struct CMUXCLI {
     private func agentIntelRepoRoot(
         sessionId: String?,
         explicitRepoRoot: String?,
-        client: SocketClient
+        client: SocketClient?
     ) throws -> String? {
         if let explicit = agentIntelNormalizedPath(explicitRepoRoot) {
             return explicit
         }
         guard let sessionId else { return nil }
+        guard let client else {
+            throw CLIError(message: "agent intel requires a live bmux session when using --session")
+        }
         let payload = try client.sendV2(method: "agent.capabilities", params: ["session_id": sessionId])
         guard let environment = payload["environment"] as? [String: Any] else {
             return nil
@@ -4873,6 +4901,206 @@ struct CMUXCLI {
             return repoRoot
         }
         return agentIntelNormalizedPath(environment["cwd"] as? String)
+    }
+
+    private func runAgentIntelCommand(
+        commandArgs: [String],
+        client: SocketClient?,
+        jsonOutput: Bool,
+        idFormat: CLIIDFormat
+    ) throws {
+        guard let intelSubcommandRaw = commandArgs.first else {
+            throw CLIError(message: "agent intel requires a subcommand")
+        }
+        let intelSubcommand = intelSubcommandRaw.lowercased()
+        let intelArgs = Array(commandArgs.dropFirst())
+
+        func output(_ payload: [String: Any], fallback: String) {
+            if jsonOutput {
+                print(jsonString(formatIDs(payload, mode: idFormat)))
+            } else {
+                print(fallback)
+            }
+        }
+
+        func commonAgentIntelArgs(
+            dbPath: String?,
+            queuePath: String?
+        ) -> [String] {
+            var args: [String] = []
+            if let dbPath {
+                args += ["--db", resolvePath(dbPath)]
+            }
+            if let queuePath {
+                args += ["--queue", resolvePath(queuePath)]
+            }
+            return args
+        }
+
+        switch intelSubcommand {
+        case "status":
+            let (dbOpt, rem0) = parseOption(intelArgs, name: "--db")
+            let (queueOpt, remaining) = parseOption(rem0, name: "--queue")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel status: unknown flag '\(unknown)'")
+            }
+
+            let payload = try runAgentIntelTool(
+                command: "status",
+                args: commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            )
+            let statusPayload = payload["status"] as? [String: Any] ?? [:]
+            let runs = intFromAny(statusPayload["runs"]) ?? 0
+            let skills = intFromAny(statusPayload["skills"]) ?? 0
+            output(payload, fallback: "OK runs=\(runs) skills=\(skills)")
+
+        case "ingest":
+            let (dbOpt, rem0) = parseOption(intelArgs, name: "--db")
+            let (queueOpt, remaining) = parseOption(rem0, name: "--queue")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel ingest: unknown flag '\(unknown)'")
+            }
+
+            let payload = try runAgentIntelTool(
+                command: "ingest-queue",
+                args: commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            )
+            let ingested = intFromAny(payload["ingested"]) ?? 0
+            output(payload, fallback: "OK ingested=\(ingested)")
+
+        case "seed-defaults":
+            let (dbOpt, rem0) = parseOption(intelArgs, name: "--db")
+            let (queueOpt, remaining) = parseOption(rem0, name: "--queue")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel seed-defaults: unknown flag '\(unknown)'")
+            }
+
+            let payload = try runAgentIntelTool(
+                command: "seed-default-skills",
+                args: commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            )
+            let inserted = intFromAny(payload["inserted"]) ?? 0
+            let updated = intFromAny(payload["updated"]) ?? 0
+            output(payload, fallback: "OK inserted=\(inserted) updated=\(updated)")
+
+        case "search":
+            let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (repoRootOpt, rem2) = parseOption(rem1, name: "--repo-root")
+            let (dbOpt, rem3) = parseOption(rem2, name: "--db")
+            let (queueOpt, rem4) = parseOption(rem3, name: "--queue")
+            let (limitOpt, rem5) = parseOption(rem4, name: "--limit")
+            let (queryOpt, remaining) = parseOption(rem5, name: "--query")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel search: unknown flag '\(unknown)'")
+            }
+            let query = queryOpt ?? remaining.joined(separator: " ")
+            guard !query.isEmpty else {
+                throw CLIError(message: "agent intel search requires --query <text> or positional text")
+            }
+
+            let sessionId = sessionOptA ?? sessionOptB
+            let repoRoot = try agentIntelRepoRoot(
+                sessionId: sessionId,
+                explicitRepoRoot: repoRootOpt,
+                client: client
+            )
+            var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            if let repoRoot {
+                toolArgs += ["--repo-root", repoRoot]
+            }
+            if let limitOpt {
+                guard let limit = Int(limitOpt), limit > 0 else {
+                    throw CLIError(message: "agent intel search: --limit must be > 0")
+                }
+                toolArgs += ["--limit", String(limit)]
+            }
+
+            _ = try runAgentIntelTool(command: "seed-default-skills", args: toolArgs)
+            let payload = try runAgentIntelTool(
+                command: "search-skills",
+                args: toolArgs + ["--query", query]
+            )
+            let count = intFromAny(payload["count"]) ?? 0
+            output(
+                payload,
+                fallback: repoRoot == nil
+                    ? "OK hits=\(count)"
+                    : "OK hits=\(count) repo=\(repoRoot!)"
+            )
+
+        case "evaluations":
+            let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (repoRootOpt, rem2) = parseOption(rem1, name: "--repo-root")
+            let (dbOpt, rem3) = parseOption(rem2, name: "--db")
+            let (queueOpt, rem4) = parseOption(rem3, name: "--queue")
+            let (limitOpt, remaining) = parseOption(rem4, name: "--limit")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel evaluations: unknown flag '\(unknown)'")
+            }
+
+            let repoRoot = try agentIntelRepoRoot(
+                sessionId: sessionOptA ?? sessionOptB,
+                explicitRepoRoot: repoRootOpt,
+                client: client
+            )
+            var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            if let repoRoot {
+                toolArgs += ["--repo-root", repoRoot]
+            }
+            if let limitOpt {
+                guard let limit = Int(limitOpt), limit > 0 else {
+                    throw CLIError(message: "agent intel evaluations: --limit must be > 0")
+                }
+                toolArgs += ["--limit", String(limit)]
+            }
+
+            let payload = try runAgentIntelTool(command: "list-evaluations", args: toolArgs)
+            let count = intFromAny(payload["count"]) ?? 0
+            output(payload, fallback: "OK evaluations=\(count)")
+
+        case "propose":
+            let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (repoRootOpt, rem2) = parseOption(rem1, name: "--repo-root")
+            let (dbOpt, rem3) = parseOption(rem2, name: "--db")
+            let (queueOpt, rem4) = parseOption(rem3, name: "--queue")
+            let (limitOpt, rem5) = parseOption(rem4, name: "--limit")
+            let (minOccurrencesOpt, remaining) = parseOption(rem5, name: "--min-occurrences")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel propose: unknown flag '\(unknown)'")
+            }
+
+            let repoRoot = try agentIntelRepoRoot(
+                sessionId: sessionOptA ?? sessionOptB,
+                explicitRepoRoot: repoRootOpt,
+                client: client
+            )
+            var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            if let repoRoot {
+                toolArgs += ["--repo-root", repoRoot]
+            }
+            if let limitOpt {
+                guard let limit = Int(limitOpt), limit > 0 else {
+                    throw CLIError(message: "agent intel propose: --limit must be > 0")
+                }
+                toolArgs += ["--limit", String(limit)]
+            }
+            if let minOccurrencesOpt {
+                guard let minOccurrences = Int(minOccurrencesOpt), minOccurrences >= 2 else {
+                    throw CLIError(message: "agent intel propose: --min-occurrences must be >= 2")
+                }
+                toolArgs += ["--min-occurrences", String(minOccurrences)]
+            }
+
+            let payload = try runAgentIntelTool(command: "propose-evaluations", args: toolArgs)
+            let count = intFromAny(payload["count"]) ?? 0
+            output(payload, fallback: "OK proposals=\(count)")
+
+        default:
+            throw CLIError(message: "Unsupported agent intel subcommand: \(intelSubcommand)")
+        }
     }
 
     private func runAgentCommand(
@@ -6044,190 +6272,12 @@ struct CMUXCLI {
             }
 
         case "intel":
-            guard let intelSubcommandRaw = subArgs.first else {
-                throw CLIError(message: "agent intel requires a subcommand")
-            }
-            let intelSubcommand = intelSubcommandRaw.lowercased()
-            let intelArgs = Array(subArgs.dropFirst())
-
-            func commonAgentIntelArgs(
-                dbPath: String?,
-                queuePath: String?
-            ) -> [String] {
-                var args: [String] = []
-                if let dbPath {
-                    args += ["--db", resolvePath(dbPath)]
-                }
-                if let queuePath {
-                    args += ["--queue", resolvePath(queuePath)]
-                }
-                return args
-            }
-
-            switch intelSubcommand {
-            case "status":
-                let (dbOpt, rem0) = parseOption(intelArgs, name: "--db")
-                let (queueOpt, remaining) = parseOption(rem0, name: "--queue")
-                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
-                    throw CLIError(message: "agent intel status: unknown flag '\(unknown)'")
-                }
-
-                let payload = try runAgentIntelTool(
-                    command: "status",
-                    args: commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
-                )
-                let statusPayload = payload["status"] as? [String: Any] ?? [:]
-                let runs = intFromAny(statusPayload["runs"]) ?? 0
-                let skills = intFromAny(statusPayload["skills"]) ?? 0
-                output(payload, fallback: "OK runs=\(runs) skills=\(skills)")
-
-            case "ingest":
-                let (dbOpt, rem0) = parseOption(intelArgs, name: "--db")
-                let (queueOpt, remaining) = parseOption(rem0, name: "--queue")
-                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
-                    throw CLIError(message: "agent intel ingest: unknown flag '\(unknown)'")
-                }
-
-                let payload = try runAgentIntelTool(
-                    command: "ingest-queue",
-                    args: commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
-                )
-                let ingested = intFromAny(payload["ingested"]) ?? 0
-                output(payload, fallback: "OK ingested=\(ingested)")
-
-            case "seed-defaults":
-                let (dbOpt, rem0) = parseOption(intelArgs, name: "--db")
-                let (queueOpt, remaining) = parseOption(rem0, name: "--queue")
-                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
-                    throw CLIError(message: "agent intel seed-defaults: unknown flag '\(unknown)'")
-                }
-
-                let payload = try runAgentIntelTool(
-                    command: "seed-default-skills",
-                    args: commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
-                )
-                let inserted = intFromAny(payload["inserted"]) ?? 0
-                let updated = intFromAny(payload["updated"]) ?? 0
-                output(payload, fallback: "OK inserted=\(inserted) updated=\(updated)")
-
-            case "search":
-                let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
-                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
-                let (repoRootOpt, rem2) = parseOption(rem1, name: "--repo-root")
-                let (dbOpt, rem3) = parseOption(rem2, name: "--db")
-                let (queueOpt, rem4) = parseOption(rem3, name: "--queue")
-                let (limitOpt, rem5) = parseOption(rem4, name: "--limit")
-                let (queryOpt, remaining) = parseOption(rem5, name: "--query")
-                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
-                    throw CLIError(message: "agent intel search: unknown flag '\(unknown)'")
-                }
-                let query = queryOpt ?? remaining.joined(separator: " ")
-                guard !query.isEmpty else {
-                    throw CLIError(message: "agent intel search requires --query <text> or positional text")
-                }
-
-                let sessionId = sessionOptA ?? sessionOptB
-                let repoRoot = try agentIntelRepoRoot(
-                    sessionId: sessionId,
-                    explicitRepoRoot: repoRootOpt,
-                    client: client
-                )
-                var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
-                if let repoRoot {
-                    toolArgs += ["--repo-root", repoRoot]
-                }
-                if let limitOpt {
-                    guard let limit = Int(limitOpt), limit > 0 else {
-                        throw CLIError(message: "agent intel search: --limit must be > 0")
-                    }
-                    toolArgs += ["--limit", String(limit)]
-                }
-
-                _ = try runAgentIntelTool(command: "seed-default-skills", args: toolArgs)
-                let payload = try runAgentIntelTool(
-                    command: "search-skills",
-                    args: toolArgs + ["--query", query]
-                )
-                let count = intFromAny(payload["count"]) ?? 0
-                output(
-                    payload,
-                    fallback: repoRoot == nil
-                        ? "OK hits=\(count)"
-                        : "OK hits=\(count) repo=\(repoRoot!)"
-                )
-
-            case "evaluations":
-                let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
-                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
-                let (repoRootOpt, rem2) = parseOption(rem1, name: "--repo-root")
-                let (dbOpt, rem3) = parseOption(rem2, name: "--db")
-                let (queueOpt, rem4) = parseOption(rem3, name: "--queue")
-                let (limitOpt, remaining) = parseOption(rem4, name: "--limit")
-                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
-                    throw CLIError(message: "agent intel evaluations: unknown flag '\(unknown)'")
-                }
-
-                let repoRoot = try agentIntelRepoRoot(
-                    sessionId: sessionOptA ?? sessionOptB,
-                    explicitRepoRoot: repoRootOpt,
-                    client: client
-                )
-                var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
-                if let repoRoot {
-                    toolArgs += ["--repo-root", repoRoot]
-                }
-                if let limitOpt {
-                    guard let limit = Int(limitOpt), limit > 0 else {
-                        throw CLIError(message: "agent intel evaluations: --limit must be > 0")
-                    }
-                    toolArgs += ["--limit", String(limit)]
-                }
-
-                let payload = try runAgentIntelTool(command: "list-evaluations", args: toolArgs)
-                let count = intFromAny(payload["count"]) ?? 0
-                output(payload, fallback: "OK evaluations=\(count)")
-
-            case "propose":
-                let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
-                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
-                let (repoRootOpt, rem2) = parseOption(rem1, name: "--repo-root")
-                let (dbOpt, rem3) = parseOption(rem2, name: "--db")
-                let (queueOpt, rem4) = parseOption(rem3, name: "--queue")
-                let (limitOpt, rem5) = parseOption(rem4, name: "--limit")
-                let (minOccurrencesOpt, remaining) = parseOption(rem5, name: "--min-occurrences")
-                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
-                    throw CLIError(message: "agent intel propose: unknown flag '\(unknown)'")
-                }
-
-                let repoRoot = try agentIntelRepoRoot(
-                    sessionId: sessionOptA ?? sessionOptB,
-                    explicitRepoRoot: repoRootOpt,
-                    client: client
-                )
-                var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
-                if let repoRoot {
-                    toolArgs += ["--repo-root", repoRoot]
-                }
-                if let limitOpt {
-                    guard let limit = Int(limitOpt), limit > 0 else {
-                        throw CLIError(message: "agent intel propose: --limit must be > 0")
-                    }
-                    toolArgs += ["--limit", String(limit)]
-                }
-                if let minOccurrencesOpt {
-                    guard let minOccurrences = Int(minOccurrencesOpt), minOccurrences >= 2 else {
-                        throw CLIError(message: "agent intel propose: --min-occurrences must be >= 2")
-                    }
-                    toolArgs += ["--min-occurrences", String(minOccurrences)]
-                }
-
-                let payload = try runAgentIntelTool(command: "propose-evaluations", args: toolArgs)
-                let count = intFromAny(payload["count"]) ?? 0
-                output(payload, fallback: "OK proposals=\(count)")
-
-            default:
-                throw CLIError(message: "Unsupported agent intel subcommand: \(intelSubcommand)")
-            }
+            try runAgentIntelCommand(
+                commandArgs: subArgs,
+                client: client,
+                jsonOutput: effectiveJSONOutput,
+                idFormat: effectiveIDFormat
+            )
 
         case "search":
             guard let searchSubcommandRaw = subArgs.first else {
