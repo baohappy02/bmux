@@ -28,6 +28,8 @@ bmux agent intel seed-defaults --json
 bmux agent intel search --session <sid> --query "verify existing build fix" --json
 bmux agent intel propose --session <sid> --json
 bmux agent intel evaluations --session <sid> --json
+bmux agent intel review --evaluation <eval-id> --decision approve --json
+bmux agent intel skills --session <sid> --json
 ```
 
 Rules:
@@ -35,6 +37,7 @@ Rules:
 1. search for a compact skill card before widening search or reading long logs
 2. let `task result` and `state summary` drive the next step
 3. treat `propose` output as reviewable candidates, not auto-active behavior
+4. approvals should land as `canary` by default; use `skill-status` to promote only after repeated clean runs
 
 ## Verify Loop
 
@@ -87,6 +90,21 @@ bmux agent search query --session <sid> --limit 5 --query "existing auth validat
 ```
 
 Use `agent.search` for concept lookup. Use `rg` for exact-match or regex follow-up work.
+
+## Code Intel Loop
+
+```bash
+bmux agent code status --session <sid> --json
+bmux agent code index --session <sid> --timeout-ms 120000 --json
+bmux agent code symbols --session <sid> --limit 5 --query "TerminalController" --json
+bmux agent code context --session <sid> --symbol "TerminalController" --path Sources/TerminalController.swift --json
+bmux agent code impact --session <sid> --symbol "TerminalController" --path Sources/TerminalController.swift --json
+bmux agent code changes --session <sid> --scope unstaged --json
+bmux agent code rename --session <sid> --symbol "activeSocketPath" --path Sources/TerminalController.swift --to currentSocketPath --json
+```
+
+Use `agent.code` when the task needs symbol-aware answers, blast radius, changed-symbol mapping, module ownership, or safe rename preview. Prefer it over GitNexus for the common local repo loop.
+If `status` is `stale` or `missing` on a large repo, prefer `code index --timeout-ms 120000` instead of relying on the CLI's shorter default response window.
 
 ## Measurement Hooks
 

@@ -282,6 +282,158 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertTrue(manager.tabs.contains(where: { $0.id == pinnedWorkspace.id }))
     }
 
+    func testAgentCodeStatusUsesBmuxIndexBackendWhenAvailable() async throws {
+        let socketPath = makeSocketPath("code-status")
+        let manager = TabManager()
+        let repoURL = try makeFakeRepository(named: "bmux-index-code-status")
+        let scriptURL = try makeFakeBmuxIndexScript(for: repoURL)
+        defer {
+            try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: scriptURL)
+        }
+
+        let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
+        setenv("BMUX_INDEX_PATH", scriptURL.path, 1)
+        defer {
+            if let previousPath {
+                setenv("BMUX_INDEX_PATH", previousPath, 1)
+            } else {
+                unsetenv("BMUX_INDEX_PATH")
+            }
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try self.sendV2Request(
+                        method: "agent.code.status",
+                        params: ["cwd": repoURL.path],
+                        to: socketPath
+                    )
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        XCTAssertEqual(result["backend"] as? String, "bmux-index")
+        XCTAssertEqual(result["status"] as? String, "warm")
+        XCTAssertEqual(result["repo_root"] as? String, repoURL.path)
+    }
+
+    func testAgentSearchMapsBmuxIndexResultsIntoHits() async throws {
+        let socketPath = makeSocketPath("code-search")
+        let manager = TabManager()
+        let repoURL = try makeFakeRepository(named: "bmux-index-search")
+        let scriptURL = try makeFakeBmuxIndexScript(for: repoURL)
+        defer {
+            try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: scriptURL)
+        }
+
+        let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
+        setenv("BMUX_INDEX_PATH", scriptURL.path, 1)
+        defer {
+            if let previousPath {
+                setenv("BMUX_INDEX_PATH", previousPath, 1)
+            } else {
+                unsetenv("BMUX_INDEX_PATH")
+            }
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try self.sendV2Request(
+                        method: "agent.search",
+                        params: [
+                            "cwd": repoURL.path,
+                            "query": "greet user function",
+                            "limit": 3
+                        ],
+                        to: socketPath
+                    )
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        XCTAssertEqual(result["backend"] as? String, "bmux-index")
+        XCTAssertEqual(result["mode"] as? String, "zig_score")
+        let hits = try XCTUnwrap(result["hits"] as? [[String: Any]])
+        XCTAssertEqual(hits.count, 1)
+        XCTAssertEqual(hits.first?["relative_path"] as? String, "Sources/App.swift")
+    }
+
+    private func makeFakeRepository(named name: String) throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString)")
+        let sources = root.appendingPathComponent("Sources", isDirectory: true)
+        let git = root.appendingPathComponent(".git", isDirectory: true)
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: git, withIntermediateDirectories: true)
+        try """
+        func greetUser() -> String {
+            "hello"
+        }
+        """.write(to: sources.appendingPathComponent("App.swift"), atomically: true, encoding: .utf8)
+        return root
+    }
+
+    private func makeFakeBmuxIndexScript(for repoURL: URL) throws -> URL {
+        let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent("fake-bmux-index-\(UUID().uuidString).sh")
+        let statusResponse = #"{"id":"1","command":"status","ok":true,"payload":{"ok":true,"repo":"__REPO__","state":"warm","indexed_at":"2026-04-03T00:00:00Z","file_count":3,"chunk_count":5,"symbol_count":2,"backend":"swift+zig"}}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+        let searchResponse = #"{"id":"1","command":"search","ok":true,"payload":{"ok":true,"repo":"__REPO__","query":"greet user function","limit":3,"index_state":"warm","mode":"zig_score","results":[{"path":"Sources/App.swift","line_start":1,"line_end":3,"snippet":"func greetUser() -> String","score":9.5,"kind":"function","language":"swift"}]}}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+        let script = """
+        #!/bin/sh
+        if [ "$1" != "serve" ]; then
+          exit 1
+        fi
+        while IFS= read -r line; do
+          case "$line" in
+            *'"command":"shutdown"'*)
+              printf '%s\\n' '{"id":"shutdown","command":"shutdown","ok":true,"payload":{"ok":true}}'
+              exit 0
+              ;;
+            *'"command":"status"'*)
+              printf '%s\\n' '\(statusResponse)'
+              ;;
+            *'"command":"search"'*)
+              printf '%s\\n' '\(searchResponse)'
+              ;;
+            *)
+              printf '%s\\n' '{"id":"unknown","command":"unknown","ok":false,"error":{"error":"UNSUPPORTED","message":"unsupported"}}'
+              ;;
+          esac
+        done
+        """
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
     private func waitForSocket(at path: String, timeout: TimeInterval = 5.0) throws {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in

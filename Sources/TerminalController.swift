@@ -12,6 +12,195 @@ extension Notification.Name {
     static let browserDownloadEventDidArrive = Notification.Name("bmux.browserDownloadEventDidArrive")
 }
 
+private struct AgentBmuxIndexFailure: Error {
+    let code: String
+    let message: String
+    let data: [String: Any]?
+}
+
+private final class AgentBmuxIndexRuntime {
+    private let executablePath: String
+    private let ioLock = NSLock()
+    private var process: Process?
+    private var stdinHandle: FileHandle?
+    private var stdoutHandle: FileHandle?
+    private var nextRequestID: Int = 1
+
+    init(executablePath: String) {
+        self.executablePath = executablePath
+    }
+
+    func isRunning() -> Bool {
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        return process?.isRunning == true
+    }
+
+    func send(command: String, payload: [String: Any]) -> Result<[String: Any], AgentBmuxIndexFailure> {
+        ioLock.lock()
+        defer { ioLock.unlock() }
+
+        if let failure = ensureRunningLocked() {
+            return .failure(failure)
+        }
+        guard let stdinHandle, let stdoutHandle else {
+            return .failure(
+                AgentBmuxIndexFailure(
+                    code: "bmux_index_unavailable",
+                    message: "bmux-index runtime is not available",
+                    data: nil
+                )
+            )
+        }
+
+        var request = payload
+        request["id"] = "bmux-\(nextRequestID)"
+        request["command"] = command
+        nextRequestID += 1
+
+        guard JSONSerialization.isValidJSONObject(request),
+              let data = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]) else {
+            return .failure(
+                AgentBmuxIndexFailure(
+                    code: "bmux_index_encode_error",
+                    message: "Failed to encode bmux-index request",
+                    data: nil
+                )
+            )
+        }
+
+        do {
+            try stdinHandle.write(contentsOf: data)
+            try stdinHandle.write(contentsOf: Data([0x0a]))
+
+            let line = try readLineLocked(from: stdoutHandle)
+            guard let responseData = line.data(using: .utf8),
+                  let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
+                invalidateLocked()
+                return .failure(
+                    AgentBmuxIndexFailure(
+                        code: "bmux_index_decode_error",
+                        message: "Failed to decode bmux-index response",
+                        data: nil
+                    )
+                )
+            }
+
+            if (object["ok"] as? Bool) == true,
+               let responsePayload = object["payload"] as? [String: Any] {
+                return .success(responsePayload)
+            }
+
+            let errorPayload = object["error"] as? [String: Any]
+            return .failure(
+                AgentBmuxIndexFailure(
+                    code: (errorPayload?["error"] as? String) ?? "bmux_index_request_failed",
+                    message: (errorPayload?["message"] as? String) ?? "bmux-index request failed",
+                    data: errorPayload
+                )
+            )
+        } catch {
+            invalidateLocked()
+            return .failure(
+                AgentBmuxIndexFailure(
+                    code: "bmux_index_io_error",
+                    message: "bmux-index runtime I/O failed: \(error.localizedDescription)",
+                    data: nil
+                )
+            )
+        }
+    }
+
+    func shutdown() {
+        ioLock.lock()
+        defer { ioLock.unlock() }
+        invalidateLocked(sendShutdown: true)
+    }
+
+    private func ensureRunningLocked() -> AgentBmuxIndexFailure? {
+        if process?.isRunning == true, stdinHandle != nil, stdoutHandle != nil {
+            return nil
+        }
+
+        invalidateLocked()
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = ["serve"]
+        process.standardError = FileHandle.nullDevice
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+
+        do {
+            try process.run()
+        } catch {
+            return AgentBmuxIndexFailure(
+                code: "bmux_index_launch_failed",
+                message: "Failed to launch bmux-index serve: \(error.localizedDescription)",
+                data: ["executable_path": executablePath]
+            )
+        }
+
+        self.process = process
+        self.stdinHandle = stdinPipe.fileHandleForWriting
+        self.stdoutHandle = stdoutPipe.fileHandleForReading
+        return nil
+    }
+
+    private func readLineLocked(from handle: FileHandle) throws -> String {
+        var buffer = Data()
+        while true {
+            let chunk = try handle.read(upToCount: 1) ?? Data()
+            if chunk.isEmpty {
+                if buffer.isEmpty {
+                    throw NSError(
+                        domain: NSCocoaErrorDomain,
+                        code: NSFileReadUnknownError,
+                        userInfo: [NSLocalizedDescriptionKey: "bmux-index runtime closed stdout"]
+                    )
+                }
+                break
+            }
+            if chunk[0] == 0x0a {
+                break
+            }
+            buffer.append(chunk)
+        }
+
+        guard let line = String(data: buffer, encoding: .utf8) else {
+            throw NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileReadInapplicableStringEncodingError,
+                userInfo: [NSLocalizedDescriptionKey: "bmux-index response was not valid UTF-8"]
+            )
+        }
+        return line
+    }
+
+    private func invalidateLocked(sendShutdown: Bool = false) {
+        if sendShutdown,
+           let stdinHandle,
+           process?.isRunning == true,
+           let data = #"{"id":"shutdown","command":"shutdown"}"#.data(using: .utf8) {
+            try? stdinHandle.write(contentsOf: data)
+            try? stdinHandle.write(contentsOf: Data([0x0a]))
+        }
+
+        try? stdinHandle?.close()
+        try? stdoutHandle?.close()
+        if process?.isRunning == true {
+            process?.terminate()
+        }
+
+        process = nil
+        stdinHandle = nil
+        stdoutHandle = nil
+    }
+}
+
 /// Unix socket-based controller for programmatic terminal control
 /// Allows automated testing and external control of terminal tabs
 @MainActor
@@ -254,6 +443,7 @@ class TerminalController {
         var startedAt: Date?
         var completedAt: Date?
         var exitCode: Int?
+        var terminalCaptureBaseline: String?
         var workingDirectory: String?
     }
 
@@ -401,6 +591,7 @@ class TerminalController {
     private var v2AgentCompletedGroups: Set<String> = []
     private var v2AgentProfileSuccessCache: [String: AgentCachedProfileResult] = [:]
     private var v2AgentSearchIndexByRepo: [String: AgentSearchIndexState] = [:]
+    private var v2AgentBmuxIndexRuntime: AgentBmuxIndexRuntime?
     private var v2AgentRecordedArtifacts: [AgentRecordedArtifact] = []
     private var v2AgentAvailableToolsCache: [String]?
     private let v2AgentStateLock = NSRecursiveLock()
@@ -1363,6 +1554,10 @@ class TerminalController {
     }
 
     nonisolated func stop() {
+        Task { @MainActor in
+            self.v2AgentBmuxIndexRuntime?.shutdown()
+            self.v2AgentBmuxIndexRuntime = nil
+        }
         let (socketToClose, socketPathToUnlink) = withListenerState {
             isRunning = false
             acceptLoopAlive = false
@@ -2303,6 +2498,28 @@ class TerminalController {
             return v2Result(id: id, self.v2AgentSearchIndex(params: params))
         case "agent.search":
             return v2Result(id: id, self.v2AgentSearchQuery(params: params))
+        case "agent.code.status":
+            return v2Result(id: id, self.v2AgentCodeStatus(params: params))
+        case "agent.code.index":
+            return v2Result(id: id, self.v2AgentCodeIndex(params: params))
+        case "agent.code.search":
+            return v2Result(id: id, self.v2AgentCodeSearch(params: params))
+        case "agent.code.symbols":
+            return v2Result(id: id, self.v2AgentCodeSymbols(params: params))
+        case "agent.code.context":
+            return v2Result(id: id, self.v2AgentCodeContext(params: params))
+        case "agent.code.impact":
+            return v2Result(id: id, self.v2AgentCodeImpact(params: params))
+        case "agent.code.trace":
+            return v2Result(id: id, self.v2AgentCodeTrace(params: params))
+        case "agent.code.refs":
+            return v2Result(id: id, self.v2AgentCodeRefs(params: params))
+        case "agent.code.rename":
+            return v2Result(id: id, self.v2AgentCodeRename(params: params))
+        case "agent.code.changes":
+            return v2Result(id: id, self.v2AgentCodeChanges(params: params))
+        case "agent.code.module":
+            return v2Result(id: id, self.v2AgentCodeModule(params: params))
 
         case "system.identify":
             return v2Ok(id: id, result: v2Identify(params: params))
@@ -2745,6 +2962,17 @@ class TerminalController {
             "agent.search.status",
             "agent.search.index",
             "agent.search",
+            "agent.code.status",
+            "agent.code.index",
+            "agent.code.search",
+            "agent.code.symbols",
+            "agent.code.context",
+            "agent.code.impact",
+            "agent.code.trace",
+            "agent.code.refs",
+            "agent.code.rename",
+            "agent.code.changes",
+            "agent.code.module",
             "system.identify",
             "system.tree",
             "auth.login",
@@ -3324,6 +3552,26 @@ class TerminalController {
         return .ok([
             "backend_kind": v2AgentBackendKind(surfaceId: context.surfaceId, workspace: context.workspace),
             "capabilities": v2AgentCapabilityFlags(),
+            "code_intelligence": [
+                "backend": v2AgentBmuxIndexExecutablePath() != nil ? "bmux-index" : (v2AgentGitNexusAvailable() ? "gitnexus" : "none"),
+                "search_backend": v2AgentBmuxIndexExecutablePath() != nil ? "bmux-index" : "legacy_lexical",
+                "methods": [
+                    "agent.search.status",
+                    "agent.search.index",
+                    "agent.search",
+                    "agent.code.status",
+                    "agent.code.index",
+                    "agent.code.search",
+                    "agent.code.symbols",
+                    "agent.code.context",
+                    "agent.code.impact",
+                    "agent.code.trace",
+                    "agent.code.refs",
+                    "agent.code.rename",
+                    "agent.code.changes",
+                    "agent.code.module"
+                ]
+            ],
             "environment": environment,
             "event_cursor": v2AgentCurrentEventCursor(),
             "preferences": preferences,
@@ -4411,8 +4659,11 @@ class TerminalController {
             let shellState = terminalContext.workspace.panelShellActivityState(panelId: terminalPanel.id)
             let shouldQueueUntilPrompt = shellState == .commandRunning
             let startedAt = shouldQueueUntilPrompt ? nil : now
-            let taskWorkingDirectory = cwd ?? v2AgentEffectiveDirectory(context: terminalContext)
             let initialStatus: AgentTaskStatus = shouldQueueUntilPrompt ? .queued : .running
+            let terminalCaptureBaseline = shouldQueueUntilPrompt
+                ? nil
+                : v2AgentTaskCaptureBaseline(terminalPanel: terminalPanel)
+            let taskWorkingDirectory = cwd ?? v2AgentEffectiveDirectory(context: terminalContext)
 
             let task = AgentTask(
                 id: taskId,
@@ -4438,6 +4689,7 @@ class TerminalController {
                 startedAt: startedAt,
                 completedAt: nil,
                 exitCode: nil,
+                terminalCaptureBaseline: terminalCaptureBaseline,
                 workingDirectory: taskWorkingDirectory
             )
             v2AgentTasks[taskId] = task
@@ -4788,7 +5040,7 @@ class TerminalController {
                 ])
                 return
             }
-            let savedLogPath = self.v2AgentTaskLogPath(taskId: task.id)
+            let savedLogPath = self.v2AgentTaskLogPath(task: task)
             let savedLogText = savedLogPath.flatMap {
                 try? String(contentsOfFile: $0, encoding: .utf8)
             }
@@ -4949,6 +5201,7 @@ class TerminalController {
                 self.v2AgentMaybeFinalizeProfileGroup(task: task)
                 if let workspaceId = task.workspaceId,
                    let workspace = self.tabForSidebarMutation(id: workspaceId) {
+                    self.v2AgentReleaseOwnedServicePorts(task: task, workspace: workspace)
                     self.v2AgentSyncWorkspaceManagedPresentation(workspace: workspace)
                 }
                 result = .ok([
@@ -4990,6 +5243,7 @@ class TerminalController {
             self.v2AgentMaybeFinalizeProfileGroup(task: task)
             if let workspaceId = task.workspaceId,
                let workspace = self.tabForSidebarMutation(id: workspaceId) {
+                self.v2AgentReleaseOwnedServicePorts(task: task, workspace: workspace)
                 self.v2AgentSyncWorkspaceManagedPresentation(workspace: workspace)
             }
             result = .ok([
@@ -5049,15 +5303,46 @@ class TerminalController {
         task: AgentTask,
         terminalPanel: TerminalPanel
     ) -> (path: String?, text: String) {
-        let logPath = v2AgentTaskLogPath(taskId: task.id)
+        let logPath = v2AgentTaskLogPath(task: task)
         if let logPath,
            let persisted = try? String(contentsOfFile: logPath, encoding: .utf8) {
             return (path: logPath, text: persisted)
         }
 
         let captured = v2AgentReadTerminalText(terminalPanel: terminalPanel, includeScrollback: true, lineLimit: nil) ?? ""
-        let persisted = v2AgentWriteTaskLog(taskId: task.id, text: captured)
-        return (path: persisted, text: captured)
+        let text: String
+        if let baseline = task.terminalCaptureBaseline,
+           captured.hasPrefix(baseline) {
+            text = String(captured.dropFirst(baseline.count))
+        } else if let isolated = v2AgentIsolatedTaskLogText(task: task, capturedText: captured) {
+            text = isolated
+        } else {
+            text = captured
+        }
+        let persisted = v2AgentWriteTaskLog(task: task, text: text)
+        return (path: persisted, text: text)
+    }
+
+    private func v2AgentIsolatedTaskLogText(
+        task: AgentTask,
+        capturedText: String
+    ) -> String? {
+        let marker = "report_task_result \(task.id)"
+        guard let markerRange = capturedText.range(of: marker) else {
+            return nil
+        }
+
+        let prefix = capturedText[..<markerRange.lowerBound]
+        let startIndex: String.Index
+        if let commandLineRange = prefix.range(of: "\n> ", options: .backwards) {
+            startIndex = capturedText.index(after: commandLineRange.lowerBound)
+        } else if prefix.hasPrefix("> ") {
+            startIndex = capturedText.startIndex
+        } else {
+            return nil
+        }
+
+        return String(capturedText[startIndex...])
     }
 
     private func v2AgentLimitedTailText(
@@ -5317,11 +5602,13 @@ class TerminalController {
         let timeoutMs = max(0, v2Int(params, "timeout_ms") ?? 300_000)
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
         var lastKickAt: Date?
+        var lastHealthProbeAt: Date?
         let healthConfig = v2AgentServiceHealthConfig(params)
 
         while true {
             var readyPayload: [String: Any]?
             var timeoutPayload: [String: Any]?
+            var fallbackSurfaceId: UUID?
             v2MainSync {
                 guard let context = v2AgentResolveContext(params: params, session: session) else {
                     timeoutPayload = [
@@ -5341,8 +5628,17 @@ class TerminalController {
                     return context.workspace.surfaceListeningPorts.first(where: { $0.value.contains(port) })?.key
                 }()
 
+                fallbackSurfaceId = resolvedSurfaceId
+                    ?? v2AgentPreferredServiceSurfaceId(
+                        sessionId: sessionId,
+                        session: session,
+                        workspace: context.workspace,
+                        explicitSurfaceId: explicitSurfaceId,
+                        port: port
+                    )
+
                 let serviceReady: Bool = {
-                    if let resolvedSurfaceId {
+                    if let resolvedSurfaceId = fallbackSurfaceId {
                         return context.workspace.surfaceListeningPorts[resolvedSurfaceId]?.contains(port) == true
                     }
                     return context.workspace.listeningPorts.contains(port)
@@ -5353,10 +5649,10 @@ class TerminalController {
                         sessionId: sessionId,
                         workspace: context.workspace,
                         port: port,
-                        surfaceId: resolvedSurfaceId,
+                        surfaceId: fallbackSurfaceId,
                         ready: true
                     )
-                    if let serviceTask = v2AgentLatestTask(sessionId: sessionId, workspaceId: context.workspace.id, surfaceId: resolvedSurfaceId) {
+                    if let serviceTask = v2AgentLatestTask(sessionId: sessionId, workspaceId: context.workspace.id, surfaceId: fallbackSurfaceId) {
                         payload["job_id"] = serviceTask.id
                         payload["status"] = serviceTask.status.rawValue
                     }
@@ -5405,11 +5701,71 @@ class TerminalController {
                     return .ok(readyPayload)
                 }
             }
+            if healthConfig.isEnabled,
+               lastHealthProbeAt == nil || Date().timeIntervalSince(lastHealthProbeAt!) >= 0.5 {
+                lastHealthProbeAt = Date()
+                let health = v2AgentServiceHealthCheck(
+                    port: port,
+                    config: healthConfig
+                )
+                if health.ready {
+                    var inferredReadyPayload: [String: Any]?
+                    v2MainSync {
+                        guard let context = v2AgentResolveContext(params: params, session: session) else {
+                            return
+                        }
+                        let inferredSurfaceId = v2AgentPreferredServiceSurfaceId(
+                            sessionId: sessionId,
+                            session: session,
+                            workspace: context.workspace,
+                            explicitSurfaceId: v2UUID(params, "surface_id"),
+                            port: port
+                        )
+                        v2AgentBackfillDetectedServicePort(
+                            sessionId: sessionId,
+                            workspace: context.workspace,
+                            port: port,
+                            surfaceId: inferredSurfaceId
+                        )
+                        var payload = v2AgentServicePayload(
+                            sessionId: sessionId,
+                            workspace: context.workspace,
+                            port: port,
+                            surfaceId: inferredSurfaceId,
+                            ready: true
+                        )
+                        if let serviceTask = v2AgentLatestTask(
+                            sessionId: sessionId,
+                            workspaceId: context.workspace.id,
+                            surfaceId: inferredSurfaceId
+                        ) {
+                            payload["job_id"] = serviceTask.id
+                            payload["status"] = serviceTask.status.rawValue
+                        }
+                        payload["event_cursor"] = v2AgentCurrentEventCursor()
+                        inferredReadyPayload = payload
+                    }
+                    var payload = inferredReadyPayload ?? [
+                        "ok": true,
+                        "session_id": sessionId,
+                        "service_id": "service:\(port)",
+                        "port": port,
+                        "url": v2AgentServiceURL(port: port),
+                        "ready": true,
+                        "event_cursor": v2AgentCurrentEventCursor()
+                    ]
+                    payload["health"] = health.payload
+                    return .ok(payload)
+                }
+            }
             Thread.sleep(forTimeInterval: 0.1)
         }
     }
 
     private func v2AgentSearchStatus(params: [String: Any]) -> V2CallResult {
+        if let result = v2AgentSearchStatusViaBmuxIndex(params: params) {
+            return result
+        }
         let resolution = v2AgentSearchResolution(params: params)
         guard let repoRoot = resolution.repoRoot else {
             return .ok([
@@ -5431,6 +5787,9 @@ class TerminalController {
     }
 
     private func v2AgentSearchIndex(params: [String: Any]) -> V2CallResult {
+        if let result = v2AgentSearchIndexViaBmuxIndex(params: params) {
+            return result
+        }
         let resolution = v2AgentSearchResolution(params: params)
         guard let repoRoot = resolution.repoRoot else {
             return .err(code: "not_found", message: "Repository root not found", data: [
@@ -5488,6 +5847,9 @@ class TerminalController {
     }
 
     private func v2AgentSearchQuery(params: [String: Any]) -> V2CallResult {
+        if let result = v2AgentSearchQueryViaBmuxIndex(params: params) {
+            return result
+        }
         let resolution = v2AgentSearchResolution(params: params)
         guard let repoRoot = resolution.repoRoot else {
             return .err(code: "not_found", message: "Repository root not found", data: [
@@ -5537,6 +5899,520 @@ class TerminalController {
             "count": searchResult.hits.count,
             "event_cursor": v2AgentCurrentEventCursor()
         ])
+    }
+
+    private func v2AgentSearchStatusViaBmuxIndex(params: [String: Any]) -> V2CallResult? {
+        guard v2AgentBmuxIndexExecutablePath() != nil else {
+            return nil
+        }
+
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .ok([
+                "status": "missing",
+                "backend": "bmux-index",
+                "repo_root": NSNull(),
+                "capabilities": [
+                    "lexical": false,
+                    "semantic": false,
+                    "graph": true
+                ],
+                "safe_for_exact_symbol_work": false,
+                "event_cursor": v2AgentCurrentEventCursor()
+            ])
+        }
+
+        switch v2AgentBmuxIndexPayload(command: "status", repoRoot: repoRoot, payload: [:]) {
+        case .success(let payload):
+            return .ok(v2AgentSearchStatusPayloadFromBmuxIndex(repoRoot: repoRoot, payload: payload))
+        case .failure(let failure):
+            return .err(code: failure.code, message: failure.message, data: failure.data)
+        case .none:
+            return nil
+        }
+    }
+
+    private func v2AgentSearchIndexViaBmuxIndex(params: [String: Any]) -> V2CallResult? {
+        guard v2AgentBmuxIndexExecutablePath() != nil else {
+            return nil
+        }
+
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+
+        switch v2AgentBmuxIndexPayload(command: "index", repoRoot: repoRoot, payload: [:]) {
+        case .success(let payload):
+            let resultPayload = v2AgentSearchIndexPayloadFromBmuxIndex(repoRoot: repoRoot, payload: payload)
+            v2AgentAppendEvent(
+                type: "search.indexed",
+                sessionId: resolution.session?.id,
+                workspaceId: resolution.session?.workspaceId,
+                surfaceId: resolution.session?.surfaceId,
+                payload: [
+                    "repo_root": repoRoot,
+                    "status": v2OrNull(resultPayload["status"]),
+                    "backend": "bmux-index",
+                    "file_count": v2OrNull(resultPayload["file_count"]),
+                    "duration_ms": v2OrNull(resultPayload["duration_ms"])
+                ]
+            )
+            return .ok(resultPayload)
+        case .failure(let failure):
+            return .err(code: failure.code, message: failure.message, data: failure.data)
+        case .none:
+            return nil
+        }
+    }
+
+    private func v2AgentSearchQueryViaBmuxIndex(params: [String: Any]) -> V2CallResult? {
+        guard v2AgentBmuxIndexExecutablePath() != nil else {
+            return nil
+        }
+
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        guard let query = v2String(params, "query")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !query.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing query", data: nil)
+        }
+
+        let limit = min(max(1, v2Int(params, "limit") ?? 5), 10)
+        switch v2AgentBmuxIndexPayload(command: "search", repoRoot: repoRoot, payload: [
+            "query": query,
+            "limit": limit
+        ]) {
+        case .success(let payload):
+            let resultPayload = v2AgentSearchQueryPayloadFromBmuxIndex(
+                repoRoot: repoRoot,
+                query: query,
+                payload: payload
+            )
+            v2AgentAppendEvent(
+                type: "search.query",
+                sessionId: resolution.session?.id,
+                workspaceId: resolution.session?.workspaceId,
+                surfaceId: resolution.session?.surfaceId,
+                payload: [
+                    "repo_root": repoRoot,
+                    "query_hash": v2AgentShortHash(["query": query]),
+                    "mode": v2OrNull(resultPayload["mode"]),
+                    "fallback_mode": v2OrNull(resultPayload["fallback_mode"]),
+                    "hit_count": v2OrNull(resultPayload["count"])
+                ]
+            )
+            return .ok(resultPayload)
+        case .failure(let failure):
+            return .err(code: failure.code, message: failure.message, data: failure.data)
+        case .none:
+            return nil
+        }
+    }
+
+    private func v2AgentCodeStatus(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .ok([
+                "status": "missing",
+                "backend": v2AgentBmuxIndexExecutablePath() != nil ? "bmux-index" : "none",
+                "repo_root": NSNull(),
+                "event_cursor": v2AgentCurrentEventCursor()
+            ])
+        }
+        return v2AgentCodeForward(command: "status", params: [:], resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeIndex(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        return v2AgentCodeForward(command: "index", params: [:], resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeSearch(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        guard let query = v2String(params, "query")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !query.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing query", data: nil)
+        }
+        let limit = min(max(1, v2Int(params, "limit") ?? 5), 20)
+        return v2AgentCodeForward(command: "search", params: ["query": query, "limit": limit], resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeSymbols(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        guard let query = v2String(params, "query")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !query.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing query", data: nil)
+        }
+        let limit = min(max(1, v2Int(params, "limit") ?? 8), 20)
+        return v2AgentCodeForward(command: "symbols", params: ["query": query, "limit": limit], resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeContext(params: [String: Any]) -> V2CallResult {
+        v2AgentCodeSymbolCommand(command: "context", params: params)
+    }
+
+    private func v2AgentCodeImpact(params: [String: Any]) -> V2CallResult {
+        v2AgentCodeSymbolCommand(command: "impact", params: params)
+    }
+
+    private func v2AgentCodeTrace(params: [String: Any]) -> V2CallResult {
+        v2AgentCodeSymbolCommand(command: "trace", params: params)
+    }
+
+    private func v2AgentCodeRefs(params: [String: Any]) -> V2CallResult {
+        v2AgentCodeSymbolCommand(command: "refs", params: params)
+    }
+
+    private func v2AgentCodeRename(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        guard let symbol = v2String(params, "symbol")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !symbol.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing symbol", data: nil)
+        }
+        guard let newName = v2String(params, "to")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !newName.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing rename target", data: nil)
+        }
+        var payload: [String: Any] = [
+            "symbol": symbol,
+            "to": newName,
+            "apply": v2Bool(params, "apply") ?? false
+        ]
+        if let path = v2String(params, "path")?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            payload["path"] = path
+        }
+        if let line = v2Int(params, "line"), line > 0 {
+            payload["line"] = line
+        }
+        if let limit = v2Int(params, "limit"), limit > 0 {
+            payload["limit"] = min(limit, 24)
+        }
+        return v2AgentCodeForward(command: "rename", params: payload, resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeChanges(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        var payload: [String: Any] = [:]
+        if let scope = v2String(params, "scope")?.trimmingCharacters(in: .whitespacesAndNewlines), !scope.isEmpty {
+            payload["scope"] = scope
+        }
+        if let base = v2String(params, "base")?.trimmingCharacters(in: .whitespacesAndNewlines), !base.isEmpty {
+            payload["base"] = base
+        }
+        if let limit = v2Int(params, "limit"), limit > 0 {
+            payload["limit"] = min(limit, 24)
+        }
+        return v2AgentCodeForward(command: "changes", params: payload, resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeModule(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        let symbol = v2String(params, "symbol")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = v2String(params, "path")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (symbol?.isEmpty == false) || (path?.isEmpty == false) else {
+            return .err(code: "invalid_params", message: "Missing symbol or path", data: nil)
+        }
+        var payload: [String: Any] = [:]
+        if let symbol, !symbol.isEmpty {
+            payload["symbol"] = symbol
+        }
+        if let path, !path.isEmpty {
+            payload["path"] = path
+        }
+        if let line = v2Int(params, "line"), line > 0 {
+            payload["line"] = line
+        }
+        if let limit = v2Int(params, "limit"), limit > 0 {
+            payload["limit"] = min(limit, 20)
+        }
+        return v2AgentCodeForward(command: "module", params: payload, resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeSymbolCommand(command: String, params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        guard let symbol = v2String(params, "symbol")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !symbol.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing symbol", data: nil)
+        }
+        var payload: [String: Any] = ["symbol": symbol]
+        if let path = v2String(params, "path")?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty {
+            payload["path"] = path
+        }
+        if let line = v2Int(params, "line"), line > 0 {
+            payload["line"] = line
+        }
+        if let limit = v2Int(params, "limit"), limit > 0 {
+            payload["limit"] = min(limit, 20)
+        }
+        return v2AgentCodeForward(command: command, params: payload, resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeForward(
+        command: String,
+        params: [String: Any],
+        resolution: (session: AgentSession?, repoRoot: String?),
+        repoRoot: String
+    ) -> V2CallResult {
+        switch v2AgentBmuxIndexPayload(command: command, repoRoot: repoRoot, payload: params) {
+        case .success(let payload):
+            let augmentedPayload = v2AgentAugmentBmuxIndexPayload(repoRoot: repoRoot, payload: payload)
+            v2AgentAppendEvent(
+                type: "code.\(command)",
+                sessionId: resolution.session?.id,
+                workspaceId: resolution.session?.workspaceId,
+                surfaceId: resolution.session?.surfaceId,
+                payload: v2AgentCodeEventPayload(command: command, repoRoot: repoRoot, payload: augmentedPayload)
+            )
+            return .ok(augmentedPayload)
+        case .failure(let failure):
+            return .err(code: failure.code, message: failure.message, data: failure.data)
+        case .none:
+            return .err(code: "unavailable", message: "bmux-index is not available", data: [
+                "repo_root": repoRoot
+            ])
+        }
+    }
+
+    private func v2AgentBmuxIndexPayload(
+        command: String,
+        repoRoot: String,
+        payload: [String: Any]
+    ) -> Result<[String: Any], AgentBmuxIndexFailure>? {
+        guard let runtime = v2AgentCurrentBmuxIndexRuntime() else {
+            return nil
+        }
+        var request = payload
+        request["repo"] = repoRoot
+        return runtime.send(command: command, payload: request)
+    }
+
+    private func v2AgentCurrentBmuxIndexRuntime() -> AgentBmuxIndexRuntime? {
+        if let runtime = v2AgentBmuxIndexRuntime {
+            return runtime
+        }
+        guard let executablePath = v2AgentBmuxIndexExecutablePath() else {
+            return nil
+        }
+        let runtime = AgentBmuxIndexRuntime(executablePath: executablePath)
+        v2AgentBmuxIndexRuntime = runtime
+        return runtime
+    }
+
+    private func v2AgentBmuxIndexExecutablePath() -> String? {
+        let fileManager = FileManager.default
+        if let explicit = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"],
+           !explicit.isEmpty,
+           fileManager.isExecutableFile(atPath: explicit) {
+            return explicit
+        }
+
+        if let resourcePath = Bundle.main.resourceURL?
+            .appendingPathComponent("bin", isDirectory: true)
+            .appendingPathComponent("bmux-index")
+            .path,
+           fileManager.isExecutableFile(atPath: resourcePath) {
+            return resourcePath
+        }
+
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let toolsRoot = sourceRoot.deletingLastPathComponent()
+        let candidates = [
+            toolsRoot.appendingPathComponent("bmux-index/.build/debug/bmux-index").path,
+            toolsRoot.appendingPathComponent("bmux-index/.build/release/bmux-index").path,
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/bmux-index").path
+        ]
+        if let existing = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return existing
+        }
+
+        return v2AgentResolvedCommandPath("bmux-index")
+    }
+
+    private func v2AgentSearchStatusPayloadFromBmuxIndex(
+        repoRoot: String,
+        payload: [String: Any]
+    ) -> [String: Any] {
+        let status = (payload["state"] as? String) ?? (payload["index_state"] as? String) ?? "unknown"
+        return [
+            "repo_root": repoRoot,
+            "status": status,
+            "backend": "bmux-index",
+            "indexed_at": v2OrNull(payload["indexed_at"]),
+            "duration_ms": v2OrNull(payload["duration_ms"]),
+            "file_count": v2OrNull(payload["file_count"]),
+            "chunk_count": v2OrNull(payload["chunk_count"]),
+            "symbol_count": v2OrNull(payload["symbol_count"]),
+            "stale_reason": v2OrNull(payload["stale_reason"]),
+            "capabilities": [
+                "lexical": true,
+                "semantic": false,
+                "graph": true
+            ],
+            "safe_for_exact_symbol_work": status == "warm",
+            "event_cursor": v2AgentCurrentEventCursor()
+        ]
+    }
+
+    private func v2AgentSearchIndexPayloadFromBmuxIndex(
+        repoRoot: String,
+        payload: [String: Any]
+    ) -> [String: Any] {
+        let status = (payload["state"] as? String) ?? (payload["index_state"] as? String) ?? "unknown"
+        return [
+            "ok": true,
+            "repo_root": repoRoot,
+            "status": status,
+            "backend": "bmux-index",
+            "file_count": v2OrNull(payload["file_count"]),
+            "chunk_count": v2OrNull(payload["chunk_count"]),
+            "symbol_count": v2OrNull(payload["symbol_count"]),
+            "indexed_at": v2OrNull(payload["indexed_at"]),
+            "duration_ms": v2OrNull(payload["duration_ms"]),
+            "stale_reason": v2OrNull(payload["stale_reason"]),
+            "capabilities": [
+                "lexical": true,
+                "semantic": false,
+                "graph": true
+            ],
+            "event_cursor": v2AgentCurrentEventCursor()
+        ]
+    }
+
+    private func v2AgentSearchQueryPayloadFromBmuxIndex(
+        repoRoot: String,
+        query: String,
+        payload: [String: Any]
+    ) -> [String: Any] {
+        let mode = (payload["mode"] as? String) ?? "bmux_index"
+        let hits = v2AgentSearchHitsFromBmuxIndex(repoRoot: repoRoot, payload: payload, mode: mode)
+        return [
+            "ok": true,
+            "repo_root": repoRoot,
+            "query": query,
+            "status": v2OrNull(payload["index_state"]),
+            "mode": mode,
+            "fallback_mode": NSNull(),
+            "backend": "bmux-index",
+            "capabilities": [
+                "lexical": true,
+                "semantic": false,
+                "graph": true
+            ],
+            "hits": hits,
+            "count": hits.count,
+            "event_cursor": v2AgentCurrentEventCursor()
+        ]
+    }
+
+    private func v2AgentSearchHitsFromBmuxIndex(
+        repoRoot: String,
+        payload: [String: Any],
+        mode: String
+    ) -> [[String: Any]] {
+        let results = (payload["results"] as? [[String: Any]]) ?? []
+        return results.map { item in
+            let relativePath = (item["path"] as? String) ?? ""
+            return [
+                "path": v2AgentAbsoluteCodePath(repoRoot: repoRoot, path: relativePath),
+                "relative_path": relativePath,
+                "line_start": v2OrNull(item["line_start"]),
+                "line_end": v2OrNull(item["line_end"]),
+                "symbol": NSNull(),
+                "snippet": v2OrNull(item["snippet"]),
+                "score": v2OrNull(item["score"]),
+                "kind": v2OrNull(item["kind"]),
+                "language": v2OrNull(item["language"]),
+                "mode": mode
+            ]
+        }
+    }
+
+    private func v2AgentAbsoluteCodePath(repoRoot: String, path: String) -> String {
+        guard !path.hasPrefix("/") else {
+            return path
+        }
+        return URL(fileURLWithPath: repoRoot, isDirectory: true)
+            .appendingPathComponent(path)
+            .path
+    }
+
+    private func v2AgentAugmentBmuxIndexPayload(
+        repoRoot: String,
+        payload: [String: Any]
+    ) -> [String: Any] {
+        var augmented = payload
+        augmented["backend"] = "bmux-index"
+        augmented["repo_root"] = repoRoot
+        augmented["event_cursor"] = v2AgentCurrentEventCursor()
+        return augmented
+    }
+
+    private func v2AgentCodeEventPayload(
+        command: String,
+        repoRoot: String,
+        payload: [String: Any]
+    ) -> [String: Any] {
+        var eventPayload: [String: Any] = [
+            "repo_root": repoRoot,
+            "command": command
+        ]
+        if let indexState = (payload["index_state"] as? String) ?? (payload["state"] as? String) {
+            eventPayload["index_state"] = indexState
+        }
+        if let results = payload["results"] as? [Any] {
+            eventPayload["count"] = results.count
+        } else if let symbols = payload["symbols"] as? [Any] {
+            eventPayload["count"] = symbols.count
+        } else if let references = payload["references"] as? [Any] {
+            eventPayload["count"] = references.count
+        } else if let edits = payload["edits"] as? [Any] {
+            eventPayload["count"] = edits.count
+        }
+        return eventPayload
     }
 
     private func v2AgentResolveContext(
@@ -6192,6 +7068,7 @@ class TerminalController {
         workspace: Workspace
     ) -> [String: Any]? {
         let services = v2AgentServicesPayload(workspace: workspace, sessionId: sessionId)
+            .filter { $0["job_id"] != nil }
         let tasksById = withV2AgentState {
             v2AgentTasks
         }
@@ -6290,21 +7167,17 @@ class TerminalController {
 
         var summary = "command failed"
         var logPath: String?
-        if let taskTarget = v2AgentTaskTerminalTarget(task: task, session: session) {
-            let captured = v2AgentReadTerminalText(
-                terminalPanel: taskTarget.terminalPanel,
-                includeScrollback: true,
-                lineLimit: 400
-            ) ?? ""
-            logPath = v2AgentTaskLogPath(taskId: task.id)
-            let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: captured)
-            if let derivedSummary = failurePayload["summary"] as? String, !derivedSummary.isEmpty {
-                summary = derivedSummary
-            }
-        } else if let existingLogPath = v2AgentTaskLogPath(taskId: task.id),
+        if let existingLogPath = v2AgentTaskLogPath(task: task),
                   let text = v2AgentReadFileTail(path: existingLogPath, maxBytes: 64 * 1024) {
             logPath = existingLogPath
             let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: text)
+            if let derivedSummary = failurePayload["summary"] as? String, !derivedSummary.isEmpty {
+                summary = derivedSummary
+            }
+        } else if let taskTarget = v2AgentTaskTerminalTarget(task: task, session: session) {
+            let loaded = v2AgentLoadTaskLog(task: task, terminalPanel: taskTarget.terminalPanel)
+            logPath = loaded.path
+            let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: loaded.text)
             if let derivedSummary = failurePayload["summary"] as? String, !derivedSummary.isEmpty {
                 summary = derivedSummary
             }
@@ -6348,7 +7221,7 @@ class TerminalController {
         var artifacts: [[String: Any]] = []
         for task in candidateTasks {
             let artifactPath: String?
-            if let existingPath = v2AgentTaskLogPath(taskId: task.id),
+            if let existingPath = v2AgentTaskLogPath(task: task),
                FileManager.default.fileExists(atPath: existingPath) {
                 artifactPath = existingPath
             } else if task.status.isTerminal,
@@ -6524,29 +7397,21 @@ class TerminalController {
         workspace: Workspace,
         sessionId: String
     ) -> [[String: Any]] {
-        let hintedPorts = v2AgentTasks.values
+        let sessionTasks = v2AgentTasks.values
             .filter { task in
                 task.sessionId == sessionId &&
-                    task.workspaceId == workspace.id &&
-                    !task.expectedPorts.isEmpty
+                    task.workspaceId == workspace.id
             }
+            .sorted(by: { $0.updatedAt > $1.updatedAt })
+        let hintedPorts = sessionTasks
+            .filter { !$0.status.isTerminal && !$0.expectedPorts.isEmpty }
             .flatMap(\.expectedPorts)
         let allPorts = Array(Set(workspace.listeningPorts + hintedPorts)).sorted()
 
         return allPorts.map { port in
+            let task = sessionTasks.first(where: { $0.expectedPorts.contains(port) })
             let surfaceId = workspace.surfaceListeningPorts.first(where: { $0.value.contains(port) })?.key
-                ?? v2AgentTasks.values
-                    .filter { $0.sessionId == sessionId && $0.workspaceId == workspace.id }
-                    .sorted(by: { $0.updatedAt > $1.updatedAt })
-                    .first(where: { task in
-                        v2AgentTask(task, matchesServicePort: port, in: workspace)
-                    })?.surfaceId
-            let task = v2AgentTasks.values
-                .filter { $0.sessionId == sessionId && $0.workspaceId == workspace.id }
-                .sorted(by: { $0.updatedAt > $1.updatedAt })
-                .first(where: { task in
-                    v2AgentTask(task, matchesServicePort: port, in: workspace)
-                })
+                ?? task?.surfaceId
             let ready = workspace.listeningPorts.contains(port)
             var payload = v2AgentServicePayload(
                 sessionId: sessionId,
@@ -6565,6 +7430,150 @@ class TerminalController {
             }
             return payload
         }
+    }
+
+    private func v2AgentAssociateServicePorts(
+        workspaceId: UUID,
+        surfaceId: UUID,
+        ports: [Int],
+        sessionId: String? = nil
+    ) {
+        let normalizedPorts = Array(Set(ports)).sorted()
+        guard !normalizedPorts.isEmpty else { return }
+
+        let candidateTasks = withV2AgentState {
+            Array(v2AgentTasks.values)
+        }
+            .filter { task in
+                task.workspaceId == workspaceId &&
+                    task.surfaceId == surfaceId &&
+                    !task.status.isTerminal &&
+                    (sessionId == nil || task.sessionId == sessionId)
+            }
+            .sorted { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
+
+        guard var task = candidateTasks.first else { return }
+        let mergedPorts = Array(Set(task.expectedPorts + normalizedPorts)).sorted()
+        guard mergedPorts != task.expectedPorts else { return }
+
+        task.expectedPorts = mergedPorts
+        withV2AgentState {
+            v2AgentTasks[task.id] = task
+        }
+    }
+
+    private func v2AgentReleaseOwnedServicePorts(
+        task: AgentTask,
+        workspace: Workspace
+    ) {
+        guard let workspaceId = task.workspaceId,
+              let surfaceId = task.surfaceId,
+              workspace.id == workspaceId,
+              !task.expectedPorts.isEmpty else {
+            return
+        }
+
+        let retainedPorts = Set(
+            withV2AgentState {
+                Array(v2AgentTasks.values)
+            }
+            .filter { candidate in
+                candidate.id != task.id &&
+                    candidate.workspaceId == workspaceId &&
+                    candidate.surfaceId == surfaceId &&
+                    !candidate.status.isTerminal
+            }
+            .flatMap(\.expectedPorts)
+        )
+        let previousPorts = workspace.surfaceListeningPorts[surfaceId] ?? []
+        let currentPorts = previousPorts.filter { port in
+            !task.expectedPorts.contains(port) || retainedPorts.contains(port)
+        }
+        guard currentPorts != previousPorts else { return }
+
+        if currentPorts.isEmpty {
+            workspace.surfaceListeningPorts.removeValue(forKey: surfaceId)
+        } else {
+            workspace.surfaceListeningPorts[surfaceId] = currentPorts
+        }
+        workspace.recomputeListeningPorts()
+        v2AgentAppendServiceEvents(
+            workspace: workspace,
+            surfaceId: surfaceId,
+            previousPorts: previousPorts,
+            currentPorts: currentPorts
+        )
+    }
+
+    private func v2AgentPreferredServiceSurfaceId(
+        sessionId: String,
+        session: AgentSession,
+        workspace: Workspace,
+        explicitSurfaceId: UUID?,
+        port: Int
+    ) -> UUID? {
+        let sessionTasks = withV2AgentState {
+            Array(v2AgentTasks.values)
+        }
+            .filter { task in
+                task.sessionId == sessionId &&
+                    task.workspaceId == workspace.id &&
+                    !task.status.isTerminal
+            }
+            .sorted { lhs, rhs in
+                if lhs.expectedPorts.contains(port) != rhs.expectedPorts.contains(port) {
+                    return lhs.expectedPorts.contains(port)
+                }
+                return lhs.updatedAt > rhs.updatedAt
+            }
+
+        let candidates: [UUID?] = [
+            explicitSurfaceId,
+            workspace.surfaceListeningPorts.first(where: { $0.value.contains(port) })?.key,
+            sessionTasks.first(where: { $0.expectedPorts.contains(port) })?.surfaceId,
+            session.surfaceId,
+            sessionTasks.first?.surfaceId
+        ]
+
+        for candidate in candidates {
+            guard let candidate,
+                  workspace.terminalPanel(for: candidate) != nil else {
+                continue
+            }
+            return candidate
+        }
+        return nil
+    }
+
+    private func v2AgentBackfillDetectedServicePort(
+        sessionId: String,
+        workspace: Workspace,
+        port: Int,
+        surfaceId: UUID?
+    ) {
+        guard let surfaceId,
+              workspace.terminalPanel(for: surfaceId) != nil else {
+            return
+        }
+
+        let previousPorts = workspace.surfaceListeningPorts[surfaceId] ?? []
+        let currentPorts = Array(Set(previousPorts + [port])).sorted()
+        workspace.surfaceListeningPorts[surfaceId] = currentPorts
+        workspace.recomputeListeningPorts()
+        if currentPorts != previousPorts {
+            v2AgentAppendServiceEvents(
+                workspace: workspace,
+                surfaceId: surfaceId,
+                previousPorts: previousPorts,
+                currentPorts: currentPorts
+            )
+        }
+        v2AgentAssociateServicePorts(
+            workspaceId: workspace.id,
+            surfaceId: surfaceId,
+            ports: [port],
+            sessionId: sessionId
+        )
     }
 
     private func v2AgentResolveTerminalTarget(
@@ -6606,6 +7615,14 @@ class TerminalController {
         terminalPanel.sendText("\u{3}")
         terminalPanel.surface.requestBackgroundSurfaceStartIfNeeded()
         return "queued_text"
+    }
+
+    private func v2AgentTaskCaptureBaseline(terminalPanel: TerminalPanel) -> String? {
+        v2AgentReadTerminalText(
+            terminalPanel: terminalPanel,
+            includeScrollback: true,
+            lineLimit: nil
+        )
     }
 
     private func v2AgentQueueTaskCommand(
@@ -6652,6 +7669,7 @@ class TerminalController {
         }
 
         v2AgentPendingTaskCommandsBySurface.removeValue(forKey: surfaceId)
+        task.terminalCaptureBaseline = v2AgentTaskCaptureBaseline(terminalPanel: terminalPanel)
         let queuedDelivery = v2AgentSendText(pending.text, terminalPanel: terminalPanel)
         let now = Date()
         task.status = .running
@@ -6893,17 +7911,25 @@ class TerminalController {
         return Data(base64Encoded: base64).flatMap { String(data: $0, encoding: .utf8) }
     }
 
-    private func v2AgentTaskLogPath(taskId: String) -> String? {
-        let sanitizedId = taskId.replacingOccurrences(
+    private func v2AgentTaskLogPath(task: AgentTask) -> String? {
+        let sanitizedSessionId = task.sessionId.replacingOccurrences(
             of: "[^A-Za-z0-9._-]",
             with: "_",
             options: .regularExpression
         )
+        let sanitizedId = task.id.replacingOccurrences(
+            of: "[^A-Za-z0-9._-]",
+            with: "_",
+            options: .regularExpression
+        )
+        let createdAtToken = String(Int(task.createdAt.timeIntervalSince1970 * 1000))
         let directoryURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("bmux-agent-jobs", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-            return directoryURL.appendingPathComponent("\(sanitizedId).log").path
+            return directoryURL
+                .appendingPathComponent("\(sanitizedSessionId)_\(createdAtToken)_\(sanitizedId).log")
+                .path
         } catch {
             return nil
         }
@@ -7165,8 +8191,8 @@ class TerminalController {
         }
     }
 
-    private func v2AgentWriteTaskLog(taskId: String, text: String) -> String? {
-        guard let path = v2AgentTaskLogPath(taskId: taskId) else { return nil }
+    private func v2AgentWriteTaskLog(task: AgentTask, text: String) -> String? {
+        guard let path = v2AgentTaskLogPath(task: task) else { return nil }
         do {
             try text.write(toFile: path, atomically: true, encoding: .utf8)
             return path
@@ -7317,7 +8343,7 @@ class TerminalController {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return (summary?.isEmpty == false ? summary! : fallback, loaded.path)
         }
-        if let existingLogPath = v2AgentTaskLogPath(taskId: task.id),
+        if let existingLogPath = v2AgentTaskLogPath(task: task),
            let text = try? String(contentsOfFile: existingLogPath, encoding: .utf8) {
             let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: text)
             let summary = (failurePayload["summary"] as? String)?
@@ -7728,32 +8754,38 @@ class TerminalController {
            let workspace = workspaceTabManager.tabs.first(where: { $0.id == workspaceId }),
            let surfaceId = task.surfaceId,
            let terminalPanel = workspace.terminalPanel(for: surfaceId) {
+            var persistedFailureText: String?
             if task.status == .failed,
-               let fullText = v2AgentReadTerminalText(
-                    terminalPanel: terminalPanel,
-                    includeScrollback: true,
-                    lineLimit: nil
-               ) {
-                let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: fullText)
+               let loadedText = {
+                    let loaded = v2AgentLoadTaskLog(task: task, terminalPanel: terminalPanel)
+                    persistedFailureText = loaded.text
+                    if let logPath = loaded.path {
+                        payload["log_path"] = logPath
+                    }
+                    return loaded.text
+               }() {
+                let failurePayload = v2AgentAnalyzeTaskFailure(task: task, output: loadedText)
                 for (key, value) in failurePayload {
                     payload[key] = value
                 }
-                if let logPath = v2AgentWriteTaskLog(taskId: task.id, text: fullText) {
-                    payload["log_path"] = logPath
-                }
             }
 
-            if let requestedLines = includeTailLines, requestedLines > 0,
-               let tailText = v2AgentReadTerminalText(
+            if let requestedLines = includeTailLines, requestedLines > 0 {
+                if task.status == .failed,
+                   let persistedFailureText {
+                    payload["tail"] = v2AgentCompactTailLines(from: persistedFailureText, limit: requestedLines)
+                    payload["tail_lines"] = requestedLines
+                } else if let tailText = v2AgentReadTerminalText(
                     terminalPanel: terminalPanel,
                     includeScrollback: true,
                     lineLimit: requestedLines
-               ) {
-                payload["tail"] = v2AgentCompactTailLines(from: tailText, limit: requestedLines)
-                payload["tail_lines"] = requestedLines
+                ) {
+                    payload["tail"] = v2AgentCompactTailLines(from: tailText, limit: requestedLines)
+                    payload["tail_lines"] = requestedLines
+                }
             } else if task.status == .failed,
                       payload["tail"] == nil,
-                      let tailText = v2AgentReadTerminalText(
+                      let tailText = persistedFailureText ?? v2AgentReadTerminalText(
                         terminalPanel: terminalPanel,
                         includeScrollback: true,
                         lineLimit: 8
@@ -7792,7 +8824,7 @@ class TerminalController {
                 payload["tail"] = []
             }
             if payload["log_path"] == nil,
-               let fallbackPath = v2AgentTaskLogPath(taskId: task.id) {
+               let fallbackPath = v2AgentTaskLogPath(task: task) {
                 payload["log_path"] = fallbackPath
             }
 
@@ -21271,6 +22303,11 @@ class TerminalController {
                 previousPorts: previousPorts,
                 currentPorts: ports
             )
+            self.v2AgentAssociateServicePorts(
+                workspaceId: tab.id,
+                surfaceId: surfaceId,
+                ports: ports
+            )
         }
         return result
     }
@@ -21448,6 +22485,11 @@ class TerminalController {
             task.exitCode = exitCode
             task.status = exitCode == 0 ? .succeeded : .failed
             self.v2AgentTasks[taskId] = task
+            if task.status == .failed,
+               let session = self.v2AgentSessions[task.sessionId],
+               let taskTarget = self.v2AgentTaskTerminalTarget(task: task, session: session) {
+                _ = self.v2AgentLoadTaskLog(task: task, terminalPanel: taskTarget.terminalPanel)
+            }
             if task.status == .failed {
                 self.v2AgentAppendEvent(
                     type: "task.failed",
@@ -21479,6 +22521,7 @@ class TerminalController {
             self.v2AgentMaybeFinalizeProfileGroup(task: task)
             if let workspaceId = task.workspaceId,
                let workspace = self.tabForSidebarMutation(id: workspaceId) {
+                self.v2AgentReleaseOwnedServicePorts(task: task, workspace: workspace)
                 if task.status == .failed {
                     self.v2AgentNotifyTaskFailure(task, workspace: workspace)
                 }

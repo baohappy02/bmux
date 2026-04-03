@@ -878,7 +878,8 @@ final class SocketClient {
     func send(
         command: String,
         stopAfterFirstLine: Bool = false,
-        maxResponseBytes: Int? = nil
+        maxResponseBytes: Int? = nil,
+        responseTimeoutSeconds: TimeInterval? = nil
     ) throws -> String {
         guard socketFD >= 0 else { throw CLIError(message: "Not connected") }
         let payload = command + "\n"
@@ -894,7 +895,9 @@ final class SocketClient {
 
         while true {
             try configureReceiveTimeout(
-                sawNewline ? Self.multilineResponseIdleTimeoutSeconds : Self.responseTimeoutSeconds
+                sawNewline
+                    ? Self.multilineResponseIdleTimeoutSeconds
+                    : (responseTimeoutSeconds ?? Self.responseTimeoutSeconds)
             )
 
             var buffer = [UInt8](repeating: 0, count: 8192)
@@ -1124,7 +1127,11 @@ final class SocketClient {
         return nil
     }
 
-    func sendV2(method: String, params: [String: Any] = [:]) throws -> [String: Any] {
+    func sendV2(
+        method: String,
+        params: [String: Any] = [:],
+        responseTimeoutSeconds: TimeInterval? = nil
+    ) throws -> [String: Any] {
         let request: [String: Any] = [
             "id": UUID().uuidString,
             "method": method,
@@ -1142,7 +1149,8 @@ final class SocketClient {
         let raw = try send(
             command: requestLine,
             stopAfterFirstLine: true,
-            maxResponseBytes: Self.defaultV2ResponseMaxBytes
+            maxResponseBytes: Self.defaultV2ResponseMaxBytes,
+            responseTimeoutSeconds: responseTimeoutSeconds
         )
 
         // The server may return plain-text errors (e.g., "ERROR: Access denied ...")
@@ -1520,14 +1528,21 @@ struct CMUXCLI {
            commandArgs.first?.lowercased() == "intel",
            !hasFlag(commandArgs, name: "--session"),
            !hasFlag(commandArgs, name: "--session-id") {
+            var standaloneJSONOutput = jsonOutput
+            var standaloneIDFormat = idFormat
             var standaloneAgentArgs = commandArgs
             while !standaloneAgentArgs.isEmpty {
                 if standaloneAgentArgs.last == "--json" {
+                    standaloneJSONOutput = true
                     standaloneAgentArgs.removeLast()
                     continue
                 }
                 if standaloneAgentArgs.count >= 2,
                    standaloneAgentArgs[standaloneAgentArgs.count - 2] == "--id-format" {
+                    standaloneIDFormat = try resolvedIDFormat(
+                        jsonOutput: standaloneJSONOutput,
+                        raw: standaloneAgentArgs.last
+                    )
                     standaloneAgentArgs.removeLast(2)
                     continue
                 }
@@ -1536,8 +1551,8 @@ struct CMUXCLI {
             try runAgentIntelCommand(
                 commandArgs: Array(standaloneAgentArgs.dropFirst()),
                 client: nil,
-                jsonOutput: jsonOutput,
-                idFormat: idFormat
+                jsonOutput: standaloneJSONOutput,
+                idFormat: standaloneIDFormat
             )
             return
         }
@@ -5060,6 +5075,41 @@ struct CMUXCLI {
             let count = intFromAny(payload["count"]) ?? 0
             output(payload, fallback: "OK evaluations=\(count)")
 
+        case "skills":
+            let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
+            let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+            let (repoRootOpt, rem2) = parseOption(rem1, name: "--repo-root")
+            let (statusOpt, rem3) = parseOption(rem2, name: "--status")
+            let (dbOpt, rem4) = parseOption(rem3, name: "--db")
+            let (queueOpt, rem5) = parseOption(rem4, name: "--queue")
+            let (limitOpt, remaining) = parseOption(rem5, name: "--limit")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel skills: unknown flag '\(unknown)'")
+            }
+
+            let repoRoot = try agentIntelRepoRoot(
+                sessionId: sessionOptA ?? sessionOptB,
+                explicitRepoRoot: repoRootOpt,
+                client: client
+            )
+            var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            if let repoRoot {
+                toolArgs += ["--repo-root", repoRoot]
+            }
+            if let statusOpt {
+                toolArgs += ["--status", statusOpt]
+            }
+            if let limitOpt {
+                guard let limit = Int(limitOpt), limit > 0 else {
+                    throw CLIError(message: "agent intel skills: --limit must be > 0")
+                }
+                toolArgs += ["--limit", String(limit)]
+            }
+
+            let payload = try runAgentIntelTool(command: "list-skills", args: toolArgs)
+            let count = intFromAny(payload["count"]) ?? 0
+            output(payload, fallback: "OK skills=\(count)")
+
         case "propose":
             let (sessionOptA, rem0) = parseOption(intelArgs, name: "--session")
             let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
@@ -5097,6 +5147,61 @@ struct CMUXCLI {
             let payload = try runAgentIntelTool(command: "propose-evaluations", args: toolArgs)
             let count = intFromAny(payload["count"]) ?? 0
             output(payload, fallback: "OK proposals=\(count)")
+
+        case "review":
+            let (evaluationOptA, rem0) = parseOption(intelArgs, name: "--evaluation")
+            let (evaluationOptB, rem1) = parseOption(rem0, name: "--evaluation-id")
+            let (decisionOpt, rem2) = parseOption(rem1, name: "--decision")
+            let (noteOpt, rem3) = parseOption(rem2, name: "--note")
+            let (dbOpt, rem4) = parseOption(rem3, name: "--db")
+            let (queueOpt, remaining) = parseOption(rem4, name: "--queue")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel review: unknown flag '\(unknown)'")
+            }
+            guard let evaluationId = evaluationOptA ?? evaluationOptB else {
+                throw CLIError(message: "agent intel review requires --evaluation <id>")
+            }
+            let decision = (decisionOpt ?? "").lowercased()
+            guard decision == "approve" || decision == "reject" else {
+                throw CLIError(message: "agent intel review: --decision must be approve or reject")
+            }
+
+            var toolArgs = commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt)
+            toolArgs += ["--evaluation-id", evaluationId, "--decision", decision]
+            if let noteOpt {
+                toolArgs += ["--note", noteOpt]
+            }
+            if hasFlag(remaining, name: "--activate") {
+                toolArgs.append("--activate")
+            }
+
+            let payload = try runAgentIntelTool(command: "review-evaluation", args: toolArgs)
+            let status = (payload["status"] as? String) ?? "unknown"
+            output(payload, fallback: "OK evaluation=\(evaluationId) status=\(status)")
+
+        case "skill-status":
+            let (skillOptA, rem0) = parseOption(intelArgs, name: "--skill")
+            let (skillOptB, rem1) = parseOption(rem0, name: "--skill-id")
+            let (statusOpt, rem2) = parseOption(rem1, name: "--status")
+            let (dbOpt, rem3) = parseOption(rem2, name: "--db")
+            let (queueOpt, remaining) = parseOption(rem3, name: "--queue")
+            if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                throw CLIError(message: "agent intel skill-status: unknown flag '\(unknown)'")
+            }
+            guard let skillId = skillOptA ?? skillOptB else {
+                throw CLIError(message: "agent intel skill-status requires --skill <id>")
+            }
+            guard let statusOpt, !statusOpt.isEmpty else {
+                throw CLIError(message: "agent intel skill-status requires --status <value>")
+            }
+
+            let payload = try runAgentIntelTool(
+                command: "set-skill-status",
+                args: commonAgentIntelArgs(dbPath: dbOpt, queuePath: queueOpt) +
+                    ["--skill-id", skillId, "--status", statusOpt]
+            )
+            let status = (payload["status"] as? String) ?? statusOpt
+            output(payload, fallback: "OK skill=\(skillId) status=\(status)")
 
         default:
             throw CLIError(message: "Unsupported agent intel subcommand: \(intelSubcommand)")
@@ -6348,6 +6453,325 @@ struct CMUXCLI {
 
             default:
                 throw CLIError(message: "Unsupported agent search subcommand: \(searchSubcommand)")
+            }
+
+        case "code":
+            guard let codeSubcommandRaw = subArgs.first else {
+                throw CLIError(message: "agent code requires a subcommand")
+            }
+            let codeSubcommand = codeSubcommandRaw.lowercased()
+            let codeArgs = Array(subArgs.dropFirst())
+            let defaultAgentCodeIndexTimeoutSeconds: TimeInterval = 120
+
+            func parseAgentCodeTimeoutSeconds(_ raw: String?, label: String) throws -> TimeInterval? {
+                guard let raw else { return nil }
+                guard let timeoutMs = Int(raw), timeoutMs >= 0 else {
+                    throw CLIError(message: "\(label): --timeout-ms must be >= 0")
+                }
+                return Double(timeoutMs) / 1000.0
+            }
+
+            switch codeSubcommand {
+            case "status", "index":
+                let (sessionOptA, rem0) = parseOption(codeArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, rem2) = parseOption(rem1, name: "--cwd")
+                let (timeoutMsOpt, remaining) = parseOption(rem2, name: "--timeout-ms")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent code \(codeSubcommand) requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent code \(codeSubcommand): unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+
+                let method = codeSubcommand == "status" ? "agent.code.status" : "agent.code.index"
+                let responseTimeoutSeconds = try parseAgentCodeTimeoutSeconds(
+                    timeoutMsOpt,
+                    label: "agent code \(codeSubcommand)"
+                ) ?? (codeSubcommand == "index" ? defaultAgentCodeIndexTimeoutSeconds : nil)
+                let payload = try client.sendV2(
+                    method: method,
+                    params: params,
+                    responseTimeoutSeconds: responseTimeoutSeconds
+                )
+                let status = (payload["status"] as? String) ?? (payload["state"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) status=\(status)")
+
+            case "search", "symbols":
+                let (sessionOptA, rem0) = parseOption(codeArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, rem2) = parseOption(rem1, name: "--cwd")
+                let (limitOpt, rem3) = parseOption(rem2, name: "--limit")
+                let (timeoutMsOpt, rem4) = parseOption(rem3, name: "--timeout-ms")
+                let (queryOpt, remaining) = parseOption(rem4, name: "--query")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent code \(codeSubcommand) requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent code \(codeSubcommand): unknown flag '\(unknown)'")
+                }
+                let query = queryOpt ?? remaining.joined(separator: " ")
+                guard !query.isEmpty else {
+                    throw CLIError(message: "agent code \(codeSubcommand) requires --query <text> or positional text")
+                }
+
+                var params: [String: Any] = [
+                    "session_id": sessionId,
+                    "query": query
+                ]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "agent code \(codeSubcommand): --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+
+                let responseTimeoutSeconds = try parseAgentCodeTimeoutSeconds(
+                    timeoutMsOpt,
+                    label: "agent code \(codeSubcommand)"
+                )
+                let payload = try client.sendV2(
+                    method: "agent.code.\(codeSubcommand)",
+                    params: params,
+                    responseTimeoutSeconds: responseTimeoutSeconds
+                )
+                let countKey = codeSubcommand == "search" ? "results" : "symbols"
+                let count = (payload[countKey] as? [[String: Any]])?.count ?? 0
+                let mode = (payload["mode"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) mode=\(mode) count=\(count)")
+
+            case "context", "impact", "trace", "refs":
+                let (sessionOptA, rem0) = parseOption(codeArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, rem2) = parseOption(rem1, name: "--cwd")
+                let (symbolOpt, rem3) = parseOption(rem2, name: "--symbol")
+                let (pathOpt, rem4) = parseOption(rem3, name: "--path")
+                let (lineOpt, rem5) = parseOption(rem4, name: "--line")
+                let (limitOpt, rem6) = parseOption(rem5, name: "--limit")
+                let (timeoutMsOpt, remaining) = parseOption(rem6, name: "--timeout-ms")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent code \(codeSubcommand) requires --session <id>")
+                }
+                guard let symbol = symbolOpt, !symbol.isEmpty else {
+                    throw CLIError(message: "agent code \(codeSubcommand) requires --symbol <name>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent code \(codeSubcommand): unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = [
+                    "session_id": sessionId,
+                    "symbol": symbol
+                ]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+                if let pathOpt {
+                    params["path"] = pathOpt
+                }
+                if let lineOpt {
+                    guard let line = Int(lineOpt), line > 0 else {
+                        throw CLIError(message: "agent code \(codeSubcommand): --line must be > 0")
+                    }
+                    params["line"] = line
+                }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "agent code \(codeSubcommand): --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+
+                let responseTimeoutSeconds = try parseAgentCodeTimeoutSeconds(
+                    timeoutMsOpt,
+                    label: "agent code \(codeSubcommand)"
+                )
+                let payload = try client.sendV2(
+                    method: "agent.code.\(codeSubcommand)",
+                    params: params,
+                    responseTimeoutSeconds: responseTimeoutSeconds
+                )
+                let resolved = (payload["resolved"] as? Bool) ?? false
+                output(payload, fallback: "OK session=\(sessionId) resolved=\(resolved)")
+
+            case "rename":
+                let (sessionOptA, rem0) = parseOption(codeArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, rem2) = parseOption(rem1, name: "--cwd")
+                let (symbolOpt, rem3) = parseOption(rem2, name: "--symbol")
+                let (pathOpt, rem4) = parseOption(rem3, name: "--path")
+                let (lineOpt, rem5) = parseOption(rem4, name: "--line")
+                let (toOpt, rem6) = parseOption(rem5, name: "--to")
+                let (limitOpt, rem7) = parseOption(rem6, name: "--limit")
+                let (timeoutMsOpt, rem8) = parseOption(rem7, name: "--timeout-ms")
+                let apply = rem8.contains("--apply")
+                let remaining = rem8.filter { $0 != "--apply" }
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent code rename requires --session <id>")
+                }
+                guard let symbol = symbolOpt, !symbol.isEmpty else {
+                    throw CLIError(message: "agent code rename requires --symbol <name>")
+                }
+                guard let toOpt, !toOpt.isEmpty else {
+                    throw CLIError(message: "agent code rename requires --to <new-name>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent code rename: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = [
+                    "session_id": sessionId,
+                    "symbol": symbol,
+                    "to": toOpt
+                ]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+                if let pathOpt {
+                    params["path"] = pathOpt
+                }
+                if let lineOpt {
+                    guard let line = Int(lineOpt), line > 0 else {
+                        throw CLIError(message: "agent code rename: --line must be > 0")
+                    }
+                    params["line"] = line
+                }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "agent code rename: --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+                if apply {
+                    params["apply"] = true
+                }
+
+                let responseTimeoutSeconds = try parseAgentCodeTimeoutSeconds(
+                    timeoutMsOpt,
+                    label: "agent code rename"
+                )
+                let payload = try client.sendV2(
+                    method: "agent.code.rename",
+                    params: params,
+                    responseTimeoutSeconds: responseTimeoutSeconds
+                )
+                let changedOccurrences = (payload["changed_occurrences"] as? Int) ?? 0
+                output(payload, fallback: "OK session=\(sessionId) changed_occurrences=\(changedOccurrences)")
+
+            case "changes":
+                let (sessionOptA, rem0) = parseOption(codeArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, rem2) = parseOption(rem1, name: "--cwd")
+                let (scopeOpt, rem3) = parseOption(rem2, name: "--scope")
+                let (baseOpt, rem4) = parseOption(rem3, name: "--base")
+                let (limitOpt, rem5) = parseOption(rem4, name: "--limit")
+                let (timeoutMsOpt, remaining) = parseOption(rem5, name: "--timeout-ms")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent code changes requires --session <id>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent code changes: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+                if let scopeOpt {
+                    params["scope"] = scopeOpt
+                }
+                if let baseOpt {
+                    params["base"] = baseOpt
+                }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "agent code changes: --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+
+                let responseTimeoutSeconds = try parseAgentCodeTimeoutSeconds(
+                    timeoutMsOpt,
+                    label: "agent code changes"
+                )
+                let payload = try client.sendV2(
+                    method: "agent.code.changes",
+                    params: params,
+                    responseTimeoutSeconds: responseTimeoutSeconds
+                )
+                let risk = (payload["risk"] as? String) ?? "unknown"
+                output(payload, fallback: "OK session=\(sessionId) risk=\(risk)")
+
+            case "module":
+                let (sessionOptA, rem0) = parseOption(codeArgs, name: "--session")
+                let (sessionOptB, rem1) = parseOption(rem0, name: "--session-id")
+                let (cwdOpt, rem2) = parseOption(rem1, name: "--cwd")
+                let (symbolOpt, rem3) = parseOption(rem2, name: "--symbol")
+                let (pathOpt, rem4) = parseOption(rem3, name: "--path")
+                let (lineOpt, rem5) = parseOption(rem4, name: "--line")
+                let (limitOpt, rem6) = parseOption(rem5, name: "--limit")
+                let (timeoutMsOpt, remaining) = parseOption(rem6, name: "--timeout-ms")
+
+                guard let sessionId = sessionOptA ?? sessionOptB else {
+                    throw CLIError(message: "agent code module requires --session <id>")
+                }
+                guard (symbolOpt?.isEmpty == false) || (pathOpt?.isEmpty == false) else {
+                    throw CLIError(message: "agent code module requires --symbol <name> or --path <path>")
+                }
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
+                    throw CLIError(message: "agent code module: unknown flag '\(unknown)'")
+                }
+
+                var params: [String: Any] = ["session_id": sessionId]
+                if let cwdOpt {
+                    params["cwd"] = cwdOpt
+                }
+                if let symbolOpt, !symbolOpt.isEmpty {
+                    params["symbol"] = symbolOpt
+                }
+                if let pathOpt, !pathOpt.isEmpty {
+                    params["path"] = pathOpt
+                }
+                if let lineOpt {
+                    guard let line = Int(lineOpt), line > 0 else {
+                        throw CLIError(message: "agent code module: --line must be > 0")
+                    }
+                    params["line"] = line
+                }
+                if let limitOpt {
+                    guard let limit = Int(limitOpt), limit > 0 else {
+                        throw CLIError(message: "agent code module: --limit must be > 0")
+                    }
+                    params["limit"] = limit
+                }
+
+                let responseTimeoutSeconds = try parseAgentCodeTimeoutSeconds(
+                    timeoutMsOpt,
+                    label: "agent code module"
+                )
+                let payload = try client.sendV2(
+                    method: "agent.code.module",
+                    params: params,
+                    responseTimeoutSeconds: responseTimeoutSeconds
+                )
+                let resolved = (payload["resolved"] as? Bool) ?? false
+                output(payload, fallback: "OK session=\(sessionId) resolved=\(resolved)")
+
+            default:
+                throw CLIError(message: "Unsupported agent code subcommand: \(codeSubcommand)")
             }
 
         default:
@@ -9091,7 +9515,7 @@ struct CMUXCLI {
             """
         case "agent":
             return """
-            Usage: bmux agent <attach|layout|capabilities|open|ensure|batch|focus|close|surface-read|terminal|task|events|state|artifact|service|intel|search> [flags]
+            Usage: bmux agent <attach|layout|capabilities|open|ensure|batch|focus|close|surface-read|terminal|task|events|state|artifact|service|intel|search|code> [flags]
 
             Compact agent-oriented commands for coding agents such as Codex.
 
@@ -9125,10 +9549,24 @@ struct CMUXCLI {
               intel seed-defaults [--db <path>] [--queue <path>]
               intel search [--session <session-id>] [--repo-root <path>] [--db <path>] [--queue <path>] [--limit <n>] [--query <text> | <text>]
               intel evaluations [--session <session-id>] [--repo-root <path>] [--db <path>] [--queue <path>] [--limit <n>]
+              intel skills [--session <session-id>] [--repo-root <path>] [--status <status>] [--db <path>] [--queue <path>] [--limit <n>]
               intel propose [--session <session-id>] [--repo-root <path>] [--db <path>] [--queue <path>] [--limit <n>] [--min-occurrences <n>]
+              intel review --evaluation <id> --decision <approve|reject> [--activate] [--note <text>] [--db <path>] [--queue <path>]
+              intel skill-status --skill <id> --status <candidate|canary|active|quarantined|disabled> [--db <path>] [--queue <path>]
               search status --session <session-id> [--cwd <path>]
               search index --session <session-id> [--cwd <path>]
               search query --session <session-id> [--limit <n>] [--cwd <path>] [--query <text> | <text>]
+              code status --session <session-id> [--cwd <path>] [--timeout-ms <ms>]
+              code index --session <session-id> [--cwd <path>] [--timeout-ms <ms>]
+              code search --session <session-id> [--limit <n>] [--cwd <path>] [--timeout-ms <ms>] [--query <text> | <text>]
+              code symbols --session <session-id> [--limit <n>] [--cwd <path>] [--timeout-ms <ms>] [--query <text> | <text>]
+              code context --session <session-id> --symbol <name> [--cwd <path>] [--path <path>] [--line <n>] [--limit <n>] [--timeout-ms <ms>]
+              code impact --session <session-id> --symbol <name> [--cwd <path>] [--path <path>] [--line <n>] [--limit <n>] [--timeout-ms <ms>]
+              code trace --session <session-id> --symbol <name> [--cwd <path>] [--path <path>] [--line <n>] [--limit <n>] [--timeout-ms <ms>]
+              code refs --session <session-id> --symbol <name> [--cwd <path>] [--path <path>] [--line <n>] [--limit <n>] [--timeout-ms <ms>]
+              code rename --session <session-id> --symbol <name> --to <new-name> [--cwd <path>] [--path <path>] [--line <n>] [--limit <n>] [--timeout-ms <ms>] [--apply]
+              code changes --session <session-id> [--cwd <path>] [--scope unstaged|staged|all|compare] [--base <ref>] [--limit <n>] [--timeout-ms <ms>]
+              code module --session <session-id> [--cwd <path>] [--symbol <name>] [--path <path>] [--line <n>] [--limit <n>] [--timeout-ms <ms>]
 
             Notes:
               - `attach` creates a lightweight bmux agent session and returns focused context.
@@ -9145,8 +9583,10 @@ struct CMUXCLI {
               - `artifact list` returns compact metadata for job logs and other saved artifacts.
               - `service list|wait` exposes listening-port state without parsing boot logs.
               - `service wait` can optionally probe HTTP readiness with `--url-path` and `--expect-text`.
-              - `intel` records compact task outcomes, seeds default low-token skills, and proposes reviewable capture or fix evaluations.
+              - `intel` records compact task outcomes, seeds default low-token skills, proposes capture or fix evaluations, and applies reviewed rollout state without raw prompt mutation.
               - `search` is a local-first compact repo search path; it uses lexical retrieval and explicit fallback modes.
+              - `code` forwards compact `bmux-index` code-intel payloads for symbols, context, impact, trace, refs, rename, changes, and module ownership.
+              - `code index` defaults to a longer response timeout because repo indexing can exceed the CLI's normal 15s socket deadline.
             """
         case "browser":
             return """

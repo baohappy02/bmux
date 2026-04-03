@@ -40,14 +40,42 @@ Steps
 1. Check \`bmux agent search status --session <sid> --json\`.
 2. If the index is cold, run \`bmux agent search index --session <sid> --json\`.
 3. Query with \`bmux agent search query --session <sid> --limit 5 --query "<concept>" --json\`.
-4. Use \`rg\` only after the compact search narrows the file set.
+4. Once one symbol or file stands out, switch to \`bmux agent code context|impact|trace|changes --session <sid> ... --json\`.
+5. Use \`rg\` only after the compact search narrows the file set.
 
 Verify
 - Keep search hits to a small limit and prefer exact follow-up reads.
-- Use GitNexus only when relationships or indirection matter.
+- Prefer \`agent.code\` over GitNexus for local symbol, impact, rename, and changed-file questions.
 
 Stop conditions
 - If the repo root is missing, re-check \`bmux agent capabilities\` for environment and cwd.`,
+  },
+  {
+    slug: "code-intel-before-edit",
+    scope: "global",
+    status: "active",
+    origin: "manual",
+    title: "Use code intel before editing shared code",
+    summary: "Resolve the symbol, inspect impact, and check current changes before mutating reused code.",
+    tags: ["code-intel", "impact", "changes", "rename", "low-token"],
+    contentMarkdown: `When to use
+- You are about to edit a shared symbol, refactor, or rename code in a repo.
+
+Steps
+1. Check \`bmux agent code status --session <sid> --json\`.
+2. If the index is missing or stale, run \`bmux agent code index --session <sid> --timeout-ms 120000 --json\`.
+3. Resolve the target with \`bmux agent code symbols --session <sid> --query "<symbol>" --json\`.
+4. Inspect \`bmux agent code context --session <sid> --symbol "<symbol>" [--path <path>] --json\`.
+5. Inspect \`bmux agent code impact --session <sid> --symbol "<symbol>" [--path <path>] --json\`.
+6. Check current scope with \`bmux agent code changes --session <sid> --scope unstaged --json\`.
+7. Before renaming, preview with \`bmux agent code rename --session <sid> --symbol "<symbol>" --to "<new-name>" --json\`.
+
+Verify
+- Prefer compact counts, affected modules, and confidence tiers over rereading large files.
+- Fall back to GitNexus only if bmux-index cannot answer the relation you need.
+
+Stop conditions
+- If \`agent code status\` reports the backend unavailable, use \`agent search\` plus \`rg\` as the fallback path.`,
   },
   {
     slug: "dev-server-readiness",
