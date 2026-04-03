@@ -7,15 +7,24 @@ import {
   databaseStatus,
   ingestQueuedRuns,
   insertRun,
+  listSkills,
   listEvaluations,
   openDatabase,
   proposeEvaluations,
   recordSkillUsage,
+  reviewEvaluation,
   seedDefaultSkills,
+  setSkillStatus,
   searchSkills,
   upsertSkill,
 } from "./db";
-import type { EvaluationInput, RunRecordInput, SkillInput } from "./types";
+import type {
+  EvaluationDecision,
+  EvaluationInput,
+  RunRecordInput,
+  SkillInput,
+  SkillStatus,
+} from "./types";
 
 function usage(): never {
   console.error(`bmux agent-intel
@@ -30,6 +39,9 @@ Usage:
   bun run tools/agent-intel/cli.ts create-evaluation [--db PATH] [--input FILE]
   bun run tools/agent-intel/cli.ts propose-evaluations [--db PATH] [--queue PATH] [--repo-root PATH] [--limit N] [--min-occurrences N]
   bun run tools/agent-intel/cli.ts list-evaluations [--db PATH] [--queue PATH] [--repo-root PATH] [--limit N]
+  bun run tools/agent-intel/cli.ts review-evaluation --evaluation-id ID --decision approve|reject [--activate] [--note TEXT] [--db PATH]
+  bun run tools/agent-intel/cli.ts list-skills [--db PATH] [--queue PATH] [--repo-root PATH] [--status STATUS] [--limit N]
+  bun run tools/agent-intel/cli.ts set-skill-status --skill-id ID --status STATUS [--db PATH]
   bun run tools/agent-intel/cli.ts search-skills --query TEXT [--db PATH] [--queue PATH] [--repo-root PATH] [--limit N]
 
 Input JSON commands read --input FILE or stdin.`);
@@ -86,6 +98,14 @@ function numberFlag(flags: Map<string, string>, key: string, fallback: number): 
     throw new Error(`Invalid numeric flag: --${key}`);
   }
   return parsed;
+}
+
+function requiredFlag(flags: Map<string, string>, key: string): string {
+  const value = flags.get(key)?.trim();
+  if (!value) {
+    throw new Error(`Missing --${key}`);
+  }
+  return value;
 }
 
 async function main(): Promise<void> {
@@ -190,6 +210,42 @@ async function main(): Promise<void> {
           2
         )
       );
+      return;
+    }
+
+    case "review-evaluation": {
+      const evaluationId = requiredFlag(flags, "evaluation-id");
+      const decision = requiredFlag(flags, "decision") as EvaluationDecision;
+      if (decision !== "approve" && decision !== "reject") {
+        throw new Error("Invalid --decision, expected approve or reject");
+      }
+      const result = reviewEvaluation(db, {
+        evaluationId,
+        decision,
+        note: flags.get("note") || null,
+        activate: flags.get("activate") === "true",
+      });
+      console.log(JSON.stringify({ ok: true, ...result }, null, 2));
+      return;
+    }
+
+    case "list-skills": {
+      const ingestResult = ingest();
+      const repoRoot = flags.get("repo-root") || null;
+      const status = (flags.get("status") || null) as SkillStatus | null;
+      const limit = numberFlag(flags, "limit", 20);
+      const skills = listSkills(db, { repoRoot, status, limit });
+      console.log(
+        JSON.stringify({ ok: true, ingest: ingestResult, count: skills.length, skills }, null, 2)
+      );
+      return;
+    }
+
+    case "set-skill-status": {
+      const skillId = requiredFlag(flags, "skill-id");
+      const status = requiredFlag(flags, "status") as SkillStatus;
+      const result = setSkillStatus(db, { skillId, status });
+      console.log(JSON.stringify({ ok: true, ...result }, null, 2));
       return;
     }
 

@@ -47,10 +47,7 @@ tests/visual_report.html
 # Local scratch (screenshots, etc.)
 tmp/
 tmp-*/
-.gitnexus
 
 AGENTS.md
 
 CLAUDE.md
-
-.claude/skills/gitnexus/

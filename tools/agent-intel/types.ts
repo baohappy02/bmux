@@ -8,6 +8,7 @@ export type SkillStatus =
 export type SkillOrigin = "manual" | "captured" | "fixed" | "derived";
 export type EvaluationType = "capture" | "fix" | "derived";
 export type EvaluationStatus = "pending" | "approved" | "rejected";
+export type EvaluationDecision = "approve" | "reject";
 
 export interface RunRecordInput {
   id?: string;
@@ -68,6 +69,22 @@ export interface SkillSearchResult {
   reasons: string[];
 }
 
+export interface SkillListItem {
+  skillId: string;
+  versionId: string;
+  versionLabel: string | null;
+  slug: string;
+  title: string;
+  scope: SkillScope;
+  repoRoot: string | null;
+  status: SkillStatus;
+  origin: SkillOrigin;
+  summary: string;
+  contentMarkdown: string;
+  changeSummary: string | null;
+  tags: string[];
+}
+
 export interface QueuedRunIngestResult {
   queuePath: string;
   ingested: number;
@@ -84,4 +101,46 @@ export interface ProposedEvaluation {
   summary: string;
   evidenceCount: number | null;
   created: boolean;
+}
+
+export interface ReviewEvaluationResult {
+  evaluationId: string;
+  status: EvaluationStatus;
+  decision: EvaluationDecision;
+  skillId: string | null;
+  versionId: string | null;
+  skillStatus: SkillStatus | null;
+}
+
+export interface AgentIntelMetrics {
+  repoRoot: string | null;
+  runs: {
+    total: number;
+    success: number;
+    failure: number;
+    successRate: number;
+    medianDurationMs: number | null;
+    p90DurationMs: number | null;
+    recurringSuccessPatterns: number;
+    recurringFailurePatterns: number;
+  };
+  skills: {
+    total: number;
+    byStatus: Partial<Record<SkillStatus, number>>;
+  };
+  evaluations: {
+    total: number;
+    pending: number;
+    approved: number;
+    rejected: number;
+  };
+  usage: {
+    total: number;
+    selected: number;
+    successful: number;
+  };
+  topFailureSignatures: Array<{
+    failureSignature: string;
+    count: number;
+  }>;
 }

@@ -45,7 +45,7 @@ Steps
 
 Verify
 - Keep search hits to a small limit and prefer exact follow-up reads.
-- Prefer \`agent.code\` over GitNexus for local symbol, impact, rename, and changed-file questions.
+- Prefer \`agent.code\` as the default path for local symbol, impact, rename, and changed-file questions.
 
 Stop conditions
 - If the repo root is missing, re-check \`bmux agent capabilities\` for environment and cwd.`,
@@ -72,7 +72,7 @@ Steps
 
 Verify
 - Prefer compact counts, affected modules, and confidence tiers over rereading large files.
-- Fall back to GitNexus only if bmux-index cannot answer the relation you need.
+- Fall back to \`agent search\` plus scoped \`rg\` reads only when the bmux-index backend is unavailable.
 
 Stop conditions
 - If \`agent code status\` reports the backend unavailable, use \`agent search\` plus \`rg\` as the fallback path.`,

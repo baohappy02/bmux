@@ -278,9 +278,9 @@ export default function CustomCommandsPage() {
     },
     {
       "name": "Reload",
-      "description": "Build and launch the debug app tagged to the current branch",
+      "description": "Build and launch the single dev app variant",
       "keywords": ["reload", "build", "run", "launch"],
-      "command": "./scripts/reload.sh --tag $(git branch --show-current)"
+      "command": "./scripts/reload.sh --tag dev --launch"
     },
     {
       "name": "Run Unit Tests",

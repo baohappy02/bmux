@@ -426,7 +426,8 @@ extension Workspace {
         let branchSnapshot = panelGitBranches[panelId].map {
             SessionGitBranchSnapshot(branch: $0.branch, isDirty: $0.isDirty)
         }
-        let listeningPorts = (surfaceListeningPorts[panelId] ?? []).sorted()
+        // Listening ports are runtime-only process state and should not survive session restore.
+        let listeningPorts: [Int] = []
         let ttyName = surfaceTTYNames[panelId]
 
         let terminalSnapshot: SessionTerminalPanelSnapshot?
@@ -691,7 +692,7 @@ extension Workspace {
             panelGitBranches.removeValue(forKey: panelId)
         }
 
-        surfaceListeningPorts[panelId] = Array(Set(snapshot.listeningPorts)).sorted()
+        surfaceListeningPorts.removeValue(forKey: panelId)
 
         if let ttyName = snapshot.ttyName?.trimmingCharacters(in: .whitespacesAndNewlines), !ttyName.isEmpty {
             surfaceTTYNames[panelId] = ttyName

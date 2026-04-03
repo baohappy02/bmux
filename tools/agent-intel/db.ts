@@ -4,13 +4,20 @@ import { dirname, resolve } from "node:path";
 
 import { DEFAULT_SKILLS } from "./default-skills";
 import type {
+  AgentIntelMetrics,
+  EvaluationDecision,
   EvaluationInput,
+  EvaluationStatus,
   ProposedEvaluation,
   QueuedRunIngestResult,
+  ReviewEvaluationResult,
   RunRecordInput,
+  SkillListItem,
   SkillInput,
+  SkillOrigin,
   SkillSearchResult,
   SkillStatus,
+  SkillScope,
 } from "./types";
 
 const DEFAULT_STATE_DIR = normalizePathLike(process.env.BMUX_AGENT_INTEL_STATE_DIR);
@@ -59,6 +66,7 @@ export function openDatabase(explicitPath?: string): Database {
 
 export function ensureSchema(db: Database): void {
   db.exec(`
+    PRAGMA busy_timeout = 5000;
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
 
@@ -167,7 +175,20 @@ function parseJson<T>(value: string | null, fallback: T): T {
   }
 }
 
-function latestVersionRows(db: Database): Array<{
+type EvaluationRow = {
+  id: string;
+  type: EvaluationInput["type"];
+  repo_root: string | null;
+  target_skill_id: string | null;
+  proposed_slug: string | null;
+  status: EvaluationStatus;
+  evidence_count: number | null;
+  summary: string;
+  metadata_json: string | null;
+  created_at: string;
+};
+
+type SkillVersionRow = {
   skillId: string;
   slug: string;
   title: string;
@@ -182,10 +203,10 @@ function latestVersionRows(db: Database): Array<{
   changeSummary: string | null;
   tagsJson: string;
   searchBlob: string;
-}> {
-  return db
-    .query(
-      `
+};
+
+function latestSkillVersionRowQuery(whereClause = ""): string {
+  return `
       SELECT
         s.id AS skillId,
         s.slug AS slug,
@@ -211,24 +232,12 @@ function latestVersionRows(db: Database): Array<{
           LIMIT 1
         )
       WHERE s.status != 'disabled'
-      `
-    )
-    .all() as Array<{
-      skillId: string;
-      slug: string;
-      title: string;
-      scope: string;
-      repoRoot: string;
-      status: SkillStatus;
-      origin: string;
-      summary: string;
-      versionId: string;
-      versionLabel: string | null;
-      contentMarkdown: string;
-      changeSummary: string | null;
-      tagsJson: string;
-      searchBlob: string;
-    }>;
+      ${whereClause}
+  `;
+}
+
+function latestVersionRows(db: Database): SkillVersionRow[] {
+  return db.query(latestSkillVersionRowQuery()).all() as SkillVersionRow[];
 }
 
 function latestSkillVersion(
@@ -350,6 +359,161 @@ function scoreSearchBlob(params: {
   }
 
   return { score, reasons };
+}
+
+function mapSkillVersionRow(row: SkillVersionRow): SkillListItem {
+  return {
+    skillId: row.skillId,
+    versionId: row.versionId,
+    versionLabel: row.versionLabel,
+    slug: row.slug,
+    title: row.title,
+    scope: row.scope as SkillScope,
+    repoRoot: row.repoRoot || null,
+    status: row.status,
+    origin: row.origin as SkillOrigin,
+    summary: row.summary,
+    contentMarkdown: row.contentMarkdown,
+    changeSummary: row.changeSummary,
+    tags: parseJson<string[]>(row.tagsJson, []),
+  };
+}
+
+function readEvaluationRow(db: Database, evaluationId: string): EvaluationRow | null {
+  return db
+    .query(
+      `
+      SELECT *
+      FROM evaluations
+      WHERE id = ?
+      LIMIT 1
+      `
+    )
+    .get(evaluationId) as EvaluationRow | null;
+}
+
+function updateEvaluation(
+  db: Database,
+  params: {
+    evaluationId: string;
+    status: EvaluationStatus;
+    metadata: Record<string, unknown> | null;
+  }
+): void {
+  db.query(
+    `
+    UPDATE evaluations
+    SET status = ?, metadata_json = ?
+    WHERE id = ?
+    `
+  ).run(params.status, toJson(params.metadata), params.evaluationId);
+}
+
+function buildSkillDraftFromEvaluation(row: EvaluationRow): SkillInput {
+  const metadata = parseJson<Record<string, unknown> | null>(row.metadata_json, null) ?? {};
+  const repoRoot = stableRepoRoot(row.repo_root);
+  const taskText = typeof metadata.taskText === "string" ? metadata.taskText.trim() : "";
+  const executionClass =
+    typeof metadata.executionClass === "string" ? metadata.executionClass.trim() : "";
+  const failureSignature =
+    typeof metadata.failureSignature === "string" ? metadata.failureSignature.trim() : "";
+  const scope: SkillScope = repoRoot ? "repo" : "global";
+  const origin: SkillOrigin =
+    row.type === "capture" ? "captured" : row.type === "fix" ? "fixed" : "derived";
+  const proposedSlug =
+    row.proposed_slug?.trim() ||
+    `${row.type}-${slugify(taskText || executionClass || row.summary).slice(0, 48)}`;
+  const conciseTask = taskText || executionClass || row.summary;
+  const titlePrefix = row.type === "fix" ? "Fix" : row.type === "derived" ? "Derived" : "Captured";
+  const title = `${titlePrefix}: ${conciseTask}`;
+  const tags = [
+    row.type,
+    scope,
+    executionClass ? slugify(executionClass) : "",
+    failureSignature ? slugify(failureSignature).slice(0, 32) : "",
+  ].filter((value) => value.length > 0);
+
+  const whenToUse = [`- use for: ${conciseTask}`];
+  if (repoRoot) {
+    whenToUse.push(`- repo root must match: \`${repoRoot}\``);
+  }
+  if (executionClass) {
+    whenToUse.push(`- execution class: \`${executionClass}\``);
+  }
+
+  const checks = [
+    "- search for an existing compact skill card before reading long logs",
+    "- prefer `agent task result` and `agent state summary` before tailing logs",
+  ];
+  if (failureSignature) {
+    checks.push(`- watch for failure signature: \`${failureSignature}\``);
+  }
+
+  const steps =
+    row.type === "fix"
+      ? [
+          "1. reproduce with the smallest failing command or verify profile",
+          "2. inspect `agent task result` for parsed diagnostics and short tail",
+          "3. narrow to the reported failure signature before widening search",
+          "4. patch the smallest likely root cause, then rerun the same verify path",
+        ]
+      : [
+          "1. attach or reuse the current bmux session",
+          "2. search local code or bmux agent search with a narrow task query",
+          "3. run the smallest verify path that proves the task is complete",
+          "4. only widen to logs or browser artifacts if result and state summary are insufficient",
+        ];
+
+  const verify = [
+    "- rerun the same task or verify profile",
+    "- confirm `task.result.ok=true` or equivalent success signal",
+    "- capture only compact evidence back into agent-intel",
+  ];
+
+  const pitfalls = [
+    "- do not generalize this skill across unrelated repos without repeated wins",
+    "- do not promote directly to active until canary runs are clean",
+  ];
+
+  const contentMarkdown = [
+    "# When To Use",
+    ...whenToUse,
+    "",
+    "# Prechecks",
+    ...checks,
+    "",
+    "# Steps",
+    ...steps,
+    "",
+    "# Verify",
+    ...verify,
+    "",
+    "# Pitfalls",
+    ...pitfalls,
+  ].join("\n");
+
+  return {
+    slug: proposedSlug,
+    scope,
+    repoRoot,
+    status: "canary",
+    origin,
+    title,
+    summary: row.summary,
+    contentMarkdown,
+    changeSummary: `Approved from evaluation ${row.id}`,
+    versionLabel: `${row.type}.v1`,
+    tags,
+  };
+}
+
+function percentile(values: number[], fraction: number): number | null {
+  if (values.length === 0) {
+    return null;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1));
+  return sorted[index] ?? null;
 }
 
 export function insertRun(
@@ -567,6 +731,44 @@ export function listEvaluations(
   });
 }
 
+export function listSkills(
+  db: Database,
+  options: { repoRoot?: string | null; status?: SkillStatus | null; limit?: number } = {}
+): SkillListItem[] {
+  const repoRoot = stableRepoRoot(options.repoRoot);
+  const status = options.status?.trim() as SkillStatus | undefined;
+  const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
+  const filters: string[] = [];
+  const params: unknown[] = [];
+
+  if (repoRoot) {
+    filters.push("AND s.repo_root = ?");
+    params.push(repoRoot);
+  }
+  if (status) {
+    filters.push("AND s.status = ?");
+    params.push(status);
+  }
+
+  const query = `
+    ${latestSkillVersionRowQuery(filters.join("\n"))}
+    ORDER BY
+      CASE s.status
+        WHEN 'active' THEN 1
+        WHEN 'canary' THEN 2
+        WHEN 'candidate' THEN 3
+        WHEN 'quarantined' THEN 4
+        ELSE 5
+      END,
+      s.updated_at DESC,
+      s.slug ASC
+    LIMIT ?
+  `;
+
+  const rows = db.query(query).all(...params, limit) as SkillVersionRow[];
+  return rows.map(mapSkillVersionRow);
+}
+
 export function searchSkills(
   db: Database,
   options: { query: string; repoRoot?: string | null; limit?: number }
@@ -593,19 +795,7 @@ export function searchSkills(
         status: row.status,
       });
       return {
-        skillId: row.skillId,
-        versionId: row.versionId,
-        versionLabel: row.versionLabel,
-        slug: row.slug,
-        title: row.title,
-        scope: row.scope as "global" | "repo",
-        repoRoot: row.repoRoot || null,
-        status: row.status,
-        origin: row.origin as SkillSearchResult["origin"],
-        summary: row.summary,
-        contentMarkdown: row.contentMarkdown,
-        changeSummary: row.changeSummary,
-        tags: parseJson<string[]>(row.tagsJson, []),
+        ...mapSkillVersionRow(row),
         score,
         reasons,
       };
@@ -956,6 +1146,398 @@ export function proposeEvaluations(
   }
 
   return proposals;
+}
+
+export function reviewEvaluation(
+  db: Database,
+  params: {
+    evaluationId: string;
+    decision: EvaluationDecision;
+    note?: string | null;
+    activate?: boolean;
+  }
+): ReviewEvaluationResult {
+  const row = readEvaluationRow(db, params.evaluationId);
+  if (!row) {
+    throw new Error(`Unknown evaluation: ${params.evaluationId}`);
+  }
+
+  const currentMetadata = parseJson<Record<string, unknown> | null>(row.metadata_json, null) ?? {};
+  const reviewedAt = new Date().toISOString();
+  const reviewNote = params.note?.trim() || null;
+
+  if (params.decision === "reject") {
+    const metadata = {
+      ...currentMetadata,
+      review: {
+        decision: "reject",
+        reviewedAt,
+        note: reviewNote,
+      },
+    };
+    updateEvaluation(db, {
+      evaluationId: row.id,
+      status: "rejected",
+      metadata,
+    });
+    return {
+      evaluationId: row.id,
+      status: "rejected",
+      decision: "reject",
+      skillId: null,
+      versionId: null,
+      skillStatus: null,
+    };
+  }
+
+  const skillDraft = buildSkillDraftFromEvaluation(row);
+  if (params.activate) {
+    skillDraft.status = "active";
+  }
+  const { skillId, versionId } = upsertSkill(db, skillDraft);
+  const metadata = {
+    ...currentMetadata,
+    review: {
+      decision: "approve",
+      reviewedAt,
+      note: reviewNote,
+      activate: Boolean(params.activate),
+    },
+    appliedSkillId: skillId,
+    appliedVersionId: versionId,
+    appliedSkillStatus: skillDraft.status,
+  };
+  updateEvaluation(db, {
+    evaluationId: row.id,
+    status: "approved",
+    metadata,
+  });
+
+  return {
+    evaluationId: row.id,
+    status: "approved",
+    decision: "approve",
+    skillId,
+    versionId,
+    skillStatus: skillDraft.status,
+  };
+}
+
+export function setSkillStatus(
+  db: Database,
+  params: {
+    skillId: string;
+    status: SkillStatus;
+  }
+): { skillId: string; status: SkillStatus } {
+  const result = db
+    .query(
+      `
+      UPDATE skills
+      SET status = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+      `
+    )
+    .run(params.status, params.skillId);
+
+  if (Number(result.changes ?? 0) === 0) {
+    throw new Error(`Unknown skill: ${params.skillId}`);
+  }
+
+  return {
+    skillId: params.skillId,
+    status: params.status,
+  };
+}
+
+export function computeMetrics(
+  db: Database,
+  options: { repoRoot?: string | null; limit?: number } = {}
+): AgentIntelMetrics {
+  const repoRoot = stableRepoRoot(options.repoRoot);
+  const limit = Math.max(1, Math.min(options.limit ?? 5, 20));
+
+  const runWhere = repoRoot ? "WHERE repo_root = ?" : "";
+  const runCounts = (repoRoot
+    ? db
+        .query(
+          `
+          SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count,
+            SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failure_count
+          FROM runs
+          ${runWhere}
+          `
+        )
+        .get(repoRoot)
+    : db
+        .query(
+          `
+          SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS success_count,
+            SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failure_count
+          FROM runs
+          `
+        )
+        .get()) as {
+    total: number | null;
+    success_count: number | null;
+    failure_count: number | null;
+  };
+
+  const durationRows = (repoRoot
+    ? db
+        .query(
+          `
+          SELECT duration_ms
+          FROM runs
+          WHERE repo_root = ? AND duration_ms IS NOT NULL
+          ORDER BY duration_ms ASC
+          `
+        )
+        .all(repoRoot)
+    : db
+        .query(
+          `
+          SELECT duration_ms
+          FROM runs
+          WHERE duration_ms IS NOT NULL
+          ORDER BY duration_ms ASC
+          `
+        )
+        .all()) as Array<{ duration_ms: number }>;
+  const durations = durationRows
+    .map((row) => Number(row.duration_ms))
+    .filter((value) => Number.isFinite(value) && value >= 0);
+
+  const recurringSuccessPatterns = Number(
+    (
+      repoRoot
+        ? db
+            .query(
+              `
+              SELECT COUNT(*) AS count
+              FROM (
+                SELECT 1
+                FROM runs
+                WHERE repo_root = ?
+                  AND success = 1
+                  AND COALESCE(task_text, '') != ''
+                GROUP BY task_text, execution_class
+                HAVING COUNT(*) >= 2
+              )
+              `
+            )
+            .get(repoRoot)
+        : db
+            .query(
+              `
+              SELECT COUNT(*) AS count
+              FROM (
+                SELECT 1
+                FROM runs
+                WHERE success = 1
+                  AND COALESCE(task_text, '') != ''
+                GROUP BY task_text, execution_class
+                HAVING COUNT(*) >= 2
+              )
+              `
+            )
+            .get()
+    ) as { count: number }
+  .count);
+
+  const recurringFailurePatterns = Number(
+    (
+      repoRoot
+        ? db
+            .query(
+              `
+              SELECT COUNT(*) AS count
+              FROM (
+                SELECT 1
+                FROM runs
+                WHERE repo_root = ?
+                  AND success = 0
+                  AND COALESCE(failure_signature, '') != ''
+                GROUP BY failure_signature, execution_class
+                HAVING COUNT(*) >= 2
+              )
+              `
+            )
+            .get(repoRoot)
+        : db
+            .query(
+              `
+              SELECT COUNT(*) AS count
+              FROM (
+                SELECT 1
+                FROM runs
+                WHERE success = 0
+                  AND COALESCE(failure_signature, '') != ''
+                GROUP BY failure_signature, execution_class
+                HAVING COUNT(*) >= 2
+              )
+              `
+            )
+            .get()
+    ) as { count: number }
+  .count);
+
+  const failureRows = (repoRoot
+    ? db
+        .query(
+          `
+          SELECT failure_signature AS failureSignature, COUNT(*) AS count
+          FROM runs
+          WHERE repo_root = ?
+            AND success = 0
+            AND COALESCE(failure_signature, '') != ''
+          GROUP BY failure_signature
+          ORDER BY count DESC, MAX(created_at) DESC
+          LIMIT ?
+          `
+        )
+        .all(repoRoot, limit)
+    : db
+        .query(
+          `
+          SELECT failure_signature AS failureSignature, COUNT(*) AS count
+          FROM runs
+          WHERE success = 0
+            AND COALESCE(failure_signature, '') != ''
+          GROUP BY failure_signature
+          ORDER BY count DESC, MAX(created_at) DESC
+          LIMIT ?
+          `
+        )
+        .all(limit)) as Array<{ failureSignature: string; count: number }>;
+
+  const evaluationCounts = (repoRoot
+    ? db
+        .query(
+          `
+          SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+            SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+            SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+          FROM evaluations
+          WHERE repo_root = ?
+          `
+        )
+        .get(repoRoot)
+    : db
+        .query(
+          `
+          SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+            SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+            SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected_count
+          FROM evaluations
+          `
+        )
+        .get()) as {
+    total: number | null;
+    pending_count: number | null;
+    approved_count: number | null;
+    rejected_count: number | null;
+  };
+
+  const skillRows = (repoRoot
+    ? db
+        .query(
+          `
+          SELECT status, COUNT(*) AS count
+          FROM skills
+          WHERE repo_root = ? OR repo_root = ''
+          GROUP BY status
+          `
+        )
+        .all(repoRoot)
+    : db
+        .query(
+          `
+          SELECT status, COUNT(*) AS count
+          FROM skills
+          GROUP BY status
+          `
+        )
+        .all()) as Array<{ status: SkillStatus; count: number }>;
+  const skillsByStatus = skillRows.reduce<Partial<Record<SkillStatus, number>>>((acc, row) => {
+    acc[row.status] = Number(row.count);
+    return acc;
+  }, {});
+
+  const usageCounts = (repoRoot
+    ? db
+        .query(
+          `
+          SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN su.selected = 1 THEN 1 ELSE 0 END) AS selected_count,
+            SUM(CASE WHEN su.outcome = 'success' THEN 1 ELSE 0 END) AS success_count
+          FROM skill_usage su
+          JOIN runs r ON r.id = su.run_id
+          WHERE r.repo_root = ?
+          `
+        )
+        .get(repoRoot)
+    : db
+        .query(
+          `
+          SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN selected = 1 THEN 1 ELSE 0 END) AS selected_count,
+            SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count
+          FROM skill_usage
+          `
+        )
+        .get()) as {
+    total: number | null;
+    selected_count: number | null;
+    success_count: number | null;
+  };
+
+  const totalRuns = Number(runCounts.total ?? 0);
+  const successRuns = Number(runCounts.success_count ?? 0);
+  const failureRuns = Number(runCounts.failure_count ?? 0);
+
+  return {
+    repoRoot,
+    runs: {
+      total: totalRuns,
+      success: successRuns,
+      failure: failureRuns,
+      successRate: totalRuns > 0 ? Number((successRuns / totalRuns).toFixed(4)) : 0,
+      medianDurationMs: percentile(durations, 0.5),
+      p90DurationMs: percentile(durations, 0.9),
+      recurringSuccessPatterns,
+      recurringFailurePatterns,
+    },
+    skills: {
+      total: skillRows.reduce((sum, row) => sum + Number(row.count), 0),
+      byStatus: skillsByStatus,
+    },
+    evaluations: {
+      total: Number(evaluationCounts.total ?? 0),
+      pending: Number(evaluationCounts.pending_count ?? 0),
+      approved: Number(evaluationCounts.approved_count ?? 0),
+      rejected: Number(evaluationCounts.rejected_count ?? 0),
+    },
+    usage: {
+      total: Number(usageCounts.total ?? 0),
+      selected: Number(usageCounts.selected_count ?? 0),
+      successful: Number(usageCounts.success_count ?? 0),
+    },
+    topFailureSignatures: failureRows.map((row) => ({
+      failureSignature: row.failureSignature,
+      count: Number(row.count),
+    })),
+  };
 }
 
 export function databaseStatus(

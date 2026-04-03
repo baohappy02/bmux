@@ -10,10 +10,14 @@ BUNDLE_SET=0
 DERIVED_SET=0
 TAG=""
 LAUNCH=0
+INSTALL_APPLICATIONS=0
 CMUX_DEBUG_LOG=""
 CLI_PATH=""
 LAST_SOCKET_PATH_DIR="$HOME/Library/Application Support/bmux"
 LAST_SOCKET_PATH_FILE="${LAST_SOCKET_PATH_DIR}/last-socket-path"
+APPLICATIONS_APP_PATH="/Applications/bmux.app"
+APPLICATIONS_DERIVED_DATA="$HOME/Library/Developer/Xcode/DerivedData/bmux-install-applications"
+APPLICATIONS_XCODE_LOG="/tmp/bmux-xcodebuild-install-applications.log"
 AUTO_SKIP_ZIG_BUILD_REASON=""
 
 should_skip_ghostty_cli_helper_zig_build() {
@@ -58,7 +62,7 @@ if [[ -x "$fallback_bin" ]]; then
   exec "$fallback_bin" "\$@"
 fi
 
-echo "error: no reload-selected dev bmux CLI found. Run ./scripts/reload.sh --tag <name> first." >&2
+echo "error: no reload-selected dev bmux CLI found. Run ./scripts/reload.sh --tag dev first." >&2
 exit 1
 EOF
   chmod +x "$target"
@@ -121,15 +125,105 @@ write_last_socket_path() {
   echo "$socket_path" > /tmp/bmux-last-socket-path || true
 }
 
+find_bmux_index_src() {
+  local candidate=""
+  for candidate in \
+    "$PWD/../bmux-index/.build/release/bmux-index" \
+    "$PWD/../bmux-index/.build/debug/bmux-index" \
+    "$HOME/.local/bin/bmux-index" \
+    "$(command -v bmux-index 2>/dev/null || true)"
+  do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    echo "$candidate"
+    return 0
+  done
+  return 1
+}
+
+bundle_runtime_binaries() {
+  local app_path="$1"
+  local bin_dir="${app_path}/Contents/Resources/bin"
+  local bmux_index_src=""
+
+  mkdir -p "$bin_dir"
+
+  if [[ -x "$CMUXD_SRC" ]]; then
+    cp "$CMUXD_SRC" "$bin_dir/bmuxd"
+    chmod +x "$bin_dir/bmuxd"
+  fi
+
+  if [[ -x "$GHOSTTY_HELPER_SRC" ]]; then
+    cp "$GHOSTTY_HELPER_SRC" "$bin_dir/ghostty"
+    chmod +x "$bin_dir/ghostty"
+  fi
+
+  bmux_index_src="$(find_bmux_index_src || true)"
+  if [[ -n "$bmux_index_src" ]]; then
+    cp "$bmux_index_src" "$bin_dir/bmux-index"
+    chmod +x "$bin_dir/bmux-index"
+  else
+    echo "warning: bmux-index binary was not found; agent.code will stay unavailable until bmux-index is installed." >&2
+  fi
+}
+
+install_release_app_to_applications() {
+  local release_app=""
+  local -a release_args=(
+    -project GhosttyTabs.xcodeproj
+    -scheme bmux
+    -configuration Release
+    -destination 'platform=macOS'
+    -derivedDataPath "$APPLICATIONS_DERIVED_DATA"
+  )
+
+  if [[ "${CMUX_SKIP_ZIG_BUILD:-}" == "1" ]]; then
+    release_args+=(CMUX_SKIP_ZIG_BUILD=1)
+  fi
+  release_args+=(build)
+
+  echo
+  echo "Installing matching Release build to ${APPLICATIONS_APP_PATH}..."
+
+  set +e
+  xcodebuild "${release_args[@]}" 2>&1 | tee "$APPLICATIONS_XCODE_LOG" | grep -E '(warning:|error:|fatal:|BUILD FAILED|BUILD SUCCEEDED|\*\* BUILD)'
+  local release_pipestatus=("${PIPESTATUS[@]}")
+  set -e
+  local release_exit="${release_pipestatus[0]}"
+  echo "Release build log: $APPLICATIONS_XCODE_LOG"
+  if [[ "$release_exit" -ne 0 ]]; then
+    echo "error: release xcodebuild failed with exit code $release_exit" >&2
+    exit "$release_exit"
+  fi
+
+  release_app="${APPLICATIONS_DERIVED_DATA}/Build/Products/Release/bmux.app"
+  if [[ ! -d "$release_app" ]]; then
+    echo "error: bmux.app not found in ${APPLICATIONS_DERIVED_DATA}" >&2
+    exit 1
+  fi
+
+  bundle_runtime_binaries "$release_app"
+  /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$release_app" >/dev/null 2>&1 || true
+
+  pkill -f "/Applications/bmux.app/Contents/MacOS/bmux" >/dev/null 2>&1 || true
+  sleep 0.3
+  rm -rf "$APPLICATIONS_APP_PATH"
+  ditto "$release_app" "$APPLICATIONS_APP_PATH"
+  /usr/bin/codesign --force --sign - --timestamp=none --generate-entitlement-der "$APPLICATIONS_APP_PATH" >/dev/null 2>&1 || true
+
+  echo "Installed app:"
+  echo "  $APPLICATIONS_APP_PATH"
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./scripts/reload.sh --tag <name> [options]
 
 Options:
-  --tag <name>           Required. Short tag for parallel builds (e.g., feature-xyz-lol).
+  --tag <name>           Required. Reuse one stable dev tag such as "dev".
                          Sets app name, bundle id, and derived data path unless overridden.
   --launch               Launch the app after building. Without this flag, the script
                          builds and prints the app path but does not open it.
+  --install-applications Build a matching Release app and replace /Applications/bmux.app.
   --name <app name>      Override app display/bundle name.
   --bundle-id <id>       Override bundle identifier.
   --derived-data <path>  Override derived data path.
@@ -252,6 +346,10 @@ while [[ $# -gt 0 ]]; do
       LAUNCH=1
       shift
       ;;
+    --install-applications)
+      INSTALL_APPLICATIONS=1
+      shift
+      ;;
     --derived-data)
       DERIVED_DATA="${2:-}"
       if [[ -z "$DERIVED_DATA" ]]; then
@@ -274,7 +372,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$TAG" ]]; then
-  echo "error: --tag is required (example: ./scripts/reload.sh --tag fix-sidebar-theme)" >&2
+  echo "error: --tag is required (example: ./scripts/reload.sh --tag dev)" >&2
   usage
   exit 1
 fi
@@ -461,21 +559,14 @@ if [[ -d "$PWD/ghostty" ]]; then
     (cd "$PWD/ghostty" && zig build cli-helper -Dapp-runtime=none -Demit-macos-app=false -Demit-xcframework=false -Doptimize=ReleaseFast)
   fi
 fi
-if [[ -x "$CMUXD_SRC" ]]; then
-  BIN_DIR="$APP_PATH/Contents/Resources/bin"
-  mkdir -p "$BIN_DIR"
-  cp "$CMUXD_SRC" "$BIN_DIR/bmuxd"
-  chmod +x "$BIN_DIR/bmuxd"
-fi
-if [[ -x "$GHOSTTY_HELPER_SRC" ]]; then
-  BIN_DIR="$APP_PATH/Contents/Resources/bin"
-  mkdir -p "$BIN_DIR"
-  cp "$GHOSTTY_HELPER_SRC" "$BIN_DIR/ghostty"
-  chmod +x "$BIN_DIR/ghostty"
-fi
+bundle_runtime_binaries "$APP_PATH"
 CLI_PATH="$APP_PATH/Contents/Resources/bin/bmux"
 if [[ -x "$CLI_PATH" ]]; then
   echo "$CLI_PATH" > /tmp/bmux-last-cli-path || true
+fi
+
+if [[ "$INSTALL_APPLICATIONS" -eq 1 ]]; then
+  install_release_app_to_applications
 fi
 
 if [[ "$LAUNCH" -eq 1 ]]; then

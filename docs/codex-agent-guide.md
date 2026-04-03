@@ -103,7 +103,7 @@ bmux agent code changes --session <sid> --scope unstaged --json
 bmux agent code rename --session <sid> --symbol "activeSocketPath" --path Sources/TerminalController.swift --to currentSocketPath --json
 ```
 
-Use `agent.code` when the task needs symbol-aware answers, blast radius, changed-symbol mapping, module ownership, or safe rename preview. Prefer it over GitNexus for the common local repo loop.
+Use `agent.code` when the task needs symbol-aware answers, blast radius, changed-symbol mapping, module ownership, or safe rename preview. Treat it as the default local repo loop.
 If `status` is `stale` or `missing` on a large repo, prefer `code index --timeout-ms 120000` instead of relying on the CLI's shorter default response window.
 
 ## Measurement Hooks

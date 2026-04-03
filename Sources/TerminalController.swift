@@ -3553,7 +3553,7 @@ class TerminalController {
             "backend_kind": v2AgentBackendKind(surfaceId: context.surfaceId, workspace: context.workspace),
             "capabilities": v2AgentCapabilityFlags(),
             "code_intelligence": [
-                "backend": v2AgentBmuxIndexExecutablePath() != nil ? "bmux-index" : (v2AgentGitNexusAvailable() ? "gitnexus" : "none"),
+                "backend": v2AgentBmuxIndexExecutablePath() != nil ? "bmux-index" : "none",
                 "search_backend": v2AgentBmuxIndexExecutablePath() != nil ? "bmux-index" : "legacy_lexical",
                 "methods": [
                     "agent.search.status",
@@ -5775,7 +5775,7 @@ class TerminalController {
                 "capabilities": [
                     "lexical": false,
                     "semantic": false,
-                    "graph": v2AgentGitNexusAvailable()
+                    "graph": false
                 ],
                 "safe_for_exact_symbol_work": false,
                 "event_cursor": v2AgentCurrentEventCursor()
@@ -5840,7 +5840,7 @@ class TerminalController {
             "capabilities": [
                 "lexical": true,
                 "semantic": false,
-                "graph": v2AgentGitNexusAvailable()
+                "graph": false
             ],
             "event_cursor": v2AgentCurrentEventCursor()
         ])
@@ -5893,7 +5893,7 @@ class TerminalController {
             "capabilities": [
                 "lexical": true,
                 "semantic": false,
-                "graph": v2AgentGitNexusAvailable()
+                "graph": false
             ],
             "hits": searchResult.hits,
             "count": searchResult.hits.count,
@@ -9289,13 +9289,6 @@ class TerminalController {
         """
     }
 
-    private func v2AgentGitNexusAvailable() -> Bool {
-        let metaPath = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent(".gitnexus/meta.json")
-            .path
-        return FileManager.default.fileExists(atPath: metaPath)
-    }
-
     private func v2AgentEffectiveSearchState(repoRoot: String) -> AgentSearchIndexState {
         let currentFingerprint = v2AgentSearchSourceFingerprint(repoRoot: repoRoot)
         guard var state = withV2AgentState({ v2AgentSearchIndexByRepo[repoRoot] }) else {
@@ -9337,7 +9330,7 @@ class TerminalController {
             "capabilities": [
                 "lexical": true,
                 "semantic": false,
-                "graph": v2AgentGitNexusAvailable()
+                "graph": false
             ],
             "safe_for_exact_symbol_work": false,
             "event_cursor": v2AgentCurrentEventCursor()

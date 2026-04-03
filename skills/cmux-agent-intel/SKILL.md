@@ -14,6 +14,8 @@ bmux agent intel seed-defaults --json
 bmux agent intel search --session <sid> --query "verify failing change" --json
 bmux agent intel propose --session <sid> --json
 bmux agent intel evaluations --session <sid> --json
+bmux agent intel review --evaluation <eval-id> --decision approve --json
+bmux agent intel skills --session <sid> --json
 ```
 
 ## Rules
@@ -21,7 +23,8 @@ bmux agent intel evaluations --session <sid> --json
 1. Search first. Do not widen into broad logs or screenshots until `agent intel search` returns no useful card.
 2. Use `bmux agent task result` before `task logs`.
 3. Treat `propose` output as pending review, not auto-approved skill activation.
-4. Keep repo-specific reuse gated to the current repo root.
+4. Approve into `canary` first, then promote with `bmux agent intel skill-status`.
+5. Keep repo-specific reuse gated to the current repo root.
 
 ## What It Stores
 

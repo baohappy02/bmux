@@ -26,18 +26,21 @@
 
 3. Build the debug app:
    ```bash
-   ./scripts/reload.sh --tag my-feature
+   ./scripts/reload.sh --tag dev --launch
    ```
-   The script prints the `.app` path. Cmd-click to open, or pass `--launch` to open automatically.
+   Reuse the `dev` tag so you keep only one dev build around. When you want the installed app updated too, run:
+   ```bash
+   ./scripts/reload.sh --tag dev --launch --install-applications
+   ```
 
 ## Development Scripts
 
 | Script | Description |
 |--------|-------------|
 | `./scripts/setup.sh` | One-time setup (submodules + xcframework) |
-| `./scripts/reload.sh` | Build Debug app (pass `--launch` to also open it) |
-| `./scripts/reloadp.sh` | Build and launch Release app |
-| `./scripts/reload2.sh` | Reload both Debug and Release |
+| `./scripts/reload.sh --tag dev` | Build the single dev app variant |
+| `./scripts/reload.sh --tag dev --launch --install-applications` | Build dev, launch it, and replace `/Applications/bmux.app` with the matching Release build |
+| `./scripts/reloadp.sh` | Rebuild, install, and launch `/Applications/bmux.app` |
 | `./scripts/rebuild.sh` | Clean rebuild |
 
 ## Rebuilding GhosttyKit

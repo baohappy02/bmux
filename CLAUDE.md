@@ -10,19 +10,34 @@ Run the setup script to initialize submodules and build GhosttyKit:
 
 ## Local dev
 
-After making code changes, always run the reload script with a tag to build the Debug app:
+Run the setup script once to initialize submodules and build GhosttyKit:
 
 ```bash
-./scripts/reload.sh --tag fix-zsh-autosuggestions
+./scripts/setup.sh
 ```
 
-By default, `reload.sh` builds but does **not** launch the app. The script prints the `.app` path so the user can cmd-click to open it. Pass `--launch` to kill any existing instance and open the app automatically:
+Keep exactly two local app variants in normal development:
+
+1. `/Applications/bmux.app`
+2. one tagged dev build from `./scripts/reload.sh`
+
+Use a single stable dev tag such as `dev` unless you are explicitly testing isolation bugs.
 
 ```bash
-./scripts/reload.sh --tag fix-zsh-autosuggestions --launch
+./scripts/reload.sh --tag dev
+./scripts/reload.sh --tag dev --launch
+./scripts/reload.sh --tag dev --launch --install-applications
 ```
 
-`reload.sh` prints an `App path:` line with the absolute path to the built `.app`. Use that path to build a cmd-clickable `file://` URL. Steps:
+Rules:
+
+- `reload.sh` is the canonical local dev loop.
+- `--launch` opens the tagged dev app after the build succeeds.
+- `--install-applications` also builds Release and replaces `/Applications/bmux.app` so the installed app matches current source.
+- Do not keep multiple tagged dev apps around. Reuse one tag and replace the installed app when you want the stable copy updated.
+- Never `open` an untagged debug app from DerivedData manually.
+
+`reload.sh` prints an `App path:` line with the absolute path to the built dev `.app`. Use that path to build a cmd-clickable `file://` URL. Steps:
 
 1. Grab the path from the `App path:` line in `reload.sh` output.
 2. Prepend `file://` and URL-encode spaces as `%20`. Do not hardcode any part of the path.
@@ -31,36 +46,24 @@ By default, `reload.sh` builds but does **not** launch the app. The script print
 Example. If `reload.sh` output contains:
 ```
 App path:
-  /Users/someone/Library/Developer/Xcode/DerivedData/cmux-my-tag/Build/Products/Debug/cmux DEV my-tag.app
+  /Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux DEV dev.app
 ```
 
 **Claude Code** outputs:
 ```markdown
 =======================================================
-[cmux DEV my-tag.app](file:///Users/someone/Library/Developer/Xcode/DerivedData/cmux-my-tag/Build/Products/Debug/cmux%20DEV%20my-tag.app)
+[bmux DEV dev.app](file:///Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux%20DEV%20dev.app)
 =======================================================
 ```
 
 **Codex** outputs:
 ```
 =======================================================
-[my-tag: file:///Users/someone/Library/Developer/Xcode/DerivedData/cmux-my-tag/Build/Products/Debug/cmux%20DEV%20my-tag.app](file:///Users/someone/Library/Developer/Xcode/DerivedData/cmux-my-tag/Build/Products/Debug/cmux%20DEV%20my-tag.app)
+[dev: file:///Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux%20DEV%20dev.app](file:///Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux%20DEV%20dev.app)
 =======================================================
 ```
 
-Never use `/tmp/cmux-<tag>/...` app links in chat output.
-
-After making code changes, always use `reload.sh --tag` to build. **Never run bare `xcodebuild` or `open` an untagged `cmux DEV.app`.** Untagged builds share the default debug socket and bundle ID with other agents, causing conflicts and stealing focus.
-
-```bash
-./scripts/reload.sh --tag <your-branch-slug>
-```
-
-If you only need to verify the build compiles (no launch), use a tagged derivedDataPath:
-
-```bash
-xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug -destination 'platform=macOS' -derivedDataPath /tmp/cmux-<your-tag> build
-```
+Never use `/tmp/bmux-<tag>/...` app links in chat output.
 
 When rebuilding GhosttyKit.xcframework, always use Release optimizations:
 
@@ -68,46 +71,17 @@ When rebuilding GhosttyKit.xcframework, always use Release optimizations:
 cd ghostty && zig build -Demit-xcframework=true -Dxcframework-target=universal -Doptimize=ReleaseFast
 ```
 
-When rebuilding cmuxd for release/bundling, always use ReleaseFast:
+When rebuilding `bmuxd` for release/bundling, always use ReleaseFast:
 
 ```bash
-cd cmuxd && zig build -Doptimize=ReleaseFast
+cd bmuxd && zig build -Doptimize=ReleaseFast
 ```
 
-`reload` = build the Debug app (tag required). Pass `--launch` to also kill existing and open:
-
-```bash
-./scripts/reload.sh --tag <tag>
-./scripts/reload.sh --tag <tag> --launch
-```
-
-`reloadp` = kill and launch the Release app:
+`reloadp` is the stable-install shortcut for rebuilding and relaunching `/Applications/bmux.app`:
 
 ```bash
 ./scripts/reloadp.sh
 ```
-
-`reloads` = kill and launch the Release app as "cmux STAGING" (isolated from production cmux):
-
-```bash
-./scripts/reloads.sh
-```
-
-`reload2` = reload both Debug and Release (tag required for Debug reload):
-
-```bash
-./scripts/reload2.sh --tag <tag>
-```
-
-For parallel/isolated builds (e.g., testing a feature alongside the main app), use `--tag` with a short descriptive name:
-
-```bash
-./scripts/reload.sh --tag fix-blur-effect
-```
-
-This creates an isolated app with its own name, bundle ID, socket, and derived data path so it runs side-by-side with the main app. Important: use a non-`/tmp` derived data path if you need xcframework resolution (the script handles this automatically).
-
-Before launching a new tagged run, clean up any older tags you started in this session (quit old tagged app + remove its `/tmp` socket/derived data).
 
 ## Debug event log
 
@@ -118,7 +92,7 @@ tail -f "$(cat /tmp/cmux-last-debug-log-path 2>/dev/null || echo /tmp/cmux-debug
 ```
 
 - Untagged Debug app: `/tmp/cmux-debug.log`
-- Tagged Debug app (`./scripts/reload.sh --tag <tag>`): `/tmp/cmux-debug-<tag>.log`
+- Tagged Debug app (`./scripts/reload.sh --tag dev`): `/tmp/cmux-debug-dev.log`
 - `reload.sh` writes the current path to `/tmp/cmux-last-debug-log-path`
 - `reload.sh` writes the selected dev CLI path to `/tmp/cmux-last-cli-path`
 - `reload.sh` updates `/tmp/cmux-cli` and `$HOME/.local/bin/cmux-dev` to that CLI
@@ -262,105 +236,3 @@ Notes:
 - README download button points to `releases/latest/download/cmux-macos.dmg`.
 - Versioning: bump the minor version for updates unless explicitly asked otherwise.
 - Changelog: update `CHANGELOG.md`; docs changelog is rendered from it.
-
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
-
-This project is indexed by GitNexus as **bmux** (12414 symbols, 21330 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
-
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
-
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
-
-## When Debugging
-
-1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
-2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
-3. `READ gitnexus://repo/bmux/process/{processName}` — trace the full execution flow step by step
-4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
-
-## When Refactoring
-
-- **Renaming**: MUST use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with `dry_run: false`.
-- **Extracting/Splitting**: MUST run `gitnexus_context({name: "target"})` to see all incoming/outgoing refs, then `gitnexus_impact({target: "target", direction: "upstream"})` to find all external callers before moving code.
-- After any refactor: run `gitnexus_detect_changes({scope: "all"})` to verify only expected files changed.
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
-
-## Tools Quick Reference
-
-| Tool | When to use | Command |
-|------|-------------|---------|
-| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
-| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
-| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
-| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
-| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
-| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
-
-## Impact Risk Levels
-
-| Depth | Meaning | Action |
-|-------|---------|--------|
-| d=1 | WILL BREAK — direct callers/importers | MUST update these |
-| d=2 | LIKELY AFFECTED — indirect deps | Should test |
-| d=3 | MAY NEED TESTING — transitive | Test if critical path |
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/bmux/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/bmux/clusters` | All functional areas |
-| `gitnexus://repo/bmux/processes` | All execution flows |
-| `gitnexus://repo/bmux/process/{name}` | Step-by-step execution trace |
-
-## Self-Check Before Finishing
-
-Before completing any code modification task, verify:
-1. `gitnexus_impact` was run for all modified symbols
-2. No HIGH/CRITICAL risk warnings were ignored
-3. `gitnexus_detect_changes()` confirms changes match expected scope
-4. All d=1 (WILL BREAK) dependents were updated
-
-## Keeping the Index Fresh
-
-After committing code changes, the GitNexus index becomes stale. Re-run analyze to update it:
-
-```bash
-npx gitnexus analyze
-```
-
-If the index previously included embeddings, preserve them by adding `--embeddings`:
-
-```bash
-npx gitnexus analyze --embeddings
-```
-
-To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.embeddings` field shows the count (0 means no embeddings). **Running analyze without `--embeddings` will delete any previously generated embeddings.**
-
-> Claude Code users: A PostToolUse hook handles this automatically after `git commit` and `git merge`.
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
