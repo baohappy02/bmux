@@ -56,6 +56,25 @@ Failure should point to:
 3. `log_path`
 4. `agent artifact list`
 
+## User-Gated Noisy Commands
+
+When the command is large or noisy and the user wants to inspect the terminal first,
+start it with a pause contract instead of immediately pulling logs back into the model:
+
+```bash
+bmux agent task run --session <sid> --pause-for-user true --cmd "cargo test" --json
+bmux agent task run-profile --session <sid> --pause-for-user true verify.ts --json
+```
+
+The response should stay compact and machine-readable:
+
+- `paused_for_user: true`
+- `next_action: "wait_for_user"`
+- `automatic_log_ingest: false`
+
+After that, stop and wait for the user.
+Only fetch `task result`, a targeted tail, or logs after the user says to continue or provides a failure snippet.
+
 ## Dev Server Loop
 
 ```bash

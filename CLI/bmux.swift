@@ -5903,7 +5903,8 @@ struct CMUXCLI {
                 let (labelOpt, rem5) = parseOption(rem4, name: "--label")
                 let (commandOpt, rem6) = parseOption(rem5, name: "--cmd")
                 let (splitOpt, rem7) = parseOption(rem6, name: "--split")
-                let (cwdOpt, remaining) = parseOption(rem7, name: "--cwd")
+                let (cwdOpt, rem8) = parseOption(rem7, name: "--cwd")
+                let (pauseForUserOpt, remaining) = parseOption(rem8, name: "--pause-for-user")
 
                 guard let sessionId = sessionOptA ?? sessionOptB else {
                     throw CLIError(message: "agent task run requires --session <id>")
@@ -5932,11 +5933,21 @@ struct CMUXCLI {
                 if let labelOpt { params["label"] = labelOpt }
                 if let splitOpt { params["split"] = splitOpt }
                 if let cwdOpt { params["cwd"] = resolvePath(cwdOpt) }
+                if let pauseForUserOpt {
+                    guard let pauseForUser = parseBoolString(pauseForUserOpt) else {
+                        throw CLIError(message: "agent task run: --pause-for-user must be true|false")
+                    }
+                    params["pause_for_user"] = pauseForUser
+                }
 
                 let payload = try client.sendV2(method: "agent.task.run", params: params)
                 let taskPayload = payload["task"] as? [String: Any] ?? [:]
                 let jobId = (taskPayload["job_id"] as? String) ?? "unknown"
-                output(payload, fallback: "OK session=\(sessionId) job=\(jobId)")
+                if (payload["paused_for_user"] as? Bool) == true {
+                    output(payload, fallback: "PAUSED session=\(sessionId) job=\(jobId) waiting_for_user=1")
+                } else {
+                    output(payload, fallback: "OK session=\(sessionId) job=\(jobId)")
+                }
 
             case "run-many":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
@@ -5946,6 +5957,7 @@ struct CMUXCLI {
                 let (windowOpt, rem4) = parseOption(rem3, name: "--window")
                 let (jobsOpt, rem5) = parseOption(rem4, name: "--jobs")
                 let (jobsFileOpt, rem6) = parseOption(rem5, name: "--jobs-file")
+                let (pauseForUserOpt, remaining) = parseOption(rem6, name: "--pause-for-user")
 
                 guard let sessionId = sessionOptA ?? sessionOptB else {
                     throw CLIError(message: "agent task run-many requires --session <id>")
@@ -5953,7 +5965,7 @@ struct CMUXCLI {
                 if jobsOpt != nil, jobsFileOpt != nil {
                     throw CLIError(message: "agent task run-many: use either --jobs or --jobs-file, not both")
                 }
-                if let unknown = rem6.first(where: { $0.hasPrefix("--") }) {
+                if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
                     throw CLIError(message: "agent task run-many: unknown flag '\(unknown)'")
                 }
 
@@ -5962,8 +5974,8 @@ struct CMUXCLI {
                     runManyObject = try decodeJSONValue(jobsOpt, label: "agent task run-many --jobs")
                 } else if let jobsFileOpt {
                     runManyObject = try decodeJSONFile(jobsFileOpt, label: "agent task run-many --jobs-file")
-                } else if let raw = rem6.first {
-                    guard rem6.count == 1 else {
+                } else if let raw = remaining.first {
+                    guard remaining.count == 1 else {
                         throw CLIError(message: "agent task run-many accepts one positional JSON payload at most")
                     }
                     runManyObject = try decodeJSONValue(raw, label: "agent task run-many payload")
@@ -5981,11 +5993,22 @@ struct CMUXCLI {
                     surfaceId: surfaceId,
                     windowId: windowId
                 )
+                var runManyParams = params
+                if let pauseForUserOpt {
+                    guard let pauseForUser = parseBoolString(pauseForUserOpt) else {
+                        throw CLIError(message: "agent task run-many: --pause-for-user must be true|false")
+                    }
+                    runManyParams["pause_for_user"] = pauseForUser
+                }
 
-                let payload = try client.sendV2(method: "agent.task.run_many", params: params)
+                let payload = try client.sendV2(method: "agent.task.run_many", params: runManyParams)
                 let groupId = (payload["group_id"] as? String) ?? "unknown"
                 let jobCount = intFromAny(payload["job_count"]) ?? 0
-                output(payload, fallback: "OK session=\(sessionId) group=\(groupId) jobs=\(jobCount)")
+                if (payload["paused_for_user"] as? Bool) == true {
+                    output(payload, fallback: "PAUSED session=\(sessionId) group=\(groupId) jobs=\(jobCount) waiting_for_user=1")
+                } else {
+                    output(payload, fallback: "OK session=\(sessionId) group=\(groupId) jobs=\(jobCount)")
+                }
 
             case "run-profile":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
@@ -5993,7 +6016,8 @@ struct CMUXCLI {
                 let (workspaceOpt, rem2) = parseOption(rem1, name: "--workspace")
                 let (surfaceOpt, rem3) = parseOption(rem2, name: "--surface")
                 let (windowOpt, rem4) = parseOption(rem3, name: "--window")
-                let (profileOpt, remaining) = parseOption(rem4, name: "--profile")
+                let (profileOpt, rem5) = parseOption(rem4, name: "--profile")
+                let (pauseForUserOpt, remaining) = parseOption(rem5, name: "--pause-for-user")
 
                 guard let sessionId = sessionOptA ?? sessionOptB else {
                     throw CLIError(message: "agent task run-profile requires --session <id>")
@@ -6020,6 +6044,12 @@ struct CMUXCLI {
                    let windowId = try normalizeWindowHandle(windowOpt, client: client) {
                     params["window_id"] = windowId
                 }
+                if let pauseForUserOpt {
+                    guard let pauseForUser = parseBoolString(pauseForUserOpt) else {
+                        throw CLIError(message: "agent task run-profile: --pause-for-user must be true|false")
+                    }
+                    params["pause_for_user"] = pauseForUser
+                }
 
                 let payload = try client.sendV2(method: "agent.task.run_profile", params: params)
                 if (payload["cached"] as? Bool) == true {
@@ -6027,7 +6057,11 @@ struct CMUXCLI {
                     output(payload, fallback: "OK session=\(sessionId) profile=\(profile) \(summary)")
                 } else {
                     let groupId = (payload["group_id"] as? String) ?? "unknown"
-                    output(payload, fallback: "OK session=\(sessionId) group=\(groupId) profile=\(profile)")
+                    if (payload["paused_for_user"] as? Bool) == true {
+                        output(payload, fallback: "PAUSED session=\(sessionId) group=\(groupId) profile=\(profile) waiting_for_user=1")
+                    } else {
+                        output(payload, fallback: "OK session=\(sessionId) group=\(groupId) profile=\(profile)")
+                    }
                 }
 
             case "logs":
@@ -9538,9 +9572,9 @@ struct CMUXCLI {
               terminal write --session <session-id> [--surface <id|ref|index>] [--text <text> | <text>]
               terminal capture --session <session-id> [--surface <id|ref|index>] [--mode tail|full|delta] [--lines <n>] [--scrollback <true|false>]
               terminal wait --session <session-id> [--surface <id|ref|index>] [--state prompt|running] [--timeout-ms <ms>]
-              task run --session <session-id> [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--cmd <command> | <command>]
-              task run-many --session <session-id> (--jobs '<json>' | --jobs-file <path> | <json>) [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
-              task run-profile --session <session-id> --profile <name>
+              task run --session <session-id> [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--pause-for-user <true|false>] [--cmd <command> | <command>]
+              task run-many --session <session-id> (--jobs '<json>' | --jobs-file <path> | <json>) [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--pause-for-user <true|false>]
+              task run-profile --session <session-id> [--pause-for-user <true|false>] --profile <name>
               task logs --session <session-id> --job <job-id> [--mode tail|delta|path-only] [--lines <n>] [--bytes <n>] [--cursor <n>]
               task cancel --session <session-id> --job <job-id>
               task wait --session <session-id> --job <job-id> [--timeout-ms <ms>]
@@ -9584,6 +9618,7 @@ struct CMUXCLI {
               - `surface-read` returns a compact metadata snapshot for the target surface.
               - `terminal` wraps low-token terminal input/capture/wait primitives.
               - `task` runs managed shell commands or named profiles in bmux terminals and returns compact status.
+              - `task ... --pause-for-user true` starts noisy work but returns a compact wait-for-user contract instead of encouraging immediate log ingestion.
               - `events` streams cursor-based task and service events.
               - `state summary` returns the minimal server-side memory Codex needs to resume work cheaply.
               - `artifact list` returns compact metadata for job logs and other saved artifacts.

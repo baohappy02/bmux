@@ -4505,6 +4505,7 @@ class TerminalController {
         let approvalState = v2String(params, "approval_state")
         let workspaceFingerprint = v2String(params, "workspace_fingerprint")
         let cacheEligible = v2Bool(params, "cache_eligible") ?? false
+        let pauseForUser = v2Bool(params, "pause_for_user") ?? false
         let expectedPorts = v2StrictIntArray(params, "expected_ports") ?? []
         if let splitRaw, parseSplitDirection(splitRaw) == nil {
             return .err(code: "invalid_params", message: "Missing or invalid split (left|right|up|down)", data: [
@@ -4745,6 +4746,12 @@ class TerminalController {
             if let visibilityGuardPayload {
                 payload["visibility_guard"] = visibilityGuardPayload
             }
+            if pauseForUser {
+                self.v2AgentApplyPauseForUserContract(
+                    &payload,
+                    summary: "task started; waiting for user follow-up"
+                )
+            }
             result = .ok(payload)
         }
         return result
@@ -4776,6 +4783,7 @@ class TerminalController {
                 "profile": profileName
             ])
         }
+        let pauseForUser = v2Bool(params, "pause_for_user") ?? false
 
         let workspaceFingerprint = v2AgentWorkspaceFingerprint(
             context: context,
@@ -4873,7 +4881,7 @@ class TerminalController {
             ]
         )
 
-        return .ok([
+        var payload: [String: Any] = [
             "ok": true,
             "session_id": sessionId,
             "group_id": groupId,
@@ -4893,7 +4901,14 @@ class TerminalController {
             "health_expect_text": v2OrNull(profile.healthExpectText),
             "jobs": jobPayloads,
             "event_cursor": v2AgentCurrentEventCursor()
-        ])
+        ]
+        if pauseForUser {
+            v2AgentApplyPauseForUserContract(
+                &payload,
+                summary: "profile started; waiting for user follow-up"
+            )
+        }
+        return .ok(payload)
     }
 
     private func v2AgentTaskRunMany(params: [String: Any]) -> V2CallResult {
@@ -4912,6 +4927,7 @@ class TerminalController {
         guard !jobs.isEmpty else {
             return .err(code: "invalid_state", message: "jobs must not be empty", data: ["session_id": sessionId])
         }
+        let pauseForUser = v2Bool(params, "pause_for_user") ?? false
 
         let groupId = "group:\(v2AgentNextGroupOrdinal)"
         v2AgentNextGroupOrdinal += 1
@@ -4978,14 +4994,21 @@ class TerminalController {
             }
         }
 
-        return .ok([
+        var payload: [String: Any] = [
             "ok": true,
             "session_id": sessionId,
             "group_id": groupId,
             "jobs": jobPayloads,
             "job_count": jobPayloads.count,
             "event_cursor": v2AgentCurrentEventCursor()
-        ])
+        ]
+        if pauseForUser {
+            v2AgentApplyPauseForUserContract(
+                &payload,
+                summary: "tasks started; waiting for user follow-up"
+            )
+        }
+        return .ok(payload)
     }
 
     private func v2AgentJobsArray(from raw: Any?) -> [[String: Any]]? {
@@ -7878,6 +7901,17 @@ class TerminalController {
             payload["retry"] = retryPayload
         }
         return payload
+    }
+
+    private func v2AgentApplyPauseForUserContract(
+        _ payload: inout [String: Any],
+        summary: String
+    ) {
+        payload["summary"] = summary
+        payload["paused_for_user"] = true
+        payload["next_action"] = "wait_for_user"
+        payload["resume_condition"] = "user_confirmation_or_failure_snippet"
+        payload["automatic_log_ingest"] = false
     }
 
     private func v2AgentISO8601String(_ date: Date) -> String {
