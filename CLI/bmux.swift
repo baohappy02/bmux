@@ -316,6 +316,7 @@ private struct ClaudeHookParsedInput {
     let sessionId: String?
     let cwd: String?
     let transcriptPath: String?
+    let promptText: String?
 }
 
 private struct ClaudeHookSessionRecord: Codable {
@@ -327,6 +328,7 @@ private struct ClaudeHookSessionRecord: Codable {
     var lastSubtitle: String?
     var lastBody: String?
     var lastRequest: String?
+    var instructionFingerprint: String?
     var startedAt: TimeInterval
     var updatedAt: TimeInterval
 }
@@ -334,6 +336,12 @@ private struct ClaudeHookSessionRecord: Codable {
 private struct ClaudeHookSessionStoreFile: Codable {
     var version: Int = 1
     var sessions: [String: ClaudeHookSessionRecord] = [:]
+}
+
+private struct CodexHookInstructionSnapshot {
+    let fingerprint: String
+    let trackedPaths: [String]
+    let latestModifiedAt: TimeInterval?
 }
 
 private final class ClaudeHookSessionStore {
@@ -375,7 +383,8 @@ private final class ClaudeHookSessionStore {
         pid: Int? = nil,
         lastSubtitle: String? = nil,
         lastBody: String? = nil,
-        lastRequest: String? = nil
+        lastRequest: String? = nil,
+        instructionFingerprint: String? = nil
     ) throws {
         let normalized = normalizeSessionId(sessionId)
         guard !normalized.isEmpty else { return }
@@ -390,6 +399,7 @@ private final class ClaudeHookSessionStore {
                 lastSubtitle: nil,
                 lastBody: nil,
                 lastRequest: nil,
+                instructionFingerprint: nil,
                 startedAt: now,
                 updatedAt: now
             )
@@ -411,6 +421,9 @@ private final class ClaudeHookSessionStore {
             }
             if let request = normalizeOptional(lastRequest) {
                 record.lastRequest = request
+            }
+            if let instructionFingerprint = normalizeOptional(instructionFingerprint) {
+                record.instructionFingerprint = instructionFingerprint
             }
             record.updatedAt = now
             state.sessions[normalized] = record
@@ -5037,7 +5050,6 @@ struct CMUXCLI {
                 toolArgs += ["--limit", String(limit)]
             }
 
-            _ = try runAgentIntelTool(command: "seed-default-skills", args: toolArgs)
             let payload = try runAgentIntelTool(
                 command: "search-skills",
                 args: toolArgs + ["--query", query]
@@ -14367,19 +14379,28 @@ struct CMUXCLI {
                 normalizedSingleLine(redactClaudeSensitiveSpans(trimmed)),
                 maxLength: 180
             )
-            return ClaudeHookParsedInput(object: nil, rawFallback: fallback, sessionId: nil, cwd: nil, transcriptPath: nil)
+            return ClaudeHookParsedInput(
+                object: nil,
+                rawFallback: fallback,
+                sessionId: nil,
+                cwd: nil,
+                transcriptPath: nil,
+                promptText: fallback
+            )
         }
 
         let sessionId = extractClaudeHookSessionId(from: object)
         let cwd = extractClaudeHookCWD(from: object)
         let transcriptPath = firstString(in: object, keys: ["transcript_path", "transcriptPath"])
+        let promptText = extractClaudeHookPromptText(from: object)
         let compactObject = compactClaudeHookObject(object)
         return ClaudeHookParsedInput(
             object: compactObject,
             rawFallback: nil,
             sessionId: sessionId,
             cwd: cwd,
-            transcriptPath: transcriptPath
+            transcriptPath: transcriptPath,
+            promptText: promptText
         )
     }
 
@@ -14551,6 +14572,188 @@ struct CMUXCLI {
             return cwd
         }
         return nil
+    }
+
+    private func extractClaudeHookPromptText(from object: [String: Any]) -> String? {
+        let promptKeys = ["message", "prompt", "text", "body", "description"]
+        let prompt = [
+            firstString(in: object, keys: promptKeys),
+            firstString(in: object["data"] as? [String: Any] ?? [:], keys: promptKeys),
+            firstString(in: object["notification"] as? [String: Any] ?? [:], keys: promptKeys)
+        ]
+        .compactMap { $0 }
+        .first
+
+        guard let prompt else { return nil }
+        let normalized = normalizedSingleLine(prompt)
+        guard !normalized.isEmpty else { return nil }
+        return truncate(normalized, maxLength: 1600)
+    }
+
+    private func codexHookRepositoryRoot(startingAt directory: String?) -> String? {
+        guard var currentPath = agentIntelNormalizedPath(directory) else { return nil }
+        let fileManager = FileManager.default
+
+        while true {
+            let gitPath = (currentPath as NSString).appendingPathComponent(".git")
+            if fileManager.fileExists(atPath: gitPath) {
+                return currentPath
+            }
+
+            let parentPath = (currentPath as NSString).deletingLastPathComponent
+            if parentPath.isEmpty || parentPath == currentPath {
+                break
+            }
+            currentPath = parentPath
+        }
+
+        return nil
+    }
+
+    private func codexHookCanonicalInstructionPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private func codexHookProjectInstructionPaths(cwd: String?) -> [String] {
+        guard var currentPath = agentIntelNormalizedPath(cwd) else { return [] }
+        let repoRoot = codexHookRepositoryRoot(startingAt: currentPath)
+        let fileManager = FileManager.default
+        var paths: [String] = []
+        var seen = Set<String>()
+
+        while true {
+            for fileName in ["AGENTS.md", "CLAUDE.md"] {
+                let candidate = (currentPath as NSString).appendingPathComponent(fileName)
+                guard fileManager.fileExists(atPath: candidate) else { continue }
+                let canonical = codexHookCanonicalInstructionPath(candidate)
+                if seen.insert(canonical).inserted {
+                    paths.append(candidate)
+                }
+            }
+
+            if let repoRoot, currentPath == repoRoot {
+                break
+            }
+
+            let parentPath = (currentPath as NSString).deletingLastPathComponent
+            if parentPath.isEmpty || parentPath == currentPath {
+                break
+            }
+            currentPath = parentPath
+        }
+
+        return paths.sorted()
+    }
+
+    private func codexHookSkillPaths(processEnv: [String: String]) -> [String] {
+        let fileManager = FileManager.default
+        guard let skillsRoot = agentIntelNormalizedPath(processEnv["CODEX_HOME"] ?? "~/.codex"),
+              fileManager.fileExists(atPath: skillsRoot) else {
+            return []
+        }
+
+        let rootURL = URL(fileURLWithPath: skillsRoot, isDirectory: true)
+        let skillsURL = rootURL.appendingPathComponent("skills", isDirectory: true)
+        guard fileManager.fileExists(atPath: skillsURL.path),
+              let enumerator = fileManager.enumerator(
+                  at: skillsURL,
+                  includingPropertiesForKeys: nil,
+                  options: [.skipsPackageDescendants]
+              ) else {
+            return []
+        }
+
+        var paths: [String] = []
+        for case let fileURL as URL in enumerator where fileURL.lastPathComponent == "SKILL.md" {
+            paths.append(fileURL.path)
+        }
+        return paths.sorted()
+    }
+
+    private func codexHookTrackedInstructionPaths(
+        cwd: String?,
+        processEnv: [String: String]
+    ) -> [String] {
+        if let override = processEnv["CMUX_CODEX_HOOK_TRACKED_PATHS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !override.isEmpty {
+            let overridePaths = override
+                .split(separator: ":")
+                .compactMap { agentIntelNormalizedPath(String($0)) }
+            return Array(Set(overridePaths)).sorted()
+        }
+
+        let globalAgents = agentIntelNormalizedPath((processEnv["CODEX_HOME"] ?? "~/.codex") + "/AGENTS.md")
+        let paths = codexHookProjectInstructionPaths(cwd: cwd)
+            + (globalAgents.map { [$0] } ?? [])
+            + codexHookSkillPaths(processEnv: processEnv)
+        return Array(Set(paths)).sorted()
+    }
+
+    private func codexHookInstructionSnapshot(
+        cwd: String?,
+        processEnv: [String: String]
+    ) -> CodexHookInstructionSnapshot? {
+        let fileManager = FileManager.default
+        let trackedPaths = codexHookTrackedInstructionPaths(cwd: cwd, processEnv: processEnv)
+        guard !trackedPaths.isEmpty else { return nil }
+
+        let formatter = ISO8601DateFormatter()
+        var latestModifiedAt: TimeInterval?
+        var payload: [String: Any] = [:]
+
+        for path in trackedPaths {
+            let normalizedPath = agentIntelNormalizedPath(path) ?? path
+            guard fileManager.fileExists(atPath: normalizedPath) else {
+                payload[normalizedPath] = ["exists": false]
+                continue
+            }
+
+            let attributes = try? fileManager.attributesOfItem(atPath: normalizedPath)
+            let modifiedAtDate = attributes?[.modificationDate] as? Date
+            let modifiedAt = modifiedAtDate?.timeIntervalSince1970
+            let size = (attributes?[.size] as? NSNumber)?.intValue
+            if let modifiedAt {
+                latestModifiedAt = max(latestModifiedAt ?? modifiedAt, modifiedAt)
+            }
+
+            payload[normalizedPath] = [
+                "exists": true,
+                "mtime": modifiedAtDate.map { formatter.string(from: $0) as Any } ?? NSNull(),
+                "size": size.map { $0 as Any } ?? NSNull(),
+                "sha256": (try? sha256Hex(forFile: URL(fileURLWithPath: normalizedPath))).map { $0 as Any } ?? NSNull()
+            ]
+        }
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return nil
+        }
+        let digest = SHA256.hash(data: data)
+        let fingerprint = "instructions:" + digest.map { String(format: "%02x", $0) }.joined()
+        return CodexHookInstructionSnapshot(
+            fingerprint: fingerprint,
+            trackedPaths: trackedPaths,
+            latestModifiedAt: latestModifiedAt
+        )
+    }
+
+    private func codexHookShouldRefreshInstructions(
+        snapshot: CodexHookInstructionSnapshot?,
+        sessionRecord: ClaudeHookSessionRecord?
+    ) -> Bool {
+        guard let snapshot,
+              let sessionRecord else {
+            return false
+        }
+        if let previousFingerprint = sessionRecord.instructionFingerprint,
+           !previousFingerprint.isEmpty {
+            return previousFingerprint != snapshot.fingerprint
+        }
+        guard let latestModifiedAt = snapshot.latestModifiedAt else {
+            return false
+        }
+        return latestModifiedAt > (sessionRecord.startedAt + 0.001)
     }
 
     private func summarizeClaudeHookStop(
@@ -15280,9 +15483,121 @@ struct CMUXCLI {
         return (subtitle, "Codex session completed")
     }
 
-    /// Codex validates hook stdout against a strict event schema with
-    /// additionalProperties=false, so bmux must keep this payload minimal.
-    /// The real user-facing work happens via bmux notifications and sidebar status.
+    private static let codexHookReplayPrefix = "[bmux-refresh]"
+
+    private func codexHookReplayablePromptText(_ parsedInput: ClaudeHookParsedInput) -> String? {
+        let prompt = parsedInput.promptText ?? parsedInput.rawFallback
+        guard let prompt else { return nil }
+        let normalized = normalizedSingleLine(prompt)
+        guard !normalized.isEmpty else { return nil }
+        return truncate(normalized, maxLength: 1200)
+    }
+
+    private func codexHookReplayOriginalRequest(from prompt: String?) -> String? {
+        guard let prompt else { return nil }
+        let normalized = normalizedSingleLine(prompt)
+        guard normalized.hasPrefix(Self.codexHookReplayPrefix) else {
+            return nil
+        }
+        let marker = "original user request:"
+        let lower = normalized.lowercased()
+        guard let range = lower.range(of: marker) else {
+            return nil
+        }
+        let original = normalized[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !original.isEmpty else { return nil }
+        return original
+    }
+
+    private func codexHookRequestSummary(_ parsedInput: ClaudeHookParsedInput) -> String? {
+        if let replayOriginal = codexHookReplayOriginalRequest(from: parsedInput.promptText),
+           !replayOriginal.isEmpty {
+            return truncate(replayOriginal, maxLength: 90)
+        }
+        return codexHookPromptSummary(parsedInput)
+    }
+
+    private func codexHookRefreshStatus(cwd: String?, replayed: Bool) -> String {
+        let projectName = hookProjectName(cwd: cwd)
+        if let projectName {
+            return replayed ? "Refreshing in \(projectName)" : "Refresh needed in \(projectName)"
+        }
+        return replayed ? "Refreshing instructions" : "Refresh needed"
+    }
+
+    private func codexHookRefreshNotificationBody(
+        snapshot: CodexHookInstructionSnapshot?,
+        replayed: Bool
+    ) -> String {
+        let trackedCount = snapshot?.trackedPaths.count ?? 0
+        if replayed {
+            return trackedCount > 0
+                ? "Detected updated instructions or skills and replayed the prompt with the new context (\(trackedCount) tracked files)."
+                : "Detected updated instructions or skills and replayed the prompt with the new context."
+        }
+        return trackedCount > 0
+            ? "Detected updated instructions or skills. Re-send the prompt to continue with the new context (\(trackedCount) tracked files)."
+            : "Detected updated instructions or skills. Re-send the prompt to continue with the new context."
+    }
+
+    private func codexHookReplayPrompt(for originalPrompt: String) -> String {
+        "\(Self.codexHookReplayPrefix) Re-read the latest repo and global instructions from disk before answering. Then continue with the original user request: \(originalPrompt)"
+    }
+
+    private func codexHookCanAutoReplay(prompt: String?, processEnv: [String: String]) -> Bool {
+        guard processEnv["CMUX_CODEX_HOOK_AUTO_REPLAY_DISABLED"] != "1",
+              let prompt,
+              !prompt.isEmpty,
+              prompt.count <= 1200 else {
+            return false
+        }
+        return !prompt.unicodeScalars.contains(where: { scalar in
+            switch scalar.value {
+            case 0x0A, 0x0D, 0x09, 0x1B, 0x7F:
+                return true
+            default:
+                return false
+            }
+        })
+    }
+
+    private func codexHookReplayPrompt(
+        client: SocketClient,
+        workspaceId: String,
+        surfaceId: String,
+        prompt: String
+    ) -> Bool {
+        guard !prompt.isEmpty else { return false }
+        let textPayload: [String: Any] = [
+            "workspace_id": workspaceId,
+            "surface_id": surfaceId,
+            "text": prompt
+        ]
+        let keyPayload: [String: Any] = [
+            "workspace_id": workspaceId,
+            "surface_id": surfaceId,
+            "key": "enter"
+        ]
+
+        guard (try? client.sendV2(method: "surface.send_text", params: textPayload)) != nil else {
+            return false
+        }
+        guard (try? client.sendV2(method: "surface.send_key", params: keyPayload)) != nil else {
+            return false
+        }
+        return true
+    }
+
+    private func codexHookRefreshDefaultSkillsIfNeeded(processEnv: [String: String]) {
+        guard processEnv["CMUX_CODEX_HOOK_DISABLE_INTEL_REFRESH"] != "1" else {
+            return
+        }
+        _ = try? runAgentIntelTool(command: "seed-default-skills", args: [])
+    }
+
+    /// Codex validates hook stdout against a strict event schema. Keep the payload
+    /// minimal: continue hooks return the legacy quiet object, while block hooks
+    /// return only the decision and reason.
     private func printCodexHookOutput(suppressOutput: Bool = true) {
         let payload: [String: Any] = [
             "continue": true,
@@ -15293,6 +15608,22 @@ struct CMUXCLI {
               let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else {
             print("{\"continue\":true,\"suppressOutput\":true}")
+            return
+        }
+        print(text)
+    }
+
+    private func printCodexHookBlockOutput(reason: String) {
+        let trimmedReason = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        let payload: [String: Any] = [
+            "decision": "block",
+            "reason": trimmedReason.isEmpty ? "bmux requested a prompt refresh because instructions changed." : trimmedReason
+        ]
+
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let text = String(data: data, encoding: .utf8) else {
+            print("{\"decision\":\"block\",\"reason\":\"bmux requested a prompt refresh because instructions changed.\"}")
             return
         }
         print(text)
@@ -15354,12 +15685,17 @@ struct CMUXCLI {
                 workspaceId: workspaceId,
                 client: client
             )
+            let instructionSnapshot = codexHookInstructionSnapshot(
+                cwd: parsedInput.cwd,
+                processEnv: env
+            )
             if let sessionId = parsedInput.sessionId {
                 try? sessionStore.upsert(
                     sessionId: sessionId,
                     workspaceId: workspaceId,
                     surfaceId: surfaceId,
-                    cwd: parsedInput.cwd
+                    cwd: parsedInput.cwd,
+                    instructionFingerprint: instructionSnapshot?.fingerprint
                 )
             }
             let statusValue = codexReadyStatus(cwd: parsedInput.cwd)
@@ -15386,14 +15722,81 @@ struct CMUXCLI {
                 workspaceId: workspaceId,
                 client: client
             )
-            let requestSummary = codexHookPromptSummary(parsedInput)
+            let effectiveCWD = parsedInput.cwd ?? mappedSession?.cwd
+            let instructionSnapshot = codexHookInstructionSnapshot(
+                cwd: effectiveCWD,
+                processEnv: env
+            )
+            let requestSummary = codexHookRequestSummary(parsedInput)
+            let shouldRefresh = codexHookShouldRefreshInstructions(
+                snapshot: instructionSnapshot,
+                sessionRecord: mappedSession
+            )
+            if shouldRefresh {
+                telemetry.breadcrumb(
+                    "codex-hook.prompt-submit.refresh",
+                    data: ["tracked_files": instructionSnapshot?.trackedPaths.count ?? 0]
+                )
+                codexHookRefreshDefaultSkillsIfNeeded(processEnv: env)
+                let replayablePrompt = codexHookReplayablePromptText(parsedInput)
+                let replayPrompt = replayablePrompt.map { prompt in
+                    codexHookReplayPrompt(for: prompt)
+                }
+                let canReplay = codexHookCanAutoReplay(prompt: replayablePrompt, processEnv: env)
+                let replayed = canReplay && replayPrompt.map {
+                    codexHookReplayPrompt(
+                        client: client,
+                        workspaceId: workspaceId,
+                        surfaceId: surfaceId,
+                        prompt: $0
+                    )
+                } == true
+
+                if let sessionId = parsedInput.sessionId {
+                    try? sessionStore.upsert(
+                        sessionId: sessionId,
+                        workspaceId: workspaceId,
+                        surfaceId: surfaceId,
+                        cwd: effectiveCWD,
+                        lastRequest: requestSummary,
+                        instructionFingerprint: instructionSnapshot?.fingerprint
+                    )
+                }
+
+                let refreshStatus = codexHookRefreshStatus(cwd: effectiveCWD, replayed: replayed)
+                try? setCodexStatus(
+                    client: client,
+                    workspaceId: workspaceId,
+                    value: refreshStatus,
+                    icon: "arrow.triangle.2.circlepath",
+                    color: "#F5A623"
+                )
+                _ = try? client.sendV2(
+                    method: "notification.create_for_target",
+                    params: [
+                        "workspace_id": workspaceId,
+                        "surface_id": surfaceId,
+                        "title": "Codex",
+                        "subtitle": replayed ? "Instructions refreshed" : "Instructions updated",
+                        "body": sanitizeNotificationField(
+                            codexHookRefreshNotificationBody(snapshot: instructionSnapshot, replayed: replayed)
+                        )
+                    ]
+                )
+                let reason = replayed
+                    ? "bmux detected updated instructions or skills, refreshed the session, and replayed your prompt once."
+                    : "bmux detected updated instructions or skills. Re-send your prompt to continue with the new context."
+                printCodexHookBlockOutput(reason: reason)
+                return
+            }
             if let sessionId = parsedInput.sessionId {
                 try? sessionStore.upsert(
                     sessionId: sessionId,
                     workspaceId: workspaceId,
                     surfaceId: surfaceId,
-                    cwd: parsedInput.cwd ?? mappedSession?.cwd,
-                    lastRequest: requestSummary
+                    cwd: effectiveCWD,
+                    lastRequest: requestSummary,
+                    instructionFingerprint: instructionSnapshot?.fingerprint
                 )
             }
             _ = try? sendV1Command("clear_notifications --tab=\(workspaceId)", client: client)

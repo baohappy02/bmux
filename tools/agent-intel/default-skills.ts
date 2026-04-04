@@ -26,6 +26,60 @@ Stop conditions
 - If \`verify.ts\` is unavailable, inspect \`bmux agent capabilities\` for profiles and package manager first.`,
   },
   {
+    slug: "coding-principles",
+    scope: "global",
+    status: "active",
+    origin: "manual",
+    title: "Coding principles before and after edits",
+    summary:
+      "Treat code work as production work: inspect impact, keep one source of truth, handle failures explicitly, and verify behavior with tools.",
+    tags: ["coding-principles", "quality", "review", "ssot", "impact", "verify"],
+    contentMarkdown: `When to use
+- You are reading code with intent to change it, reviewing a fix, or verifying behavior after an edit.
+
+Steps
+1. If the change touches shared code, inspect \`bmux agent code context|impact|changes --session <sid> ... --json\` first.
+2. Prefer the simplest change that keeps one source of truth across code, config, docs, and instruction surfaces.
+3. Keep failure paths explicit. Do not swallow errors or hide invariants behind force unwraps or bare catches.
+4. Preserve readability: clear names, no dead code, and comments only for why.
+5. Verify with the smallest useful tool loop before declaring success.
+
+Verify
+- State what you verified and what you could not verify.
+- Treat instruction drift, config drift, and copy drift as engineering risk when they can mislead humans or agents.
+
+Stop conditions
+- If code intel is unavailable, fall back to scoped source reads and say so explicitly.`,
+  },
+  {
+    slug: "bmux-managed-terminal-tasks",
+    scope: "global",
+    status: "active",
+    origin: "manual",
+    title: "Use bmux managed terminals for noisy commands",
+    summary:
+      "Run builds, tests, and dev servers in bmux task or terminal surfaces, prefer pause-for-user when the user should inspect the terminal, and keep logs compact.",
+    tags: ["bmux-agent", "terminal", "task", "test", "build", "dev-server", "pause-for-user", "low-token"],
+    contentMarkdown: `When to use
+- You need to run tests, builds, installs, migrations, benchmarks, or dev servers from bmux.
+
+Steps
+1. Attach once and read \`bmux agent capabilities --session <sid> --json\`.
+2. Reuse an existing terminal surface when possible. If the user needs a visible terminal, open or ensure one with \`bmux agent open\` or \`bmux agent ensure\`.
+3. For managed execution, prefer \`bmux agent task run\` or \`bmux agent task run-profile\`.
+4. If the user wants to inspect the terminal before the agent continues, pass \`--pause-for-user true\` and stop after the compact task payload.
+5. Wait with \`bmux agent task wait\`, then read \`bmux agent task result\`.
+6. Only fetch \`task logs\` or artifacts if the task failed or the user asked for them.
+
+Verify
+- Keep output compact and prefer task result over raw terminal capture.
+- If a split is refused by the visibility guard, accept the fallback tab or surface instead of forcing more panes.
+
+Stop conditions
+- If there is no live session, attach first.
+- If no visible surface can be ensured, keep the command attached instead of launching an unobserved detached job.`,
+  },
+  {
     slug: "search-then-rg",
     scope: "global",
     status: "active",
@@ -126,3 +180,52 @@ Stop conditions
 - If the session was recovered onto a different layout, refresh layout once and continue from the new cursor.`,
   },
 ];
+
+const REQUIRED_DEFAULT_SKILL_SLUGS = ["coding-principles", "bmux-managed-terminal-tasks"] as const;
+
+function stableDefaultRepoRoot(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+export function validateDefaultSkills(skills: SkillInput[] = DEFAULT_SKILLS): void {
+  const seenKeys = new Set<string>();
+  const availableSlugs = new Set<string>();
+
+  for (const skill of skills) {
+    const slug = skill.slug.trim();
+    const title = skill.title.trim();
+    const summary = skill.summary.trim();
+    const contentMarkdown = skill.contentMarkdown.trim();
+    const repoRoot = stableDefaultRepoRoot(skill.repoRoot);
+    const key = [skill.scope, repoRoot ?? "", slug].join(":");
+
+    if (!slug) {
+      throw new Error("Default skill catalog contains an empty slug");
+    }
+    if (!title) {
+      throw new Error(`Default skill '${slug}' is missing a title`);
+    }
+    if (!summary) {
+      throw new Error(`Default skill '${slug}' is missing a summary`);
+    }
+    if (!contentMarkdown) {
+      throw new Error(`Default skill '${slug}' is missing contentMarkdown`);
+    }
+    if (skill.scope === "global" && repoRoot) {
+      throw new Error(`Global default skill '${slug}' must not set repoRoot`);
+    }
+    if (seenKeys.has(key)) {
+      throw new Error(`Default skill catalog contains a duplicate identity: ${key}`);
+    }
+
+    seenKeys.add(key);
+    availableSlugs.add(slug);
+  }
+
+  for (const slug of REQUIRED_DEFAULT_SKILL_SLUGS) {
+    if (!availableSlugs.has(slug)) {
+      throw new Error(`Default skill catalog is missing required slug '${slug}'`);
+    }
+  }
+}

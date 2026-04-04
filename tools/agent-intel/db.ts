@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
-import { DEFAULT_SKILLS } from "./default-skills";
+import { DEFAULT_SKILLS, validateDefaultSkills } from "./default-skills";
 import type {
   AgentIntelMetrics,
   EvaluationDecision,
@@ -740,10 +740,12 @@ export function listSkills(
   const limit = Math.max(1, Math.min(options.limit ?? 20, 100));
   const filters: string[] = [];
   const params: unknown[] = [];
+  const orderParams: unknown[] = [];
 
   if (repoRoot) {
-    filters.push("AND s.repo_root = ?");
+    filters.push("AND (s.repo_root = ? OR s.repo_root = '')");
     params.push(repoRoot);
+    orderParams.push(repoRoot);
   }
   if (status) {
     filters.push("AND s.status = ?");
@@ -753,6 +755,7 @@ export function listSkills(
   const query = `
     ${latestSkillVersionRowQuery(filters.join("\n"))}
     ORDER BY
+      ${repoRoot ? "CASE WHEN s.repo_root = ? THEN 0 ELSE 1 END," : ""}
       CASE s.status
         WHEN 'active' THEN 1
         WHEN 'canary' THEN 2
@@ -765,7 +768,7 @@ export function listSkills(
     LIMIT ?
   `;
 
-  const rows = db.query(query).all(...params, limit) as SkillVersionRow[];
+  const rows = db.query(query).all(...params, ...orderParams, limit) as SkillVersionRow[];
   return rows.map(mapSkillVersionRow);
 }
 
@@ -890,6 +893,8 @@ export function seedDefaultSkills(db: Database): {
   skipped: number;
   skillIds: string[];
 } {
+  validateDefaultSkills();
+
   let inserted = 0;
   let updated = 0;
   let skipped = 0;

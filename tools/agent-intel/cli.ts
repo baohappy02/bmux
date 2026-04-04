@@ -120,11 +120,13 @@ async function main(): Promise<void> {
   switch (command) {
     case "status": {
       const ingestResult = ingest();
+      const defaults = seedDefaultSkills(db);
       console.log(
         JSON.stringify(
           {
             ok: true,
             ingest: ingestResult,
+            defaults,
             status: databaseStatus(db, { queuePath }),
           },
           null,
@@ -231,12 +233,13 @@ async function main(): Promise<void> {
 
     case "list-skills": {
       const ingestResult = ingest();
+      const defaults = seedDefaultSkills(db);
       const repoRoot = flags.get("repo-root") || null;
       const status = (flags.get("status") || null) as SkillStatus | null;
       const limit = numberFlag(flags, "limit", 20);
       const skills = listSkills(db, { repoRoot, status, limit });
       console.log(
-        JSON.stringify({ ok: true, ingest: ingestResult, count: skills.length, skills }, null, 2)
+        JSON.stringify({ ok: true, ingest: ingestResult, defaults, count: skills.length, skills }, null, 2)
       );
       return;
     }
@@ -251,6 +254,7 @@ async function main(): Promise<void> {
 
     case "search-skills": {
       const ingestResult = ingest();
+      const defaults = seedDefaultSkills(db);
       const query = flags.get("query");
       if (!query) {
         throw new Error("Missing --query");
@@ -259,7 +263,7 @@ async function main(): Promise<void> {
       const limit = numberFlag(flags, "limit", 5);
       const hits = searchSkills(db, { query, repoRoot, limit });
       console.log(
-        JSON.stringify({ ok: true, ingest: ingestResult, count: hits.length, hits }, null, 2)
+        JSON.stringify({ ok: true, ingest: ingestResult, defaults, count: hits.length, hits }, null, 2)
       );
       return;
     }
