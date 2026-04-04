@@ -14748,7 +14748,7 @@ struct CMUXCLI {
     private func codexHookCommand(_ event: String) -> String {
         let cliPath = resolvedExecutableURL()?.path ?? "bmux"
         let quotedPath = shellQuote(cliPath)
-        return "[ -n \"$CMUX_SURFACE_ID\" ] && [ -x \(quotedPath) ] && \(quotedPath) codex-hook \(event) || echo '{}'"
+        return "[ -n \"$CMUX_SURFACE_ID\" ] && [ -x \(quotedPath) ] && \(quotedPath) codex-hook \(event) || echo '{\"continue\":true,\"suppressOutput\":true}'"
     }
 
     private func codexHooksJSON() -> [String: Any] {
@@ -14758,6 +14758,7 @@ struct CMUXCLI {
                     "hooks": [[
                         "type": "command",
                         "command": codexHookCommand("session-start"),
+                        "statusMessage": "Syncing bmux session",
                         "timeout": 10
                     ] as [String: Any]]
                 ] as [String: Any]],
@@ -14765,6 +14766,7 @@ struct CMUXCLI {
                     "hooks": [[
                         "type": "command",
                         "command": codexHookCommand("prompt-submit"),
+                        "statusMessage": "Updating bmux status",
                         "timeout": 10
                     ] as [String: Any]]
                 ] as [String: Any]],
@@ -14772,6 +14774,7 @@ struct CMUXCLI {
                     "hooks": [[
                         "type": "command",
                         "command": codexHookCommand("stop"),
+                        "statusMessage": "Finalizing bmux session",
                         "timeout": 10
                     ] as [String: Any]]
                 ] as [String: Any]]
@@ -14781,6 +14784,7 @@ struct CMUXCLI {
 
     /// Identifier used to detect bmux-owned hooks during uninstall.
     private static let codexHookCommandMarker = "codex-hook"
+    private static let codexHookSurfaceGuardMarker = "CMUX_SURFACE_ID"
 
     private func runCodexInstallHooks() throws {
         let skipConfirm = ProcessInfo.processInfo.arguments.contains("--yes")
@@ -14812,12 +14816,8 @@ struct CMUXCLI {
         for (eventName, bmuxGroups) in bmuxHooks {
             guard let bmuxGroupArray = bmuxGroups as? [[String: Any]] else { continue }
             var eventGroups = hooks[eventName] as? [[String: Any]] ?? []
-            eventGroups.removeAll { group in
-                guard let groupHooks = group["hooks"] as? [[String: Any]] else { return false }
-                return groupHooks.allSatisfy { hook in
-                    (hook["command"] as? String)?.contains(Self.codexHookCommandMarker) == true
-                }
-            }
+            let (sanitizedGroups, _) = sanitizeCodexHookGroups(eventGroups)
+            eventGroups = sanitizedGroups
             eventGroups.append(contentsOf: bmuxGroupArray)
             hooks[eventName] = eventGroups
         }
@@ -14916,16 +14916,11 @@ struct CMUXCLI {
 
         // Build the new state without bmux hooks
         var removedCount = 0
-        for eventName in hooks.keys {
+        for eventName in Array(hooks.keys) {
             guard var eventGroups = hooks[eventName] as? [[String: Any]] else { continue }
-            let before = eventGroups.count
-            eventGroups.removeAll { group in
-                guard let groupHooks = group["hooks"] as? [[String: Any]] else { return false }
-                return groupHooks.allSatisfy { hook in
-                    (hook["command"] as? String)?.contains(Self.codexHookCommandMarker) == true
-                }
-            }
-            removedCount += before - eventGroups.count
+            let (sanitizedGroups, removedHooks) = sanitizeCodexHookGroups(eventGroups)
+            eventGroups = sanitizedGroups
+            removedCount += removedHooks
             if eventGroups.isEmpty {
                 hooks.removeValue(forKey: eventName)
             } else {
@@ -15118,6 +15113,40 @@ struct CMUXCLI {
         return lines.joined(separator: "\n")
     }
 
+    /// Strip bmux-owned Codex hooks from mixed groups so reinstall/uninstall
+    /// does not leave duplicate hook commands behind.
+    private func sanitizeCodexHookGroups(_ groups: [[String: Any]]) -> ([[String: Any]], Int) {
+        var sanitized: [[String: Any]] = []
+        var removedCount = 0
+
+        for var group in groups {
+            guard let groupHooks = group["hooks"] as? [[String: Any]] else {
+                sanitized.append(group)
+                continue
+            }
+
+            let filteredHooks = groupHooks.filter { hook in
+                let isBmuxHook = isBmuxManagedCodexHookCommand(hook["command"] as? String)
+                if isBmuxHook {
+                    removedCount += 1
+                }
+                return !isBmuxHook
+            }
+
+            guard !filteredHooks.isEmpty else { continue }
+            group["hooks"] = filteredHooks
+            sanitized.append(group)
+        }
+
+        return (sanitized, removedCount)
+    }
+
+    private func isBmuxManagedCodexHookCommand(_ command: String?) -> Bool {
+        guard let command else { return false }
+        return command.contains(Self.codexHookCommandMarker) &&
+            command.contains(Self.codexHookSurfaceGuardMarker)
+    }
+
     /// Check if a TOML line sets a specific key (ignoring comments and whitespace).
     private func isTomlKey(_ line: String, key: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -15216,34 +15245,19 @@ struct CMUXCLI {
         return (subtitle, "Codex session completed")
     }
 
-    private func printHookResult(
-        source: String,
-        event: String,
-        summary: String,
-        detail: String? = nil,
-        skipped: Bool = false,
-        extra: [String: Any] = [:]
-    ) {
-        var payload: [String: Any] = [
-            "ok": true,
-            "source": source,
-            "event": event,
-            "summary": summary,
-            "skipped": skipped
+    /// Codex validates hook stdout against a strict event schema with
+    /// additionalProperties=false, so bmux must keep this payload minimal.
+    /// The real user-facing work happens via bmux notifications and sidebar status.
+    private func printCodexHookOutput(suppressOutput: Bool = true) {
+        let payload: [String: Any] = [
+            "continue": true,
+            "suppressOutput": suppressOutput
         ]
-
-        if let detail, !detail.isEmpty {
-            payload["detail"] = detail
-        }
-
-        for (key, value) in extra {
-            payload[key] = value
-        }
 
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else {
-            print("{}")
+            print("{\"continue\":true,\"suppressOutput\":true}")
             return
         }
         print(text)
@@ -15267,13 +15281,7 @@ struct CMUXCLI {
 
         // Graceful no-op: if not inside bmux, exit silently with valid JSON
         guard env["CMUX_SURFACE_ID"] != nil else {
-            printHookResult(
-                source: "bmux",
-                event: subcommand.replacingOccurrences(of: "-", with: "_"),
-                summary: "Skipped outside bmux",
-                detail: "No CMUX_SURFACE_ID was present for the hook.",
-                skipped: true
-            )
+            printCodexHookOutput()
             return
         }
 
@@ -15327,17 +15335,7 @@ struct CMUXCLI {
                 icon: "sparkles",
                 color: "#36C275"
             )
-            printHookResult(
-                source: "bmux",
-                event: "session_start",
-                summary: "Registered Codex session",
-                detail: statusValue,
-                extra: [
-                    "workspaceId": workspaceId,
-                    "surfaceId": surfaceId,
-                    "status": statusValue
-                ]
-            )
+            printCodexHookOutput()
 
         case "prompt-submit":
             telemetry.breadcrumb("codex-hook.prompt-submit")
@@ -15376,18 +15374,7 @@ struct CMUXCLI {
                 icon: "bolt.fill",
                 color: "#4C8DFF"
             )
-            printHookResult(
-                source: "bmux",
-                event: "prompt_submit",
-                summary: statusValue,
-                detail: requestSummary ?? "Prompt captured and bmux status updated.",
-                extra: [
-                    "workspaceId": workspaceId,
-                    "surfaceId": surfaceId,
-                    "status": statusValue,
-                    "requestSummary": requestSummary ?? ""
-                ]
-            )
+            printCodexHookOutput()
 
         case "stop":
             telemetry.breadcrumb("codex-hook.stop")
@@ -15441,29 +15428,11 @@ struct CMUXCLI {
                     icon: "checkmark.circle.fill",
                     color: "#36C275"
                 )
-                printHookResult(
-                    source: "bmux",
-                    event: "stop",
-                    summary: stopSummary.subtitle,
-                    detail: stopSummary.body,
-                    extra: [
-                        "workspaceId": workspaceId,
-                        "surfaceId": surfaceId,
-                        "status": statusValue,
-                        "notificationSubtitle": stopSummary.subtitle,
-                        "notificationBody": stopSummary.body
-                    ]
-                )
+                printCodexHookOutput()
             } catch {
                 if shouldIgnoreClaudeHookTeardownError(error) {
                     telemetry.breadcrumb("codex-hook.stop.ignored", data: ["error": String(describing: error)])
-                    printHookResult(
-                        source: "bmux",
-                        event: "stop",
-                        summary: "Skipped stop cleanup",
-                        detail: "Workspace or surface was already torn down.",
-                        skipped: true
-                    )
+                    printCodexHookOutput()
                     return
                 }
                 throw error

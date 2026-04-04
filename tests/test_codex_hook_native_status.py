@@ -89,6 +89,16 @@ def fail(message: str) -> int:
     return 1
 
 
+def assert_quiet_hook_output(output: dict, subcommand: str) -> str | None:
+    if output.get("continue") is not True:
+        return f"Expected {subcommand} hook output to continue, got {output!r}"
+    if output.get("suppressOutput") is not True:
+        return f"Expected {subcommand} hook output to suppress Codex output, got {output!r}"
+    if set(output.keys()) != {"continue", "suppressOutput"}:
+        return f"Expected {subcommand} hook output to stay schema-minimal, got {output!r}"
+    return None
+
+
 def main() -> int:
     try:
         cli_path = resolve_bmux_cli()
@@ -141,11 +151,9 @@ def main() -> int:
                 },
                 hook_env,
             )
-            if session_start_output.get("summary") != "Registered Codex session":
-                return fail(f"Expected session-start summary, got {session_start_output!r}")
+            if error := assert_quiet_hook_output(session_start_output, "session-start"):
+                return fail(error)
             ready_status = f"Ready in {project_dir.name}"
-            if session_start_output.get("status") != ready_status:
-                return fail(f"Expected ready status in session-start output, got {session_start_output!r}")
 
             if not state_path.exists():
                 return fail(f"Expected state file at {state_path}")
@@ -175,12 +183,10 @@ def main() -> int:
                 },
                 hook_env,
             )
+            if error := assert_quiet_hook_output(prompt_submit_output, "prompt-submit"):
+                return fail(error)
 
             expected_running = f"codex=Running in {project_dir.name}: {prompt_message}"
-            if prompt_submit_output.get("summary") != expected_running.replace("codex=", "", 1):
-                return fail(f"Expected prompt-submit summary to match running status, got {prompt_submit_output!r}")
-            if prompt_submit_output.get("requestSummary") != prompt_message:
-                return fail(f"Expected prompt-submit request summary in output, got {prompt_submit_output!r}")
             sidebar_state = wait_for_sidebar_fragment(client, workspace_id, expected_running)
             if expected_running not in sidebar_state:
                 return fail(f"Expected running status fragment. sidebar_state={sidebar_state!r}")
@@ -202,12 +208,10 @@ def main() -> int:
                 },
                 hook_env,
             )
+            if error := assert_quiet_hook_output(stop_output, "stop"):
+                return fail(error)
 
             subtitle = f"Completed in {project_dir.name}"
-            if stop_output.get("summary") != subtitle:
-                return fail(f"Expected stop summary to match notification subtitle, got {stop_output!r}")
-            if assistant_message not in str(stop_output.get("detail", "")):
-                return fail(f"Expected stop detail to include assistant message, got {stop_output!r}")
             expected_completed = f"codex={subtitle}"
             sidebar_state = wait_for_sidebar_fragment(client, workspace_id, expected_completed)
             if expected_completed not in sidebar_state:
