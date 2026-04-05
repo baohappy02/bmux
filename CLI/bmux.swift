@@ -324,11 +324,13 @@ private struct ClaudeHookSessionRecord: Codable {
     var workspaceId: String
     var surfaceId: String
     var cwd: String?
+    var transcriptPath: String?
     var pid: Int?
     var lastSubtitle: String?
     var lastBody: String?
     var lastRequest: String?
     var instructionFingerprint: String?
+    var observedCompactionCount: Int?
     var startedAt: TimeInterval
     var updatedAt: TimeInterval
 }
@@ -342,6 +344,11 @@ private struct CodexHookInstructionSnapshot {
     let fingerprint: String
     let trackedPaths: [String]
     let latestModifiedAt: TimeInterval?
+}
+
+private struct CodexHookCompactionSnapshot {
+    let transcriptPath: String
+    let compactionCount: Int
 }
 
 private final class ClaudeHookSessionStore {
@@ -380,11 +387,13 @@ private final class ClaudeHookSessionStore {
         workspaceId: String,
         surfaceId: String,
         cwd: String?,
+        transcriptPath: String? = nil,
         pid: Int? = nil,
         lastSubtitle: String? = nil,
         lastBody: String? = nil,
         lastRequest: String? = nil,
-        instructionFingerprint: String? = nil
+        instructionFingerprint: String? = nil,
+        observedCompactionCount: Int? = nil
     ) throws {
         let normalized = normalizeSessionId(sessionId)
         guard !normalized.isEmpty else { return }
@@ -395,11 +404,13 @@ private final class ClaudeHookSessionStore {
                 workspaceId: workspaceId,
                 surfaceId: surfaceId,
                 cwd: nil,
+                transcriptPath: nil,
                 pid: nil,
                 lastSubtitle: nil,
                 lastBody: nil,
                 lastRequest: nil,
                 instructionFingerprint: nil,
+                observedCompactionCount: nil,
                 startedAt: now,
                 updatedAt: now
             )
@@ -409,6 +420,9 @@ private final class ClaudeHookSessionStore {
             }
             if let cwd = normalizeOptional(cwd) {
                 record.cwd = cwd
+            }
+            if let transcriptPath = normalizeOptional(transcriptPath) {
+                record.transcriptPath = transcriptPath
             }
             if let pid {
                 record.pid = pid
@@ -424,6 +438,9 @@ private final class ClaudeHookSessionStore {
             }
             if let instructionFingerprint = normalizeOptional(instructionFingerprint) {
                 record.instructionFingerprint = instructionFingerprint
+            }
+            if let observedCompactionCount {
+                record.observedCompactionCount = observedCompactionCount
             }
             record.updatedAt = now
             state.sessions[normalized] = record
@@ -14756,6 +14773,106 @@ struct CMUXCLI {
         return latestModifiedAt > (sessionRecord.startedAt + 0.001)
     }
 
+    private func codexHookTranscriptPath(
+        sessionId: String?,
+        transcriptPath: String?,
+        sessionRecord: ClaudeHookSessionRecord?,
+        processEnv: [String: String]
+    ) -> String? {
+        let fileManager = FileManager.default
+
+        for candidate in [transcriptPath, sessionRecord?.transcriptPath] {
+            guard let normalized = agentIntelNormalizedPath(candidate),
+                  fileManager.fileExists(atPath: normalized) else {
+                continue
+            }
+            return normalized
+        }
+
+        guard let sessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionId.isEmpty,
+              let sessionsRoot = agentIntelNormalizedPath((processEnv["CODEX_HOME"] ?? "~/.codex") + "/sessions"),
+              fileManager.fileExists(atPath: sessionsRoot),
+              let enumerator = fileManager.enumerator(
+                  at: URL(fileURLWithPath: sessionsRoot, isDirectory: true),
+                  includingPropertiesForKeys: [.contentModificationDateKey],
+                  options: [.skipsHiddenFiles]
+              ) else {
+            return nil
+        }
+
+        var bestMatch: (path: String, modifiedAt: Date)?
+        for case let fileURL as URL in enumerator {
+            guard fileURL.pathExtension == "jsonl",
+                  fileURL.lastPathComponent.contains(sessionId) else {
+                continue
+            }
+
+            let modifiedAt = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast
+            if let bestMatch, bestMatch.modifiedAt >= modifiedAt {
+                continue
+            }
+            bestMatch = (fileURL.path, modifiedAt)
+        }
+
+        return bestMatch?.path
+    }
+
+    private func codexHookTranscriptCompactionCount(path: String) -> Int? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe]),
+              let content = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        var count = 0
+        content.enumerateLines { line, _ in
+            guard line.contains("context_compacted"),
+                  let lineData = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  (object["type"] as? String) == "event_msg",
+                  let payload = object["payload"] as? [String: Any],
+                  (payload["type"] as? String) == "context_compacted" else {
+                return
+            }
+            count += 1
+        }
+        return count
+    }
+
+    private func codexHookCompactionSnapshot(
+        sessionId: String?,
+        transcriptPath: String?,
+        sessionRecord: ClaudeHookSessionRecord?,
+        processEnv: [String: String]
+    ) -> CodexHookCompactionSnapshot? {
+        guard let transcriptPath = codexHookTranscriptPath(
+            sessionId: sessionId,
+            transcriptPath: transcriptPath,
+            sessionRecord: sessionRecord,
+            processEnv: processEnv
+        ),
+        let compactionCount = codexHookTranscriptCompactionCount(path: transcriptPath) else {
+            return nil
+        }
+
+        return CodexHookCompactionSnapshot(
+            transcriptPath: transcriptPath,
+            compactionCount: compactionCount
+        )
+    }
+
+    private func codexHookShouldRefreshAfterCompaction(
+        snapshot: CodexHookCompactionSnapshot?,
+        sessionRecord: ClaudeHookSessionRecord?
+    ) -> Bool {
+        guard let snapshot,
+              let sessionRecord else {
+            return false
+        }
+        return snapshot.compactionCount > (sessionRecord.observedCompactionCount ?? 0)
+    }
+
     private func summarizeClaudeHookStop(
         parsedInput: ClaudeHookParsedInput,
         sessionRecord: ClaudeHookSessionRecord?
@@ -15517,6 +15634,33 @@ struct CMUXCLI {
         return codexHookPromptSummary(parsedInput)
     }
 
+    private func codexHookRefreshContextLabel(
+        instructionsChanged: Bool,
+        compactionChanged: Bool
+    ) -> String {
+        switch (instructionsChanged, compactionChanged) {
+        case (true, true):
+            return "instructions, skills, or compacted context"
+        case (true, false):
+            return "updated instructions or skills"
+        case (false, true):
+            return "compacted context"
+        default:
+            return "updated context"
+        }
+    }
+
+    private func codexHookRefreshNotificationSubtitle(
+        replayed: Bool,
+        instructionsChanged: Bool,
+        compactionChanged: Bool
+    ) -> String {
+        if instructionsChanged && !compactionChanged {
+            return replayed ? "Instructions refreshed" : "Instructions updated"
+        }
+        return replayed ? "Context refreshed" : "Context refresh needed"
+    }
+
     private func codexHookRefreshStatus(cwd: String?, replayed: Bool) -> String {
         let projectName = hookProjectName(cwd: cwd)
         if let projectName {
@@ -15527,21 +15671,27 @@ struct CMUXCLI {
 
     private func codexHookRefreshNotificationBody(
         snapshot: CodexHookInstructionSnapshot?,
-        replayed: Bool
+        replayed: Bool,
+        instructionsChanged: Bool,
+        compactionChanged: Bool
     ) -> String {
+        let refreshContext = codexHookRefreshContextLabel(
+            instructionsChanged: instructionsChanged,
+            compactionChanged: compactionChanged
+        )
         let trackedCount = snapshot?.trackedPaths.count ?? 0
         if replayed {
             return trackedCount > 0
-                ? "Detected updated instructions or skills and replayed the prompt with the new context (\(trackedCount) tracked files)."
-                : "Detected updated instructions or skills and replayed the prompt with the new context."
+                ? "Detected \(refreshContext) and replayed the prompt with the refreshed context (\(trackedCount) tracked files)."
+                : "Detected \(refreshContext) and replayed the prompt with the refreshed context."
         }
         return trackedCount > 0
-            ? "Detected updated instructions or skills. Re-send the prompt to continue with the new context (\(trackedCount) tracked files)."
-            : "Detected updated instructions or skills. Re-send the prompt to continue with the new context."
+            ? "Detected \(refreshContext). Re-send the prompt to continue with the refreshed context (\(trackedCount) tracked files)."
+            : "Detected \(refreshContext). Re-send the prompt to continue with the refreshed context."
     }
 
     private func codexHookReplayPrompt(for originalPrompt: String) -> String {
-        "\(Self.codexHookReplayPrefix) Re-read the latest repo and global instructions from disk before answering. Then continue with the original user request: \(originalPrompt)"
+        "\(Self.codexHookReplayPrefix) Re-read the latest repo and global instructions from disk, then reopen any skills relevant to this request before answering. Then continue with the original user request: \(originalPrompt)"
     }
 
     private func codexHookCanAutoReplay(prompt: String?, processEnv: [String: String]) -> Bool {
@@ -15689,13 +15839,21 @@ struct CMUXCLI {
                 cwd: parsedInput.cwd,
                 processEnv: env
             )
+            let compactionSnapshot = codexHookCompactionSnapshot(
+                sessionId: parsedInput.sessionId,
+                transcriptPath: parsedInput.transcriptPath,
+                sessionRecord: nil,
+                processEnv: env
+            )
             if let sessionId = parsedInput.sessionId {
                 try? sessionStore.upsert(
                     sessionId: sessionId,
                     workspaceId: workspaceId,
                     surfaceId: surfaceId,
                     cwd: parsedInput.cwd,
-                    instructionFingerprint: instructionSnapshot?.fingerprint
+                    transcriptPath: compactionSnapshot?.transcriptPath ?? parsedInput.transcriptPath,
+                    instructionFingerprint: instructionSnapshot?.fingerprint,
+                    observedCompactionCount: compactionSnapshot?.compactionCount
                 )
             }
             let statusValue = codexReadyStatus(cwd: parsedInput.cwd)
@@ -15727,15 +15885,31 @@ struct CMUXCLI {
                 cwd: effectiveCWD,
                 processEnv: env
             )
+            let compactionSnapshot = codexHookCompactionSnapshot(
+                sessionId: parsedInput.sessionId,
+                transcriptPath: parsedInput.transcriptPath,
+                sessionRecord: mappedSession,
+                processEnv: env
+            )
             let requestSummary = codexHookRequestSummary(parsedInput)
-            let shouldRefresh = codexHookShouldRefreshInstructions(
+            let instructionsChanged = codexHookShouldRefreshInstructions(
                 snapshot: instructionSnapshot,
                 sessionRecord: mappedSession
             )
+            let compactionChanged = codexHookShouldRefreshAfterCompaction(
+                snapshot: compactionSnapshot,
+                sessionRecord: mappedSession
+            )
+            let shouldRefresh = instructionsChanged || compactionChanged
             if shouldRefresh {
                 telemetry.breadcrumb(
                     "codex-hook.prompt-submit.refresh",
-                    data: ["tracked_files": instructionSnapshot?.trackedPaths.count ?? 0]
+                    data: [
+                        "tracked_files": instructionSnapshot?.trackedPaths.count ?? 0,
+                        "instructions_changed": instructionsChanged,
+                        "compaction_changed": compactionChanged,
+                        "observed_compactions": compactionSnapshot?.compactionCount ?? 0
+                    ]
                 )
                 codexHookRefreshDefaultSkillsIfNeeded(processEnv: env)
                 let replayablePrompt = codexHookReplayablePromptText(parsedInput)
@@ -15758,8 +15932,10 @@ struct CMUXCLI {
                         workspaceId: workspaceId,
                         surfaceId: surfaceId,
                         cwd: effectiveCWD,
+                        transcriptPath: compactionSnapshot?.transcriptPath ?? parsedInput.transcriptPath,
                         lastRequest: requestSummary,
-                        instructionFingerprint: instructionSnapshot?.fingerprint
+                        instructionFingerprint: instructionSnapshot?.fingerprint,
+                        observedCompactionCount: compactionSnapshot?.compactionCount
                     )
                 }
 
@@ -15777,15 +15953,28 @@ struct CMUXCLI {
                         "workspace_id": workspaceId,
                         "surface_id": surfaceId,
                         "title": "Codex",
-                        "subtitle": replayed ? "Instructions refreshed" : "Instructions updated",
+                        "subtitle": codexHookRefreshNotificationSubtitle(
+                            replayed: replayed,
+                            instructionsChanged: instructionsChanged,
+                            compactionChanged: compactionChanged
+                        ),
                         "body": sanitizeNotificationField(
-                            codexHookRefreshNotificationBody(snapshot: instructionSnapshot, replayed: replayed)
+                            codexHookRefreshNotificationBody(
+                                snapshot: instructionSnapshot,
+                                replayed: replayed,
+                                instructionsChanged: instructionsChanged,
+                                compactionChanged: compactionChanged
+                            )
                         )
                     ]
                 )
+                let refreshContext = codexHookRefreshContextLabel(
+                    instructionsChanged: instructionsChanged,
+                    compactionChanged: compactionChanged
+                )
                 let reason = replayed
-                    ? "bmux detected updated instructions or skills, refreshed the session, and replayed your prompt once."
-                    : "bmux detected updated instructions or skills. Re-send your prompt to continue with the new context."
+                    ? "bmux detected \(refreshContext), refreshed the session, and replayed your prompt once."
+                    : "bmux detected \(refreshContext). Re-send your prompt to continue with the refreshed context."
                 printCodexHookBlockOutput(reason: reason)
                 return
             }
@@ -15795,8 +15984,10 @@ struct CMUXCLI {
                     workspaceId: workspaceId,
                     surfaceId: surfaceId,
                     cwd: effectiveCWD,
+                    transcriptPath: compactionSnapshot?.transcriptPath ?? parsedInput.transcriptPath,
                     lastRequest: requestSummary,
-                    instructionFingerprint: instructionSnapshot?.fingerprint
+                    instructionFingerprint: instructionSnapshot?.fingerprint,
+                    observedCompactionCount: compactionSnapshot?.compactionCount
                 )
             }
             _ = try? sendV1Command("clear_notifications --tab=\(workspaceId)", client: client)
