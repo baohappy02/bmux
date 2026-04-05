@@ -140,10 +140,20 @@ find_bmux_index_src() {
   return 1
 }
 
+find_bmux_deps_src() {
+  local resolve_script="$PWD/scripts/resolve-bmux-deps.sh"
+  if [[ ! -f "$resolve_script" ]]; then
+    echo "error: missing bmux-deps resolver script at $resolve_script" >&2
+    return 1
+  fi
+  bash "$resolve_script"
+}
+
 bundle_runtime_binaries() {
   local app_path="$1"
   local bin_dir="${app_path}/Contents/Resources/bin"
   local bmux_index_src=""
+  local bmux_deps_src=""
 
   mkdir -p "$bin_dir"
 
@@ -164,6 +174,10 @@ bundle_runtime_binaries() {
   else
     echo "warning: bmux-index binary was not found; agent.code will stay unavailable until bmux-index is installed." >&2
   fi
+
+  bmux_deps_src="$(find_bmux_deps_src)"
+  cp "$bmux_deps_src" "$bin_dir/bmux-deps"
+  chmod +x "$bin_dir/bmux-deps"
 }
 
 install_release_app_to_applications() {

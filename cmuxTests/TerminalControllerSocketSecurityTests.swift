@@ -286,14 +286,15 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         let socketPath = makeSocketPath("code-status")
         let manager = TabManager()
         let repoURL = try makeFakeRepository(named: "bmux-index-code-status")
-        let scriptURL = try makeFakeBmuxIndexScript(for: repoURL)
+        let fake = try makeFakeBmuxIndexScript(for: repoURL)
         defer {
             try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: scriptURL)
+            try? FileManager.default.removeItem(at: fake.scriptURL)
+            try? FileManager.default.removeItem(at: fake.logURL)
         }
 
         let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
-        setenv("BMUX_INDEX_PATH", scriptURL.path, 1)
+        setenv("BMUX_INDEX_PATH", fake.scriptURL.path, 1)
         defer {
             if let previousPath {
                 setenv("BMUX_INDEX_PATH", previousPath, 1)
@@ -335,14 +336,15 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         let socketPath = makeSocketPath("code-search")
         let manager = TabManager()
         let repoURL = try makeFakeRepository(named: "bmux-index-search")
-        let scriptURL = try makeFakeBmuxIndexScript(for: repoURL)
+        let fake = try makeFakeBmuxIndexScript(for: repoURL)
         defer {
             try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
-            try? FileManager.default.removeItem(at: scriptURL)
+            try? FileManager.default.removeItem(at: fake.scriptURL)
+            try? FileManager.default.removeItem(at: fake.logURL)
         }
 
         let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
-        setenv("BMUX_INDEX_PATH", scriptURL.path, 1)
+        setenv("BMUX_INDEX_PATH", fake.scriptURL.path, 1)
         defer {
             if let previousPath {
                 setenv("BMUX_INDEX_PATH", previousPath, 1)
@@ -384,6 +386,156 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         let hits = try XCTUnwrap(result["hits"] as? [[String: Any]])
         XCTAssertEqual(hits.count, 1)
         XCTAssertEqual(hits.first?["relative_path"] as? String, "Sources/App.swift")
+        XCTAssertEqual(Array(try fakeCommandLog(at: fake.logURL).prefix(2)), ["prepare", "search"])
+    }
+
+    func testAgentCodeSearchManyUsesBmuxIndexBatchSearch() async throws {
+        let socketPath = makeSocketPath("code-many")
+        let manager = TabManager()
+        let repoURL = try makeFakeRepository(named: "bmux-index-search-many")
+        let fake = try makeFakeBmuxIndexScript(for: repoURL)
+        defer {
+            try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fake.scriptURL)
+            try? FileManager.default.removeItem(at: fake.logURL)
+        }
+
+        let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
+        setenv("BMUX_INDEX_PATH", fake.scriptURL.path, 1)
+        defer {
+            if let previousPath {
+                setenv("BMUX_INDEX_PATH", previousPath, 1)
+            } else {
+                unsetenv("BMUX_INDEX_PATH")
+            }
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try sendV2Request(
+            method: "agent.code.search_many",
+            params: [
+                "cwd": repoURL.path,
+                "queries": ["greet user function", "tap the answer"],
+                "limit": 3
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        XCTAssertEqual(result["backend"] as? String, "bmux-index")
+        let searches = try XCTUnwrap(result["searches"] as? [[String: Any]])
+        XCTAssertEqual(searches.count, 2)
+        let firstResults = try XCTUnwrap(searches.first?["results"] as? [[String: Any]])
+        XCTAssertEqual(firstResults.first?["relative_path"] as? String, "Sources/App.swift")
+        XCTAssertEqual(Array(try fakeCommandLog(at: fake.logURL).prefix(2)), ["prepare", "search_many"])
+    }
+
+    func testAgentCodeRouteUsesBmuxIndexPlanner() async throws {
+        let socketPath = makeSocketPath("code-route")
+        let manager = TabManager()
+        let repoURL = try makeFakeRepository(named: "bmux-index-route")
+        let fake = try makeFakeBmuxIndexScript(for: repoURL)
+        defer {
+            try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fake.scriptURL)
+            try? FileManager.default.removeItem(at: fake.logURL)
+        }
+
+        let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
+        setenv("BMUX_INDEX_PATH", fake.scriptURL.path, 1)
+        defer {
+            if let previousPath {
+                setenv("BMUX_INDEX_PATH", previousPath, 1)
+            } else {
+                unsetenv("BMUX_INDEX_PATH")
+            }
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try sendV2Request(
+            method: "agent.code.route",
+            params: [
+                "cwd": repoURL.path,
+                "query": "find the tutorial copy",
+                "literal_terms": ["Tap the answer"]
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        XCTAssertEqual(result["backend"] as? String, "bmux-index")
+        XCTAssertEqual(result["strategy"] as? String, "code_search")
+        let commands = try XCTUnwrap(result["commands"] as? [[String: Any]])
+        XCTAssertEqual(commands.first?["command"] as? String, "prepare")
+        XCTAssertEqual(commands.dropFirst().first?["command"] as? String, "search_many")
+        XCTAssertEqual(Array(try fakeCommandLog(at: fake.logURL).prefix(2)), ["prepare", "route"])
+    }
+
+    func testAgentCodeArtifactSearchUsesArtifactLane() async throws {
+        let socketPath = makeSocketPath("code-art")
+        let manager = TabManager()
+        let repoURL = try makeFakeRepository(named: "bmux-index-artifact-search")
+        let fake = try makeFakeBmuxIndexScript(for: repoURL)
+        let artifactURL = try makeFakeArtifact(named: "onboarding-shot", contents: "Tap the answer now")
+        defer {
+            try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fake.scriptURL)
+            try? FileManager.default.removeItem(at: fake.logURL)
+            try? FileManager.default.removeItem(at: artifactURL)
+        }
+
+        let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
+        setenv("BMUX_INDEX_PATH", fake.scriptURL.path, 1)
+        defer {
+            if let previousPath {
+                setenv("BMUX_INDEX_PATH", previousPath, 1)
+            } else {
+                unsetenv("BMUX_INDEX_PATH")
+            }
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try sendV2Request(
+            method: "agent.code.artifact_search",
+            params: [
+                "cwd": repoURL.path,
+                "artifact_path": artifactURL.path,
+                "query": "find the screenshot copy",
+                "limit": 3
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        XCTAssertEqual(result["backend"] as? String, "bmux-index")
+        XCTAssertEqual(result["text_preview"] as? String, "Tap the answer now")
+        let search = try XCTUnwrap(result["search"] as? [String: Any])
+        let searches = try XCTUnwrap(search["searches"] as? [[String: Any]])
+        XCTAssertEqual(searches.count, 1)
+        let firstResults = try XCTUnwrap(searches.first?["results"] as? [[String: Any]])
+        XCTAssertEqual(firstResults.first?["relative_path"] as? String, "Sources/App.swift")
+        XCTAssertEqual(Array(try fakeCommandLog(at: fake.logURL).prefix(2)), ["prepare", "artifact_search"])
     }
 
     private func makeFakeRepository(named name: String) throws -> URL {
@@ -400,28 +552,63 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         return root
     }
 
-    private func makeFakeBmuxIndexScript(for repoURL: URL) throws -> URL {
+    private func makeFakeBmuxIndexScript(for repoURL: URL) throws -> (scriptURL: URL, logURL: URL) {
         let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent("fake-bmux-index-\(UUID().uuidString).sh")
+        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("fake-bmux-index-\(UUID().uuidString).log")
         let statusResponse = #"{"id":"1","command":"status","ok":true,"payload":{"ok":true,"repo":"__REPO__","state":"warm","indexed_at":"2026-04-03T00:00:00Z","file_count":3,"chunk_count":5,"symbol_count":2,"backend":"swift+zig"}}"#
             .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+        let prepareResponse = #"{"id":"1","command":"prepare","ok":true,"payload":{"ok":true,"repo":"__REPO__","state":"warm","indexed_at":"2026-04-03T00:00:00Z","backend":"swift+zig"}}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
         let searchResponse = #"{"id":"1","command":"search","ok":true,"payload":{"ok":true,"repo":"__REPO__","query":"greet user function","limit":3,"index_state":"warm","mode":"zig_score","results":[{"path":"Sources/App.swift","line_start":1,"line_end":3,"snippet":"func greetUser() -> String","score":9.5,"kind":"function","language":"swift"}]}}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+        let searchManyResponse = #"{"id":"1","command":"search_many","ok":true,"payload":{"ok":true,"repo":"__REPO__","limit":3,"index_state":"warm","mode":"hybrid_auto","applied_terms":["greet user function","tap the answer"],"path_hit_limit":2,"searches":[{"query":"greet user function","results":[{"path":"Sources/App.swift","line_start":1,"line_end":3,"snippet":"func greetUser() -> String","score":9.5,"kind":"function","language":"swift"}]},{"query":"tap the answer","results":[{"path":"Sources/App.swift","line_start":1,"line_end":3,"snippet":"func greetUser() -> String","score":8.7,"kind":"function","language":"swift"}]}]}}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+        let routeResponse = #"{"id":"1","command":"route","ok":true,"payload":{"ok":true,"repo":"__REPO__","index_state":"warm","strategy":"code_search","reason":"Use batched search for rough copy hunting.","commands":[{"command":"prepare","repo":"__REPO__","rationale":"Warm the serve session."},{"command":"search_many","repo":"__REPO__","queries":["find the tutorial copy","Tap the answer"],"limit":6,"open_paths":["Sources/App.swift"],"recent_paths":["Sources/App.swift"],"changed_paths":[],"literal_terms":["Tap the answer"],"rationale":"Search multiple hints in one indexed call."}]}}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+        let artifactExtractResponse = #"{"id":"1","command":"artifact_extract","ok":true,"payload":{"ok":true,"source_path":"__ARTIFACT__","backend":"tesseract","format":"image","character_count":18,"truncated":false,"text_preview":"Tap the answer now","literal_terms":["Tap the answer now"]}}"#
+        let artifactSearchResponse = #"{"id":"1","command":"artifact_search","ok":true,"payload":{"ok":true,"repo":"__REPO__","source_path":"__ARTIFACT__","backend":"tesseract","format":"image","character_count":18,"truncated":false,"text_preview":"Tap the answer now","literal_terms":["Tap the answer now"],"search":{"ok":true,"repo":"__REPO__","limit":3,"index_state":"warm","mode":"hybrid_auto","applied_terms":["Tap the answer now"],"path_hit_limit":3,"searches":[{"query":"find the screenshot copy","results":[{"path":"Sources/App.swift","line_start":1,"line_end":3,"snippet":"func greetUser() -> String","score":9.5,"kind":"function","language":"swift"}]}]}}}"#
             .replacingOccurrences(of: "__REPO__", with: repoURL.path)
         let script = """
         #!/bin/sh
         if [ "$1" != "serve" ]; then
           exit 1
         fi
+        : > "\(logURL.path)"
         while IFS= read -r line; do
+          command=$(printf '%s' "$line" | sed -n 's/.*"command":"\\([^"]*\\)".*/\\1/p')
+          if [ -n "$command" ]; then
+            printf '%s\\n' "$command" >> "\(logURL.path)"
+          fi
+          artifact_path=$(printf '%s' "$line" | sed -n 's/.*"artifact_path":"\\([^"]*\\)".*/\\1/p')
           case "$line" in
             *'"command":"shutdown"'*)
               printf '%s\\n' '{"id":"shutdown","command":"shutdown","ok":true,"payload":{"ok":true}}'
               exit 0
+              ;;
+            *'"command":"prepare"'*)
+              printf '%s\\n' '\(prepareResponse)'
               ;;
             *'"command":"status"'*)
               printf '%s\\n' '\(statusResponse)'
               ;;
             *'"command":"search"'*)
               printf '%s\\n' '\(searchResponse)'
+              ;;
+            *'"command":"search_many"'*)
+              printf '%s\\n' '\(searchManyResponse)'
+              ;;
+            *'"command":"route"'*)
+              printf '%s\\n' '\(routeResponse)'
+              ;;
+            *'"command":"artifact_extract"'*)
+              printf '%s\\n' '\(artifactExtractResponse)'
+              ;;
+            *'"command":"artifact_search"'*)
+              response='\(artifactSearchResponse)'
+              if [ -n "$artifact_path" ]; then
+                response=$(printf '%s' "$response" | sed "s|__ARTIFACT__|$artifact_path|g")
+              fi
+              printf '%s\\n' "$response"
               ;;
             *)
               printf '%s\\n' '{"id":"unknown","command":"unknown","ok":false,"error":{"error":"UNSUPPORTED","message":"unsupported"}}'
@@ -431,7 +618,21 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         """
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
-        return scriptURL
+        return (scriptURL, logURL)
+    }
+
+    private func makeFakeArtifact(named name: String, contents: String) throws -> URL {
+        let artifactURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).txt")
+        try contents.write(to: artifactURL, atomically: true, encoding: .utf8)
+        return artifactURL
+    }
+
+    private func fakeCommandLog(at url: URL) throws -> [String] {
+        let contents = try String(contentsOf: url, encoding: .utf8)
+        return contents
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { !$0.isEmpty }
     }
 
     private func waitForSocket(at path: String, timeout: TimeInterval = 5.0) throws {

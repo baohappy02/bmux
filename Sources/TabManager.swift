@@ -711,6 +711,12 @@ class TabManager: ObservableObject {
     private static let workspaceGitMetadataPollInterval: TimeInterval = 30
     private static let selectedWorkspaceGitMetadataPollInterval: TimeInterval = 5
     private nonisolated static let workspacePullRequestProbeTimeout: TimeInterval = 5.0
+    private nonisolated static let dependencyBootstrapTimeout: TimeInterval = 120.0
+    private nonisolated static let dependencyBootstrapQueue = DispatchQueue(
+        label: "com.bmux.workspace-dependency-bootstrap",
+        qos: .utility
+    )
+    private static var dependencyBootstrapInFlightDirectories: Set<String> = []
     @Published var selectedTabId: UUID? {
         willSet {
 #if DEBUG
@@ -793,6 +799,7 @@ class TabManager: ObservableObject {
     private var pendingPanelTitleUpdates: [PanelTitleUpdateKey: String] = [:]
     private let panelTitleUpdateCoalescer = NotificationBurstCoalescer(delay: 1.0 / 30.0)
     private var recentlyClosedBrowsers = RecentlyClosedBrowserStack(capacity: 20)
+    private let dependencyBootstrapRunner: (String) -> Void
     private let initialWorkspaceGitProbeQueue = DispatchQueue(
         label: "com.bmux.initial-workspace-git-probe",
         qos: .utility
@@ -849,7 +856,11 @@ class TabManager: ObservableObject {
     private var uiTestCancellables = Set<AnyCancellable>()
 #endif
 
-    init(initialWorkingDirectory: String? = nil) {
+    init(
+        initialWorkingDirectory: String? = nil,
+        dependencyBootstrapRunner: @escaping (String) -> Void = TabManager.runDependencyBootstrapIfAvailable
+    ) {
+        self.dependencyBootstrapRunner = dependencyBootstrapRunner
         addWorkspace(workingDirectory: initialWorkingDirectory)
         observers.append(NotificationCenter.default.addObserver(
             forName: .ghosttyDidSetTitle,
@@ -1309,6 +1320,9 @@ class TabManager: ObservableObject {
                     panelId: terminalPanel.id,
                     directory: explicitWorkingDirectory
                 )
+            }
+            if let explicitWorkingDirectory {
+                scheduleDependencyBootstrapIfNeeded(directory: explicitWorkingDirectory)
             }
             if eagerLoadTerminal {
                 if select {
@@ -1931,6 +1945,20 @@ class TabManager: ObservableObject {
         )
     }
 
+    nonisolated static func resolvedDependencyBootstrapPathForTesting(
+        override: String?,
+        environment: [String: String],
+        bundledPath: String?,
+        fallbackDirectories: [String]
+    ) -> String? {
+        resolvedDependencyBootstrapPath(
+            override: override,
+            environment: environment,
+            bundledPath: bundledPath,
+            fallbackDirectories: fallbackDirectories
+        )
+    }
+
     private nonisolated static func resolvedCommandPath(
         executable: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -1974,6 +2002,33 @@ class TabManager: ObservableObject {
             }
         }
         return nil
+    }
+
+    private nonisolated static func resolvedDependencyBootstrapPath(
+        override: String? = ProcessInfo.processInfo.environment["BMUX_DEPS_CLI"],
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundledPath: String? = Bundle.main.resourceURL?.appendingPathComponent("bin/bmux-deps").path,
+        fallbackDirectories: [String] = fallbackCommandSearchDirectories
+    ) -> String? {
+        let fileManager = FileManager.default
+
+        if let override {
+            let expanded = NSString(string: override).expandingTildeInPath
+            if fileManager.isExecutableFile(atPath: expanded) {
+                return expanded
+            }
+        }
+
+        if let bundledPath,
+           fileManager.isExecutableFile(atPath: bundledPath) {
+            return bundledPath
+        }
+
+        return resolvedCommandPath(
+            executable: "bmux-deps",
+            environment: environment,
+            fallbackDirectories: fallbackDirectories
+        )
     }
 
     private nonisolated static func runCommand(
@@ -2059,6 +2114,40 @@ class TabManager: ObservableObject {
             exitStatus: process.terminationStatus,
             timedOut: false,
             executionError: nil
+        )
+    }
+
+    private func scheduleDependencyBootstrapIfNeeded(directory: String) {
+        let normalizedDirectory = normalizeDirectory(directory)
+        guard Self.dependencyBootstrapInFlightDirectories.insert(normalizedDirectory).inserted else {
+            return
+        }
+
+        let runner = dependencyBootstrapRunner
+#if DEBUG
+        dlog("workspace.deps.ensure.schedule dir=\(normalizedDirectory)")
+#endif
+        Self.dependencyBootstrapQueue.async {
+            runner(normalizedDirectory)
+            Task { @MainActor in
+                Self.dependencyBootstrapInFlightDirectories.remove(normalizedDirectory)
+#if DEBUG
+                dlog("workspace.deps.ensure.finish dir=\(normalizedDirectory)")
+#endif
+            }
+        }
+    }
+
+    private nonisolated static func runDependencyBootstrapIfAvailable(directory: String) {
+        guard let executablePath = resolvedDependencyBootstrapPath() else {
+            return
+        }
+
+        _ = runCommandResult(
+            directory: directory,
+            executable: executablePath,
+            arguments: ["ensure", "--repo", directory, "--json"],
+            timeout: dependencyBootstrapTimeout
         )
     }
 

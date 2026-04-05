@@ -2502,8 +2502,16 @@ class TerminalController {
             return v2Result(id: id, self.v2AgentCodeStatus(params: params))
         case "agent.code.index":
             return v2Result(id: id, self.v2AgentCodeIndex(params: params))
+        case "agent.code.route":
+            return v2Result(id: id, self.v2AgentCodeRoute(params: params))
         case "agent.code.search":
             return v2Result(id: id, self.v2AgentCodeSearch(params: params))
+        case "agent.code.search_many":
+            return v2Result(id: id, self.v2AgentCodeSearchMany(params: params))
+        case "agent.code.artifact_extract":
+            return v2Result(id: id, self.v2AgentCodeArtifactExtract(params: params))
+        case "agent.code.artifact_search":
+            return v2Result(id: id, self.v2AgentCodeArtifactSearch(params: params))
         case "agent.code.symbols":
             return v2Result(id: id, self.v2AgentCodeSymbols(params: params))
         case "agent.code.context":
@@ -2964,7 +2972,11 @@ class TerminalController {
             "agent.search",
             "agent.code.status",
             "agent.code.index",
+            "agent.code.route",
             "agent.code.search",
+            "agent.code.search_many",
+            "agent.code.artifact_extract",
+            "agent.code.artifact_search",
             "agent.code.symbols",
             "agent.code.context",
             "agent.code.impact",
@@ -3561,7 +3573,11 @@ class TerminalController {
                     "agent.search",
                     "agent.code.status",
                     "agent.code.index",
+                    "agent.code.route",
                     "agent.code.search",
+                    "agent.code.search_many",
+                    "agent.code.artifact_extract",
+                    "agent.code.artifact_search",
                     "agent.code.symbols",
                     "agent.code.context",
                     "agent.code.impact",
@@ -3570,6 +3586,13 @@ class TerminalController {
                     "agent.code.rename",
                     "agent.code.changes",
                     "agent.code.module"
+                ],
+                "scope": "local_repo_artifact",
+                "guidance": [
+                    "bmux-index is the local repo and artifact intelligence lane, not web search.",
+                    "Use agent.code.route for rough task descriptions so bmux-index can return prepare plus the next indexed command.",
+                    "Treat missing or stale index status as telemetry only; repo-scoped reads must continue after a non-blocking prepare.",
+                    "Send screenshots, PDFs, and docs through agent.code.artifact_extract or agent.code.artifact_search before repo retrieval."
                 ]
             ],
             "environment": environment,
@@ -5937,7 +5960,7 @@ class TerminalController {
                 "repo_root": NSNull(),
                 "capabilities": [
                     "lexical": false,
-                    "semantic": false,
+                    "semantic": true,
                     "graph": true
                 ],
                 "safe_for_exact_symbol_work": false,
@@ -6011,7 +6034,7 @@ class TerminalController {
         switch v2AgentBmuxIndexPayload(command: "search", repoRoot: repoRoot, payload: [
             "query": query,
             "limit": limit
-        ]) {
+        ], requestParams: params, resolution: resolution) {
         case .success(let payload):
             let resultPayload = v2AgentSearchQueryPayloadFromBmuxIndex(
                 repoRoot: repoRoot,
@@ -6049,7 +6072,7 @@ class TerminalController {
                 "event_cursor": v2AgentCurrentEventCursor()
             ])
         }
-        return v2AgentCodeForward(command: "status", params: [:], resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: "status", params: [:], requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeIndex(params: [String: Any]) -> V2CallResult {
@@ -6059,7 +6082,54 @@ class TerminalController {
                 "session_id": v2OrNull(resolution.session?.id)
             ])
         }
-        return v2AgentCodeForward(command: "index", params: [:], resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: "index", params: [:], requestParams: params, resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeRoute(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        let query = v2String(params, "query")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? v2StringArray(params, "queries")?.first
+        let symbol = v2String(params, "symbol")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = v2String(params, "path")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let artifactPath = v2AgentArtifactPath(params)
+        guard (query?.isEmpty == false) || (symbol?.isEmpty == false) || (path?.isEmpty == false) || (artifactPath?.isEmpty == false) else {
+            return .err(code: "invalid_params", message: "Missing query, symbol, path, or artifact_path", data: nil)
+        }
+
+        var payload: [String: Any] = [:]
+        if let query, !query.isEmpty {
+            payload["query"] = query
+        }
+        if let queries = v2StringArray(params, "queries"), !queries.isEmpty {
+            payload["queries"] = Array(queries.prefix(8))
+        }
+        if let symbol, !symbol.isEmpty {
+            payload["symbol"] = symbol
+        }
+        if let path, !path.isEmpty {
+            payload["path"] = path
+        }
+        if let line = v2Int(params, "line"), line > 0 {
+            payload["line"] = line
+        }
+        if let scope = v2String(params, "scope")?.trimmingCharacters(in: .whitespacesAndNewlines), !scope.isEmpty {
+            payload["scope"] = scope
+        }
+        if let base = v2String(params, "base")?.trimmingCharacters(in: .whitespacesAndNewlines), !base.isEmpty {
+            payload["base"] = base
+        }
+        if let limit = v2Int(params, "limit"), limit > 0 {
+            payload["limit"] = min(limit, 24)
+        }
+        if let artifactPath, !artifactPath.isEmpty {
+            payload["artifact_path"] = artifactPath
+        }
+        return v2AgentCodeForward(command: "route", params: payload, requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeSearch(params: [String: Any]) -> V2CallResult {
@@ -6074,7 +6144,76 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing query", data: nil)
         }
         let limit = min(max(1, v2Int(params, "limit") ?? 5), 20)
-        return v2AgentCodeForward(command: "search", params: ["query": query, "limit": limit], resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: "search", params: ["query": query, "limit": limit], requestParams: params, resolution: resolution, repoRoot: repoRoot)
+    }
+
+    private func v2AgentCodeSearchMany(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        let queries = v2StringArray(params, "queries") ?? v2String(params, "query").map { [$0] } ?? []
+        guard !queries.isEmpty else {
+            return .err(code: "invalid_params", message: "Missing queries", data: nil)
+        }
+        let limit = min(max(1, v2Int(params, "limit") ?? 5), 20)
+        return v2AgentCodeForward(
+            command: "search_many",
+            params: [
+                "queries": Array(queries.prefix(8)),
+                "limit": limit
+            ],
+            requestParams: params,
+            resolution: resolution,
+            repoRoot: repoRoot
+        )
+    }
+
+    private func v2AgentCodeArtifactExtract(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        guard let artifactPath = v2AgentArtifactPath(params) else {
+            return .err(code: "invalid_params", message: "Missing artifact_path", data: nil)
+        }
+        return v2AgentCodeForward(
+            command: "artifact_extract",
+            params: ["artifact_path": artifactPath],
+            requestParams: params,
+            resolution: resolution,
+            repoRoot: repoRoot
+        )
+    }
+
+    private func v2AgentCodeArtifactSearch(params: [String: Any]) -> V2CallResult {
+        let resolution = v2AgentSearchResolution(params: params)
+        guard let repoRoot = resolution.repoRoot else {
+            return .err(code: "not_found", message: "Repository root not found", data: [
+                "session_id": v2OrNull(resolution.session?.id)
+            ])
+        }
+        guard let artifactPath = v2AgentArtifactPath(params) else {
+            return .err(code: "invalid_params", message: "Missing artifact_path", data: nil)
+        }
+
+        var payload: [String: Any] = [
+            "artifact_path": artifactPath
+        ]
+        if let query = v2String(params, "query")?.trimmingCharacters(in: .whitespacesAndNewlines), !query.isEmpty {
+            payload["query"] = query
+        }
+        if let queries = v2StringArray(params, "queries"), !queries.isEmpty {
+            payload["queries"] = Array(queries.prefix(8))
+        }
+        if let limit = v2Int(params, "limit"), limit > 0 {
+            payload["limit"] = min(limit, 20)
+        }
+        return v2AgentCodeForward(command: "artifact_search", params: payload, requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeSymbols(params: [String: Any]) -> V2CallResult {
@@ -6089,7 +6228,7 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing query", data: nil)
         }
         let limit = min(max(1, v2Int(params, "limit") ?? 8), 20)
-        return v2AgentCodeForward(command: "symbols", params: ["query": query, "limit": limit], resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: "symbols", params: ["query": query, "limit": limit], requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeContext(params: [String: Any]) -> V2CallResult {
@@ -6137,7 +6276,7 @@ class TerminalController {
         if let limit = v2Int(params, "limit"), limit > 0 {
             payload["limit"] = min(limit, 24)
         }
-        return v2AgentCodeForward(command: "rename", params: payload, resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: "rename", params: payload, requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeChanges(params: [String: Any]) -> V2CallResult {
@@ -6157,7 +6296,7 @@ class TerminalController {
         if let limit = v2Int(params, "limit"), limit > 0 {
             payload["limit"] = min(limit, 24)
         }
-        return v2AgentCodeForward(command: "changes", params: payload, resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: "changes", params: payload, requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeModule(params: [String: Any]) -> V2CallResult {
@@ -6185,7 +6324,7 @@ class TerminalController {
         if let limit = v2Int(params, "limit"), limit > 0 {
             payload["limit"] = min(limit, 20)
         }
-        return v2AgentCodeForward(command: "module", params: payload, resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: "module", params: payload, requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeSymbolCommand(command: String, params: [String: Any]) -> V2CallResult {
@@ -6209,16 +6348,23 @@ class TerminalController {
         if let limit = v2Int(params, "limit"), limit > 0 {
             payload["limit"] = min(limit, 20)
         }
-        return v2AgentCodeForward(command: command, params: payload, resolution: resolution, repoRoot: repoRoot)
+        return v2AgentCodeForward(command: command, params: payload, requestParams: params, resolution: resolution, repoRoot: repoRoot)
     }
 
     private func v2AgentCodeForward(
         command: String,
         params: [String: Any],
+        requestParams: [String: Any],
         resolution: (session: AgentSession?, repoRoot: String?),
         repoRoot: String
     ) -> V2CallResult {
-        switch v2AgentBmuxIndexPayload(command: command, repoRoot: repoRoot, payload: params) {
+        switch v2AgentBmuxIndexPayload(
+            command: command,
+            repoRoot: repoRoot,
+            payload: params,
+            requestParams: requestParams,
+            resolution: resolution
+        ) {
         case .success(let payload):
             let augmentedPayload = v2AgentAugmentBmuxIndexPayload(repoRoot: repoRoot, payload: payload)
             v2AgentAppendEvent(
@@ -6241,13 +6387,29 @@ class TerminalController {
     private func v2AgentBmuxIndexPayload(
         command: String,
         repoRoot: String,
-        payload: [String: Any]
+        payload: [String: Any],
+        requestParams: [String: Any] = [:],
+        resolution: (session: AgentSession?, repoRoot: String?)? = nil
     ) -> Result<[String: Any], AgentBmuxIndexFailure>? {
         guard let runtime = v2AgentCurrentBmuxIndexRuntime() else {
             return nil
         }
         var request = payload
         request["repo"] = repoRoot
+        if let resolution {
+            let contextPayload = v2AgentBmuxIndexContextPayload(
+                repoRoot: repoRoot,
+                params: requestParams,
+                resolution: resolution
+            )
+            for (key, value) in contextPayload where request[key] == nil {
+                request[key] = value
+            }
+        }
+        request = v2AgentNormalizedBmuxIndexRequest(repoRoot: repoRoot, request: request)
+        if v2AgentShouldPrepareBmuxIndex(command: command) {
+            _ = runtime.send(command: "prepare", payload: ["repo": repoRoot])
+        }
         return runtime.send(command: command, payload: request)
     }
 
@@ -6312,7 +6474,7 @@ class TerminalController {
             "stale_reason": v2OrNull(payload["stale_reason"]),
             "capabilities": [
                 "lexical": true,
-                "semantic": false,
+                "semantic": true,
                 "graph": true
             ],
             "safe_for_exact_symbol_work": status == "warm",
@@ -6338,7 +6500,7 @@ class TerminalController {
             "stale_reason": v2OrNull(payload["stale_reason"]),
             "capabilities": [
                 "lexical": true,
-                "semantic": false,
+                "semantic": true,
                 "graph": true
             ],
             "event_cursor": v2AgentCurrentEventCursor()
@@ -6362,7 +6524,7 @@ class TerminalController {
             "backend": "bmux-index",
             "capabilities": [
                 "lexical": true,
-                "semantic": false,
+                "semantic": true,
                 "graph": true
             ],
             "hits": hits,
@@ -6408,6 +6570,39 @@ class TerminalController {
         payload: [String: Any]
     ) -> [String: Any] {
         var augmented = payload
+        if let results = payload["results"] as? [[String: Any]] {
+            augmented["results"] = v2AgentAugmentBmuxIndexItems(repoRoot: repoRoot, items: results)
+        }
+        if let searches = payload["searches"] as? [[String: Any]] {
+            augmented["searches"] = searches.map { item in
+                var searchItem = item
+                if let results = item["results"] as? [[String: Any]] {
+                    searchItem["results"] = v2AgentAugmentBmuxIndexItems(repoRoot: repoRoot, items: results)
+                }
+                return searchItem
+            }
+        }
+        if let nestedSearch = payload["search"] as? [String: Any] {
+            var searchPayload = nestedSearch
+            if let searches = nestedSearch["searches"] as? [[String: Any]] {
+                searchPayload["searches"] = searches.map { item in
+                    var searchItem = item
+                    if let results = item["results"] as? [[String: Any]] {
+                        searchItem["results"] = v2AgentAugmentBmuxIndexItems(repoRoot: repoRoot, items: results)
+                    }
+                    return searchItem
+                }
+            }
+            augmented["search"] = searchPayload
+        }
+        if let definition = payload["definition"] as? [String: Any] {
+            augmented["definition"] = v2AgentAugmentBmuxIndexItem(repoRoot: repoRoot, item: definition)
+        }
+        for key in ["references", "related", "callers", "upstream", "downstream", "symbols", "edits", "orphan_hunks"] {
+            if let items = payload[key] as? [[String: Any]] {
+                augmented[key] = v2AgentAugmentBmuxIndexItems(repoRoot: repoRoot, items: items)
+            }
+        }
         augmented["backend"] = "bmux-index"
         augmented["repo_root"] = repoRoot
         augmented["event_cursor"] = v2AgentCurrentEventCursor()
@@ -6428,14 +6623,231 @@ class TerminalController {
         }
         if let results = payload["results"] as? [Any] {
             eventPayload["count"] = results.count
+        } else if let searches = payload["searches"] as? [Any] {
+            eventPayload["count"] = searches.count
+        } else if let nestedSearch = payload["search"] as? [String: Any],
+                  let searches = nestedSearch["searches"] as? [Any] {
+            eventPayload["count"] = searches.count
         } else if let symbols = payload["symbols"] as? [Any] {
             eventPayload["count"] = symbols.count
         } else if let references = payload["references"] as? [Any] {
             eventPayload["count"] = references.count
         } else if let edits = payload["edits"] as? [Any] {
             eventPayload["count"] = edits.count
+        } else if let commands = payload["commands"] as? [Any] {
+            eventPayload["count"] = commands.count
         }
         return eventPayload
+    }
+
+    private func v2AgentArtifactPath(_ params: [String: Any]) -> String? {
+        v2String(params, "artifact_path")
+            ?? v2String(params, "source_path")
+            ?? v2String(params, "path")
+    }
+
+    private func v2AgentShouldPrepareBmuxIndex(command: String) -> Bool {
+        switch command {
+        case "search", "search_many", "symbols", "context", "impact", "trace", "refs", "rename", "changes", "module", "route", "artifact_search":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func v2AgentBmuxIndexContextPayload(
+        repoRoot: String,
+        params: [String: Any],
+        resolution: (session: AgentSession?, repoRoot: String?)
+    ) -> [String: Any] {
+        let workspaceContext = v2AgentResolveContext(params: params, session: resolution.session)
+        let workspaceHints = v2AgentBmuxIndexWorkspaceHints(repoRoot: repoRoot, context: workspaceContext)
+
+        var activePath = v2String(params, "active_path")
+            ?? v2String(params, "path")
+            ?? workspaceHints.activePath
+        var openPaths = v2AgentMergeOrderedStrings(v2StringArray(params, "open_paths") ?? [], workspaceHints.openPaths)
+        var recentPaths = v2AgentMergeOrderedStrings(v2StringArray(params, "recent_paths") ?? [], workspaceHints.recentPaths)
+        if let explicitPath = v2String(params, "path") {
+            openPaths = v2AgentMergeOrderedStrings([explicitPath], openPaths)
+            recentPaths = v2AgentMergeOrderedStrings([explicitPath], recentPaths)
+        }
+
+        activePath = v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: activePath)
+        openPaths = openPaths.compactMap { v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: $0) }
+        recentPaths = recentPaths.compactMap { v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: $0) }
+
+        var payload: [String: Any] = [:]
+        if let activePath, !activePath.isEmpty {
+            payload["active_path"] = activePath
+        }
+        if !openPaths.isEmpty {
+            payload["open_paths"] = Array(openPaths.prefix(12))
+        }
+        if !recentPaths.isEmpty {
+            payload["recent_paths"] = Array(recentPaths.prefix(12))
+        }
+        if let changedPaths = v2StringArray(params, "changed_paths"), !changedPaths.isEmpty {
+            payload["changed_paths"] = Array(changedPaths.prefix(12))
+        }
+        if let modulePathPrefix = v2String(params, "module_path_prefix") ?? workspaceHints.modulePathPrefix,
+           let normalizedPrefix = v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: modulePathPrefix),
+           !normalizedPrefix.isEmpty {
+            payload["module_path_prefix"] = normalizedPrefix
+        }
+        if let literalTerms = v2StringArray(params, "literal_terms"), !literalTerms.isEmpty {
+            payload["literal_terms"] = Array(literalTerms.prefix(8))
+        }
+        if let artifactText = v2String(params, "artifact_text"), !artifactText.isEmpty {
+            payload["artifact_text"] = artifactText
+        }
+        if let pathHitLimit = v2Int(params, "path_hit_limit"), pathHitLimit > 0 {
+            payload["path_hit_limit"] = min(pathHitLimit, 4)
+        }
+        return payload
+    }
+
+    private func v2AgentBmuxIndexWorkspaceHints(
+        repoRoot: String,
+        context: AgentWorkspaceContext?
+    ) -> (activePath: String?, openPaths: [String], recentPaths: [String], modulePathPrefix: String?) {
+        guard let context else {
+            return (nil, [], [], nil)
+        }
+
+        return v2MainSync {
+            let activePath = context.surfaceId.flatMap { surfaceId in
+                v2AgentBmuxIndexWorkspaceFilePath(repoRoot: repoRoot, workspace: context.workspace, surfaceId: surfaceId)
+            }
+            let openPaths = orderedPanels(in: context.workspace)
+                .compactMap { panel in
+                    v2AgentBmuxIndexWorkspaceFilePath(repoRoot: repoRoot, workspace: context.workspace, surfaceId: panel.id)
+                }
+            let recentPaths = v2AgentMergeOrderedStrings(activePath.map { [$0] } ?? [], openPaths)
+            let modulePathPrefix = context.surfaceId.flatMap { surfaceId in
+                v2AgentBmuxIndexWorkspaceModulePrefix(repoRoot: repoRoot, context: context, surfaceId: surfaceId)
+            } ?? activePath.flatMap(v2AgentBmuxIndexParentPath)
+            return (activePath, openPaths, recentPaths, modulePathPrefix)
+        }
+    }
+
+    private func v2AgentBmuxIndexWorkspaceFilePath(
+        repoRoot: String,
+        workspace: Workspace,
+        surfaceId: UUID
+    ) -> String? {
+        if let markdownPath = workspace.markdownPanel(for: surfaceId)?.filePath {
+            return v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: markdownPath)
+        }
+        return nil
+    }
+
+    private func v2AgentBmuxIndexWorkspaceModulePrefix(
+        repoRoot: String,
+        context: AgentWorkspaceContext,
+        surfaceId: UUID
+    ) -> String? {
+        if let filePath = v2AgentBmuxIndexWorkspaceFilePath(repoRoot: repoRoot, workspace: context.workspace, surfaceId: surfaceId),
+           let parent = v2AgentBmuxIndexParentPath(filePath) {
+            return parent
+        }
+        if let directory = v2AgentString(context.workspace.panelDirectories[surfaceId]),
+           let normalized = v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: directory),
+           !normalized.isEmpty {
+            return normalized
+        }
+        return nil
+    }
+
+    private func v2AgentBmuxIndexNormalizedRepoPath(repoRoot: String, value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let standardizedRoot = NSString(string: repoRoot).standardizingPath
+        let standardizedValue = NSString(string: trimmed).standardizingPath
+        if standardizedValue == standardizedRoot {
+            return nil
+        }
+        let prefix = standardizedRoot.hasSuffix("/") ? standardizedRoot : "\(standardizedRoot)/"
+        if standardizedValue.hasPrefix(prefix) {
+            let relative = String(standardizedValue.dropFirst(prefix.count))
+            return relative.isEmpty ? nil : relative
+        }
+        if standardizedValue.hasPrefix("/") {
+            return standardizedValue
+        }
+        if trimmed.hasPrefix("./") {
+            return String(trimmed.dropFirst(2))
+        }
+        return trimmed
+    }
+
+    private func v2AgentBmuxIndexParentPath(_ path: String) -> String? {
+        let components = path.split(separator: "/").map(String.init)
+        guard components.count > 1 else {
+            return nil
+        }
+        let parent = components.dropLast().joined(separator: "/")
+        return parent.isEmpty ? nil : parent
+    }
+
+    private func v2AgentMergeOrderedStrings(_ lhs: [String], _ rhs: [String], limit: Int = 12) -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for value in lhs + rhs {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            let key = trimmed.lowercased()
+            guard seen.insert(key).inserted else {
+                continue
+            }
+            ordered.append(trimmed)
+            if ordered.count >= limit {
+                break
+            }
+        }
+        return ordered
+    }
+
+    private func v2AgentNormalizedBmuxIndexRequest(repoRoot: String, request: [String: Any]) -> [String: Any] {
+        var normalized = request
+        for key in ["path", "active_path", "module_path_prefix"] {
+            if let value = request[key] as? String,
+               let normalizedValue = v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: value) {
+                normalized[key] = normalizedValue
+            }
+        }
+        for key in ["open_paths", "recent_paths", "changed_paths"] {
+            if let values = request[key] as? [String] {
+                normalized[key] = values.compactMap { v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: $0) }
+            } else if let values = request[key] as? [Any] {
+                normalized[key] = values.compactMap { ($0 as? String).flatMap { v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: $0) } }
+            }
+        }
+        return normalized
+    }
+
+    private func v2AgentAugmentBmuxIndexItem(
+        repoRoot: String,
+        item: [String: Any]
+    ) -> [String: Any] {
+        guard let path = item["path"] as? String else {
+            return item
+        }
+        var augmented = item
+        augmented["relative_path"] = path
+        augmented["absolute_path"] = v2AgentAbsoluteCodePath(repoRoot: repoRoot, path: path)
+        return augmented
+    }
+
+    private func v2AgentAugmentBmuxIndexItems(
+        repoRoot: String,
+        items: [[String: Any]]
+    ) -> [[String: Any]] {
+        items.map { v2AgentAugmentBmuxIndexItem(repoRoot: repoRoot, item: $0) }
     }
 
     private func v2AgentResolveContext(

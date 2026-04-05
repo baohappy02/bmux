@@ -50,6 +50,27 @@ SIGN_HASH="A050CC7E193C8221BDBA204E731B046CDCCC1B30"
 ENTITLEMENTS="bmux.entitlements"
 APP_PATH="build/Build/Products/Release/bmux.app"
 
+find_bmux_deps_src() {
+  local resolve_script="$PWD/scripts/resolve-bmux-deps.sh"
+  if [[ ! -f "$resolve_script" ]]; then
+    echo "error: missing bmux-deps resolver script at $resolve_script" >&2
+    return 1
+  fi
+  bash "$resolve_script"
+}
+
+bundle_runtime_binaries() {
+  local app_path="$1"
+  local bin_dir="${app_path}/Contents/Resources/bin"
+  local bmux_deps_src=""
+
+  mkdir -p "$bin_dir"
+
+  bmux_deps_src="$(find_bmux_deps_src)"
+  cp "$bmux_deps_src" "$bin_dir/bmux-deps"
+  chmod +x "$bin_dir/bmux-deps"
+}
+
 # --- Pre-flight ---
 source ~/.secrets/bmuxterm.env
 export SPARKLE_PRIVATE_KEY
@@ -74,6 +95,8 @@ rm -rf build/
 xcodebuild -scheme bmux -configuration Release -derivedDataPath build CODE_SIGNING_ALLOWED=NO build 2>&1 | tail -5
 echo "Build succeeded"
 
+bundle_runtime_binaries "$APP_PATH"
+
 HELPER_PATH="$APP_PATH/Contents/Resources/bin/ghostty"
 if [ ! -x "$HELPER_PATH" ]; then
   echo "Ghostty theme picker helper not found at $HELPER_PATH" >&2
@@ -93,9 +116,15 @@ echo "Sparkle keys injected"
 # --- Codesign ---
 echo "Codesigning..."
 CLI_PATH="$APP_PATH/Contents/Resources/bin/bmux"
+BMUX_DEPS_PATH="$APP_PATH/Contents/Resources/bin/bmux-deps"
 if [ -f "$CLI_PATH" ]; then
   /usr/bin/codesign --force --options runtime --timestamp --sign "$SIGN_HASH" --entitlements "$ENTITLEMENTS" "$CLI_PATH"
 fi
+if [ ! -x "$BMUX_DEPS_PATH" ]; then
+  echo "Required bmux-deps runtime helper not found at $BMUX_DEPS_PATH" >&2
+  exit 1
+fi
+/usr/bin/codesign --force --options runtime --timestamp --sign "$SIGN_HASH" --entitlements "$ENTITLEMENTS" "$BMUX_DEPS_PATH"
 if [ -f "$HELPER_PATH" ]; then
   /usr/bin/codesign --force --options runtime --timestamp --sign "$SIGN_HASH" --entitlements "$ENTITLEMENTS" "$HELPER_PATH"
 fi

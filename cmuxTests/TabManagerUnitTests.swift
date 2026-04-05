@@ -531,6 +531,81 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         )
     }
 
+    func testResolvedDependencyBootstrapPathPrefersOverrideThenBundledBinary() throws {
+        let fileManager = FileManager.default
+        let tempDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-deps-path-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempDir) }
+
+        let overrideURL = tempDir.appendingPathComponent("override-bmux-deps")
+        let bundledURL = tempDir.appendingPathComponent("bundled-bmux-deps")
+        try "#!/bin/sh\nexit 0\n".write(to: overrideURL, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nexit 0\n".write(to: bundledURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: overrideURL.path)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bundledURL.path)
+
+        XCTAssertEqual(
+            TabManager.resolvedDependencyBootstrapPathForTesting(
+                override: overrideURL.path,
+                environment: ["PATH": "/usr/bin:/bin"],
+                bundledPath: bundledURL.path,
+                fallbackDirectories: []
+            ),
+            overrideURL.path
+        )
+
+        XCTAssertEqual(
+            TabManager.resolvedDependencyBootstrapPathForTesting(
+                override: nil,
+                environment: ["PATH": "/usr/bin:/bin"],
+                bundledPath: bundledURL.path,
+                fallbackDirectories: []
+            ),
+            bundledURL.path
+        )
+    }
+
+    func testAddWorkspaceWithExplicitWorkingDirectorySchedulesDependencyBootstrap() throws {
+        let fileManager = FileManager.default
+        let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-deps-bootstrap-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: repoURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: repoURL) }
+
+        let bootstrapExpectation = expectation(description: "dependency bootstrap invoked")
+        var capturedDirectories: [String] = []
+        let manager = TabManager(dependencyBootstrapRunner: { directory in
+            capturedDirectories.append(directory)
+            bootstrapExpectation.fulfill()
+        })
+
+        _ = manager.addWorkspace(
+            workingDirectory: repoURL.path,
+            select: false,
+            eagerLoadTerminal: false
+        )
+
+        wait(for: [bootstrapExpectation], timeout: 1.0)
+        XCTAssertEqual(capturedDirectories, [repoURL.standardizedFileURL.path])
+    }
+
+    func testAddWorkspaceWithoutExplicitWorkingDirectoryDoesNotScheduleDependencyBootstrap() {
+        let idleExpectation = expectation(description: "dependency bootstrap should stay idle")
+        idleExpectation.isInverted = true
+        let manager = TabManager(dependencyBootstrapRunner: { _ in
+            idleExpectation.fulfill()
+        })
+
+        _ = manager.addWorkspace(select: false, eagerLoadTerminal: false)
+
+        wait(for: [idleExpectation], timeout: 0.3)
+    }
+
     func testPeriodicWorkspaceGitMetadataRefreshClearsStalePullRequestAfterBranchReset() throws {
         let fileManager = FileManager.default
         let repoURL = fileManager.temporaryDirectory.appendingPathComponent("cmux-git-refresh-\(UUID().uuidString)")
