@@ -5,8 +5,8 @@ End-to-end test for sidebar CWD + git branch updates.
 This specifically covers the regression where the sidebar directory can get
 stuck (e.g. showing "~" even after multiple `cd`s).
 
-Run with a tagged instance to avoid unix socket conflicts:
-  CMUX_TAG=<tag> python3 tests/test_sidebar_cwd_git.py
+Run with CMUX_SOCKET_PATH=<path> when targeting a non-default socket:
+  CMUX_SOCKET_PATH=/tmp/bmux-debug.sock python3 tests/test_sidebar_cwd_git.py
 """
 
 from __future__ import annotations
@@ -152,7 +152,7 @@ def _send_cd_and_wait(
 def main() -> int:
     tag = os.environ.get("CMUX_TAG") or ""
     if not tag:
-        print("Tip: set CMUX_TAG=<tag> when running this test to avoid socket conflicts.")
+        print("Tip: set CMUX_SOCKET_PATH=<path> when running this test against a non-default socket.")
 
     base = Path("/tmp") / f"bmux_sidebar_test_{os.getpid()}"
     repo = base / "repo"

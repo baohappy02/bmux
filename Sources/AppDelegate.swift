@@ -2840,8 +2840,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         isTerminatingApp = true
         _ = saveSessionSnapshot(includeScrollback: true, removeWhenEmpty: false)
 
-        // Tagged DEV builds are ephemeral, skip quit confirmation entirely.
-        if SocketControlSettings.isTaggedDevBuild() {
+        // Alternate debug bundle variants are ephemeral, skip quit confirmation entirely.
+        if SocketControlSettings.isAlternateDebugBuild() {
             return .terminateNow
         }
 
@@ -9329,8 +9329,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func handleQuitShortcutWarning() -> Bool {
-        // Tagged DEV builds are ephemeral, skip quit confirmation entirely.
-        if SocketControlSettings.isTaggedDevBuild() {
+        // Alternate debug bundle variants are ephemeral, skip quit confirmation entirely.
+        if SocketControlSettings.isAlternateDebugBuild() {
             NSApp.terminate(nil)
             return true
         }
@@ -12396,14 +12396,8 @@ enum MenuBarBuildHintFormatter {
     ) -> String? {
         guard isDebugBuild else { return nil }
         let normalized = appName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prefix = "bmux DEV"
-        guard normalized.hasPrefix(prefix) else { return "Build: DEV" }
-
-        let suffix = String(normalized.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        if suffix.isEmpty {
-            return "Build: DEV (untagged)"
-        }
-        return "Build Tag: \(suffix)"
+        guard !normalized.isEmpty else { return "Build: DEBUG" }
+        return "Build: DEBUG"
     }
 
     private static func defaultAppName() -> String {

@@ -75,7 +75,7 @@ def get_bmux_pid() -> Optional[int]:
     if result.returncode != 0:
         # Try DEV build
         result = subprocess.run(
-            ["pgrep", "-f", r"bmux DEV\.app/Contents/MacOS/bmux"],
+            ["pgrep", "-f", r"bmux\.app/Contents/MacOS/bmux"],
             capture_output=True,
             text=True,
         )
@@ -262,7 +262,7 @@ def main():
         print(f"Connected to {socket_path}")
     except bmuxError:
         print("\n❌ SKIP: Could not connect to bmux socket")
-        print("Tip: set CMUX_TAG=<tag> or CMUX_SOCKET_PATH=<path> to target a tagged instance.")
+        print("Tip: set CMUX_SOCKET_PATH=<path> to target a specific socket.")
         return 0
 
     results = []

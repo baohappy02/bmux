@@ -94,7 +94,7 @@ def run_tests():
     if not os.path.exists(socket_path):
         print(f"Error: Socket not found at {socket_path}")
         print("Please make sure bmux is running.")
-        print("Tip: set CMUX_TAG=<tag> or CMUX_SOCKET_PATH=<path> to target a tagged instance.")
+        print("Tip: set CMUX_SOCKET_PATH=<path> to target a specific socket.")
         return 1
 
     results = []

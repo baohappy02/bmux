@@ -388,6 +388,7 @@ class TerminalController {
         var workspaceId: UUID?
         var paneId: UUID?
         var surfaceId: UUID?
+        var managedTaskSurfaceId: UUID?
         var layoutRev: Int
         var layoutSignature: String
         var recoveredAt: Date?
@@ -492,6 +493,16 @@ class TerminalController {
         let workspace: Workspace
         let paneId: UUID?
         let surfaceId: UUID?
+    }
+
+    private struct AgentTaskTerminalAcquisition {
+        let context: AgentWorkspaceContext
+        let terminalPanel: TerminalPanel
+        let placement: String
+        let splitApplied: Bool
+        let visibilityGuardPayload: [String: Any]?
+        let created: Bool
+        let managedTaskSurfaceId: UUID?
     }
 
     private struct AgentSplitVisibilityDecision {
@@ -600,6 +611,7 @@ class TerminalController {
     private var v2AgentBmuxIndexRuntime: AgentBmuxIndexRuntime?
     private var v2AgentRecordedArtifacts: [AgentRecordedArtifact] = []
     private var v2AgentAvailableToolsCache: [String]?
+    private var v2AgentAvailableToolsCachePATH: String?
     private let v2AgentStateLock = NSRecursiveLock()
     private let v2AgentMinimumVisibleSplitWidth: CGFloat = 320
     private let v2AgentMinimumVisibleSplitHeight: CGFloat = 200
@@ -3520,6 +3532,7 @@ class TerminalController {
             workspaceId: context.workspace.id,
             paneId: context.paneId,
             surfaceId: context.surfaceId,
+            managedTaskSurfaceId: nil,
             layoutRev: 1,
             layoutSignature: layout.signature
         )
@@ -3597,7 +3610,9 @@ class TerminalController {
         let updatedSession = v2AgentUpdateSession(
             session,
             context: context,
-            layoutSignature: layout.signature
+            layoutSignature: layout.signature,
+            managedTaskSurfaceId: session.managedTaskSurfaceId,
+            updateManagedTaskSurface: false
         )
         withV2AgentState {
             v2AgentSessions[sessionId] = updatedSession
@@ -3688,13 +3703,17 @@ class TerminalController {
             "runtime_helper_drift_detected": runtimeHelpers.driftDetected,
             "task_execution_guidance": [
                 "Prefer agent.task.run or agent.task.run_profile for build, test, verify, typecheck, install, migration, benchmark, and dev-server commands.",
-                "For a single managed command, call agent.task.run directly; it can auto-attach to the current focus and reuse or create the task terminal without a separate attach or ensure step.",
+                "For a single managed command, call agent.task.run directly; it can auto-attach to the current focus and dispatch into a separate visible task terminal without a separate attach or ensure step.",
                 "Only call agent.capabilities when you need environment, profile, or helper discovery; do not fetch it before every managed task.",
                 "Only call agent.layout when the next step depends on topology or a previous action changed panes/surfaces.",
                 "Prefer repo wrappers or bmux-managed tasks over raw xcodebuild when available; local xcodebuild failures often come from sandbox, DerivedData, or cache permissions instead of the real code issue.",
                 "For one-shot work, agent.open, agent.ensure, agent.task.run, agent.task.run_many, and agent.task.run_profile can omit session_id; bmux will auto-attach to the current focus and return session_id in the payload.",
+                "Managed task dispatch defaults to a separate visible terminal surface and creates a right split when no reusable task terminal is already visible.",
                 "Use agent.task.result as the default success channel. Only read agent.task.logs on failure, timeout, or explicit user request.",
-                "When a command is noisy and the user may want to inspect the terminal, bmux defaults pause_for_user=true unless the caller explicitly overrides it; stop until the user follows up."
+                "For intentionally unattended work with pause_for_user=false, use agent.task.wait as the completion channel; it returns the final structured task result when the job exits.",
+                "On failed unattended work, consume failure_markers first, then failure_context, before raw logs. failure_markers scans only marker lines such as error, failed, fatal, panic, or exception instead of returning a tail dump.",
+                "When a command is noisy and the user may want to inspect the terminal, bmux defaults pause_for_user=true unless the caller explicitly overrides it; stop until the user follows up.",
+                "Do not fall back to background shell execution when managed task terminals are available."
             ],
             "policy": [
                 "default_execution_class": "local_verify",
@@ -3711,9 +3730,16 @@ class TerminalController {
                     ],
                     "prefer_profiles_when_available": true,
                     "success_channel": "agent.task.result",
+                    "unattended_completion_channel": "agent.task.wait",
                     "logs_on_success": "avoid",
-                    "logs_on_failure": "on_demand",
-                    "pause_for_user_for_noisy_commands": true
+                    "logs_on_failure": "after_failure_markers_and_context",
+                    "failure_markers_on_failure": "automatic",
+                    "failure_context_on_failure": "automatic",
+                    "pause_for_user_for_noisy_commands": true,
+                    "ensure_visible_terminal_before_dispatch": true,
+                    "default_task_terminal_split": "right",
+                    "reuse_attached_surface_for_noisy_tasks": false,
+                    "background_exec_fallback": "disallowed_when_managed_task_terminals_are_available"
                 ],
                 "network_research_requires_pricing_check": true,
                 "block_paid_or_billing_gated_work_without_approval": true,
@@ -4037,47 +4063,46 @@ class TerminalController {
 
         switch target {
         case "terminal":
-            let reusedSurfaceId = v2AgentReusableTerminalSurfaceId(params: params, context: context)
-            if let reusedSurfaceId {
-                let reusedContext = AgentWorkspaceContext(
-                    windowId: context.windowId,
-                    tabManager: context.tabManager,
-                    workspace: context.workspace,
-                    paneId: context.workspace.paneId(forPanelId: reusedSurfaceId)?.id,
-                    surfaceId: reusedSurfaceId
+            var result: V2CallResult = .err(code: "internal_error", message: "Failed to ensure terminal", data: nil)
+            v2MainSync {
+                let acquisitionResolution = v2AgentAcquireTaskTerminal(
+                    params: params,
+                    session: session,
+                    baseContext: context,
+                    workingDirectory: v2String(params, "cwd")?.trimmingCharacters(in: .whitespacesAndNewlines)
                 )
+                let acquisition: AgentTaskTerminalAcquisition
+                switch acquisitionResolution {
+                case .success(let resolved):
+                    acquisition = resolved
+                case .failure(let error):
+                    result = error
+                    return
+                }
+
                 let updatedSession = v2AgentPersistSession(
                     sessionId: sessionId,
                     session: session,
-                    context: reusedContext
+                    context: acquisition.context,
+                    managedTaskSurfaceId: acquisition.managedTaskSurfaceId,
+                    updateManagedTaskSurface: true
                 )
-                var payload = v2AgentSurfaceSummary(context: reusedContext)
+                var payload = v2AgentSurfaceSummary(context: acquisition.context)
                 payload["session_id"] = sessionId
                 payload["target"] = "terminal"
-                payload["created"] = false
+                payload["created"] = acquisition.created
                 payload["layout_rev"] = updatedSession.layoutRev
+                payload["placement"] = acquisition.placement
+                payload["split_applied"] = acquisition.splitApplied
+                if let visibilityGuardPayload = acquisition.visibilityGuardPayload {
+                    payload["visibility_guard"] = visibilityGuardPayload
+                }
                 if sessionAutoAttached {
                     payload["session_auto_attached"] = true
                 }
-                return .ok(payload)
+                result = .ok(payload)
             }
-
-            var openParams = params
-            openParams["kind"] = "terminal"
-            if openParams["split"] == nil { openParams["split"] = "right" }
-            if openParams["focus"] == nil { openParams["focus"] = false }
-            switch v2AgentOpen(params: openParams) {
-            case .ok(let value):
-                var payload = (value as? [String: Any]) ?? [:]
-                payload["target"] = "terminal"
-                payload["created"] = true
-                if sessionAutoAttached {
-                    payload["session_auto_attached"] = true
-                }
-                return .ok(payload)
-            case .err(let code, let message, let data):
-                return .err(code: code, message: message, data: data)
-            }
+            return result
 
         case "browser":
             let requestedURL = v2String(params, "url")?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4722,119 +4747,25 @@ class TerminalController {
                 return
             }
 
-            let terminalContext: AgentWorkspaceContext
-            let terminalPanel: TerminalPanel
-            let placement: String
-            let splitApplied: Bool
-            let visibilityGuardPayload: [String: Any]?
-
-            if let explicitSurfaceId = v2UUID(params, "surface_id"),
-               let explicitTerminalPanel = baseContext.workspace.terminalPanel(for: explicitSurfaceId) {
-                terminalPanel = explicitTerminalPanel
-                terminalContext = AgentWorkspaceContext(
-                    windowId: baseContext.windowId,
-                    tabManager: baseContext.tabManager,
-                    workspace: baseContext.workspace,
-                    paneId: baseContext.workspace.paneId(forPanelId: explicitSurfaceId)?.id,
-                    surfaceId: explicitSurfaceId
-                )
-                placement = "surface"
-                splitApplied = false
-                visibilityGuardPayload = nil
-            // Keep no-split task runs on the currently visible terminal when possible so
-            // user-gated noisy commands do not disappear into a background pane tab.
-            } else if let reusedSurfaceId = v2AgentReusableTerminalSurfaceId(
+            let acquisitionResolution = v2AgentAcquireTaskTerminal(
                 params: params,
-                context: baseContext
-            ),
-                      let reusedPanel = baseContext.workspace.terminalPanel(for: reusedSurfaceId) {
-                terminalPanel = reusedPanel
-                terminalContext = AgentWorkspaceContext(
-                    windowId: baseContext.windowId,
-                    tabManager: baseContext.tabManager,
-                    workspace: baseContext.workspace,
-                    paneId: baseContext.workspace.paneId(forPanelId: reusedSurfaceId)?.id,
-                    surfaceId: reusedSurfaceId
-                )
-                placement = "surface"
-                splitApplied = false
-                visibilityGuardPayload = nil
-            } else if let splitRaw {
-                let splitDirection = parseSplitDirection(splitRaw) ?? .right
-                let sourceSurfaceId = baseContext.surfaceId ?? orderedPanels(in: baseContext.workspace).first?.id
-                guard let sourceSurfaceId else {
-                    result = .err(code: "not_found", message: "No source surface available to create task terminal", data: nil)
-                    return
-                }
-                let splitDecision = v2AgentSplitVisibilityDecision(
-                    workspace: baseContext.workspace,
-                    sourceSurfaceId: sourceSurfaceId,
-                    direction: splitDirection
-                )
-                if let splitDecision,
-                   splitDecision.requiresFallback,
-                   let sourcePaneId = baseContext.workspace.paneId(forPanelId: sourceSurfaceId),
-                   let createdPanel = baseContext.workspace.newTerminalSurface(
-                    inPane: sourcePaneId,
-                    focus: false,
-                    workingDirectory: cwd
-                   ) {
-                    terminalPanel = createdPanel
-                    terminalContext = AgentWorkspaceContext(
-                        windowId: baseContext.windowId,
-                        tabManager: baseContext.tabManager,
-                        workspace: baseContext.workspace,
-                        paneId: sourcePaneId.id,
-                        surfaceId: createdPanel.id
-                    )
-                    placement = "surface"
-                    splitApplied = false
-                    visibilityGuardPayload = splitDecision.payload
-                } else {
-                    guard let createdPanel = baseContext.workspace.newTerminalSplit(
-                        from: sourceSurfaceId,
-                        orientation: splitDirection.orientation,
-                        insertFirst: splitDirection.insertFirst,
-                        focus: false
-                    ) else {
-                        result = .err(code: "internal_error", message: "Failed to create task terminal", data: nil)
-                        return
-                    }
-                    terminalPanel = createdPanel
-                    terminalContext = AgentWorkspaceContext(
-                        windowId: baseContext.windowId,
-                        tabManager: baseContext.tabManager,
-                        workspace: baseContext.workspace,
-                        paneId: baseContext.workspace.paneId(forPanelId: createdPanel.id)?.id,
-                        surfaceId: createdPanel.id
-                    )
-                    placement = "split"
-                    splitApplied = true
-                    visibilityGuardPayload = nil
-                }
-            } else {
-                guard let requestedPaneUUID = v2UUID(params, "pane_id") ?? baseContext.paneId,
-                      let requestedPaneId = v2AgentPaneId(for: requestedPaneUUID, workspace: baseContext.workspace),
-                      let createdPanel = baseContext.workspace.newTerminalSurface(
-                        inPane: requestedPaneId,
-                        focus: false,
-                        workingDirectory: cwd
-                      ) else {
-                    result = .err(code: "internal_error", message: "Failed to create task terminal surface", data: nil)
-                    return
-                }
-                terminalPanel = createdPanel
-                terminalContext = AgentWorkspaceContext(
-                    windowId: baseContext.windowId,
-                    tabManager: baseContext.tabManager,
-                    workspace: baseContext.workspace,
-                    paneId: requestedPaneId.id,
-                    surfaceId: createdPanel.id
-                )
-                placement = "surface"
-                splitApplied = false
-                visibilityGuardPayload = nil
+                session: session,
+                baseContext: baseContext,
+                workingDirectory: cwd
+            )
+            let acquisition: AgentTaskTerminalAcquisition
+            switch acquisitionResolution {
+            case .success(let resolved):
+                acquisition = resolved
+            case .failure(let error):
+                result = error
+                return
             }
+            let terminalContext = acquisition.context
+            let terminalPanel = acquisition.terminalPanel
+            let placement = acquisition.placement
+            let splitApplied = acquisition.splitApplied
+            let visibilityGuardPayload = acquisition.visibilityGuardPayload
 
             let taskId = "job:\(v2AgentNextTaskOrdinal)"
             v2AgentNextTaskOrdinal += 1
@@ -4925,7 +4856,9 @@ class TerminalController {
             let updatedSession = v2AgentPersistSession(
                 sessionId: sessionId,
                 session: session,
-                context: terminalContext
+                context: terminalContext,
+                managedTaskSurfaceId: acquisition.managedTaskSurfaceId,
+                updateManagedTaskSurface: true
             )
 
             var payload = v2AgentSurfaceSummary(context: terminalContext)
@@ -5047,8 +4980,10 @@ class TerminalController {
                     "startup_window_ms": retryPolicy.startupWindowMs
                 ]
             }
-            if index > 0 || params["split"] == nil {
-                jobParams["split"] = job.split ?? "right"
+            if let jobSplit = job.split {
+                jobParams["split"] = jobSplit
+            } else if index > 0, jobParams["split"] == nil {
+                jobParams["split"] = "right"
             }
 
             let runResult = v2AgentTaskRun(params: jobParams)
@@ -7287,7 +7222,9 @@ class TerminalController {
     private func v2AgentUpdateSession(
         _ session: AgentSession,
         context: AgentWorkspaceContext,
-        layoutSignature: String
+        layoutSignature: String,
+        managedTaskSurfaceId: UUID?,
+        updateManagedTaskSurface: Bool
     ) -> AgentSession {
         var updated = session
         updated.updatedAt = Date()
@@ -7295,6 +7232,9 @@ class TerminalController {
         updated.workspaceId = context.workspace.id
         updated.paneId = context.paneId
         updated.surfaceId = context.surfaceId
+        if updateManagedTaskSurface {
+            updated.managedTaskSurfaceId = managedTaskSurfaceId
+        }
         if updated.layoutSignature != layoutSignature {
             updated.layoutRev += 1
             updated.layoutSignature = layoutSignature
@@ -7305,13 +7245,17 @@ class TerminalController {
     private func v2AgentPersistSession(
         sessionId: String,
         session: AgentSession,
-        context: AgentWorkspaceContext
+        context: AgentWorkspaceContext,
+        managedTaskSurfaceId: UUID? = nil,
+        updateManagedTaskSurface: Bool = false
     ) -> AgentSession {
         let layout = v2AgentLayoutSnapshot(for: context)
         let updatedSession = v2AgentUpdateSession(
             session,
             context: context,
-            layoutSignature: layout.signature
+            layoutSignature: layout.signature,
+            managedTaskSurfaceId: managedTaskSurfaceId,
+            updateManagedTaskSurface: updateManagedTaskSurface
         )
         withV2AgentState {
             v2AgentSessions[sessionId] = updatedSession
@@ -7518,7 +7462,10 @@ class TerminalController {
             "cross_origin_frames": false,
             "managed_task_execution": true,
             "compact_task_results": true,
-            "pause_for_user_contract": true
+            "pause_for_user_contract": true,
+            "failure_context_payloads": true,
+            "failure_marker_payloads": true,
+            "visible_task_terminal_defaults": true
         ]
     }
 
@@ -8589,7 +8536,7 @@ class TerminalController {
             return true
         }
         if let profileName = profileName?.lowercased(),
-           ["verify.ts", "verify.flutter", "dev.web"].contains(profileName) {
+           ["verify.rust", "verify.ts", "verify.flutter", "dev.web"].contains(profileName) {
             return true
         }
 
@@ -8828,6 +8775,196 @@ class TerminalController {
         v2String(params, "split") == nil && v2String(params, "direction") == nil
     }
 
+    private func v2AgentIsVisibleSurface(
+        _ surfaceId: UUID,
+        workspace: Workspace
+    ) -> Bool {
+        guard let paneId = workspace.paneId(forPanelId: surfaceId) else { return false }
+        return workspace.effectiveSelectedPanelId(inPane: paneId) == surfaceId
+    }
+
+    private func v2AgentVisibleSurfaceIds(workspace: Workspace) -> [UUID] {
+        workspace.bonsplitController.allPaneIds.compactMap { paneId in
+            workspace.effectiveSelectedPanelId(inPane: paneId)
+        }
+    }
+
+    private func v2AgentReusableVisibleTerminalSurfaceId(
+        context: AgentWorkspaceContext,
+        candidatePaneUUID: UUID?,
+        excludedSurfaceIds: Set<UUID>
+    ) -> UUID? {
+        let workspace = context.workspace
+        return v2AgentVisibleSurfaceIds(workspace: workspace).first(where: { panelId in
+            guard !excludedSurfaceIds.contains(panelId),
+                  workspace.terminalPanel(for: panelId) != nil else {
+                return false
+            }
+            if let candidatePaneUUID,
+               workspace.paneId(forPanelId: panelId)?.id != candidatePaneUUID {
+                return false
+            }
+            return true
+        })
+    }
+
+    private func v2AgentManagedTaskSurfaceId(
+        session: AgentSession,
+        context: AgentWorkspaceContext,
+        candidatePaneUUID: UUID?
+    ) -> UUID? {
+        guard let surfaceId = session.managedTaskSurfaceId,
+              context.workspace.terminalPanel(for: surfaceId) != nil,
+              v2AgentIsVisibleSurface(surfaceId, workspace: context.workspace) else {
+            return nil
+        }
+        if let candidatePaneUUID,
+           context.workspace.paneId(forPanelId: surfaceId)?.id != candidatePaneUUID {
+            return nil
+        }
+        return surfaceId
+    }
+
+    private func v2AgentAcquireTaskTerminal(
+        params: [String: Any],
+        session: AgentSession,
+        baseContext: AgentWorkspaceContext,
+        workingDirectory: String?
+    ) -> AgentResolution<AgentTaskTerminalAcquisition> {
+        let workspace = baseContext.workspace
+
+        if let explicitSurfaceId = v2UUID(params, "surface_id"),
+           let explicitTerminalPanel = workspace.terminalPanel(for: explicitSurfaceId) {
+            let explicitContext = AgentWorkspaceContext(
+                windowId: baseContext.windowId,
+                tabManager: baseContext.tabManager,
+                workspace: workspace,
+                paneId: workspace.paneId(forPanelId: explicitSurfaceId)?.id,
+                surfaceId: explicitSurfaceId
+            )
+            return .success(
+                AgentTaskTerminalAcquisition(
+                    context: explicitContext,
+                    terminalPanel: explicitTerminalPanel,
+                    placement: "surface",
+                    splitApplied: false,
+                    visibilityGuardPayload: nil,
+                    created: false,
+                    managedTaskSurfaceId: session.managedTaskSurfaceId
+                )
+            )
+        }
+
+        let splitRaw = v2String(params, "split")?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            ?? v2String(params, "direction")?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hasExplicitSurfaceTarget = params["surface_id"] != nil
+        let hasExplicitPaneTarget = params["pane_id"] != nil
+        let constrainedPaneUUID: UUID? = (hasExplicitSurfaceTarget || hasExplicitPaneTarget)
+            ? (v2UUID(params, "pane_id") ?? baseContext.paneId)
+            : nil
+
+        if splitRaw == nil {
+            if let managedSurfaceId = v2AgentManagedTaskSurfaceId(
+                session: session,
+                context: baseContext,
+                candidatePaneUUID: constrainedPaneUUID
+            ),
+               let managedPanel = workspace.terminalPanel(for: managedSurfaceId) {
+                let managedContext = AgentWorkspaceContext(
+                    windowId: baseContext.windowId,
+                    tabManager: baseContext.tabManager,
+                    workspace: workspace,
+                    paneId: workspace.paneId(forPanelId: managedSurfaceId)?.id,
+                    surfaceId: managedSurfaceId
+                )
+                return .success(
+                    AgentTaskTerminalAcquisition(
+                        context: managedContext,
+                        terminalPanel: managedPanel,
+                        placement: "surface",
+                        splitApplied: false,
+                        visibilityGuardPayload: nil,
+                        created: false,
+                        managedTaskSurfaceId: managedSurfaceId
+                    )
+                )
+            }
+
+            let excludedSurfaceIds = Set([baseContext.surfaceId].compactMap { $0 })
+            if let visibleSurfaceId = v2AgentReusableVisibleTerminalSurfaceId(
+                context: baseContext,
+                candidatePaneUUID: constrainedPaneUUID,
+                excludedSurfaceIds: excludedSurfaceIds
+            ),
+               let visiblePanel = workspace.terminalPanel(for: visibleSurfaceId) {
+                let visibleContext = AgentWorkspaceContext(
+                    windowId: baseContext.windowId,
+                    tabManager: baseContext.tabManager,
+                    workspace: workspace,
+                    paneId: workspace.paneId(forPanelId: visibleSurfaceId)?.id,
+                    surfaceId: visibleSurfaceId
+                )
+                return .success(
+                    AgentTaskTerminalAcquisition(
+                        context: visibleContext,
+                        terminalPanel: visiblePanel,
+                        placement: "surface",
+                        splitApplied: false,
+                        visibilityGuardPayload: nil,
+                        created: false,
+                        managedTaskSurfaceId: visibleSurfaceId
+                    )
+                )
+            }
+        }
+
+        let splitDirection = parseSplitDirection(splitRaw ?? "right") ?? .right
+        guard let sourceSurfaceId = baseContext.surfaceId ?? orderedPanels(in: workspace).first?.id else {
+            return .failure(.err(code: "not_found", message: "No source surface available to create task terminal", data: nil))
+        }
+        if let splitDecision = v2AgentSplitVisibilityDecision(
+            workspace: workspace,
+            sourceSurfaceId: sourceSurfaceId,
+            direction: splitDirection
+        ), splitDecision.requiresFallback {
+            return .failure(.err(
+                code: "invalid_state",
+                message: "Unable to create visible task terminal split",
+                data: [
+                    "requested_split": splitRaw ?? "right",
+                    "visibility_guard": splitDecision.payload
+                ]
+            ))
+        }
+
+        guard let createdPanel = workspace.newTerminalSplit(
+            from: sourceSurfaceId,
+            orientation: splitDirection.orientation,
+            insertFirst: splitDirection.insertFirst,
+            focus: false
+        ) else {
+            return .failure(.err(code: "internal_error", message: "Failed to create task terminal", data: nil))
+        }
+        let createdContext = AgentWorkspaceContext(
+            windowId: baseContext.windowId,
+            tabManager: baseContext.tabManager,
+            workspace: workspace,
+            paneId: workspace.paneId(forPanelId: createdPanel.id)?.id,
+            surfaceId: createdPanel.id
+        )
+        return .success(
+            AgentTaskTerminalAcquisition(
+                context: createdContext,
+                terminalPanel: createdPanel,
+                placement: "split",
+                splitApplied: true,
+                visibilityGuardPayload: nil,
+                created: true,
+                managedTaskSurfaceId: createdPanel.id
+            )
+        )
+    }
+
     private static func v2AgentSelectReusableTerminalSurfaceId(
         explicitSurfaceId: UUID?,
         candidateSurfaceIds: [UUID],
@@ -8933,6 +9070,25 @@ class TerminalController {
         let scripts = v2AgentPackageScripts(repoRoot: repoRoot)
 
         switch name {
+        case "verify.rust":
+            guard availableTools.contains("cargo"),
+                  v2AgentHasFile(repoRoot: repoRoot, named: "Cargo.toml") else {
+                return nil
+            }
+            return AgentProfileSpec(
+                name: name,
+                executionClass: "local_verify",
+                approvalState: "not_required",
+                packageManager: nil,
+                repoRoot: repoRoot,
+                jobs: [.init(label: "cargo check", command: "cargo check --message-format=short", split: "right")],
+                expectedPorts: [],
+                cacheEligible: true,
+                retryPolicy: nil,
+                healthURLPath: nil,
+                healthExpectText: nil
+            )
+
         case "verify.ts":
             var jobs: [AgentProfileJobSpec] = []
             if scripts["typecheck"] != nil {
@@ -8944,7 +9100,7 @@ class TerminalController {
                 jobs.append(.init(label: "typecheck", command: tscCommand, split: "right"))
             }
             if scripts["build"] != nil {
-                jobs.append(.init(label: "build", command: v2AgentScriptCommand(scriptName: "build", packageManager: preferredPackageManager), split: "down"))
+                jobs.append(.init(label: "build", command: v2AgentScriptCommand(scriptName: "build", packageManager: preferredPackageManager), split: "right"))
             }
             guard !jobs.isEmpty else { return nil }
             return AgentProfileSpec(
@@ -9372,13 +9528,64 @@ class TerminalController {
             .map { $0 }
     }
 
+    private func v2AgentFailureMarkerHits(
+        from text: String,
+        limit: Int = 8
+    ) -> [[String: Any]] {
+        guard limit > 0 else { return [] }
+
+        let markerPatterns: [(String, String)] = [
+            ("error", #"\berror(?:\[[A-Z]\d+\])?\b"#),
+            ("failed", #"\bfail(?:ed|ure)?\b"#),
+            ("fatal", #"\bfatal\b"#),
+            ("panic", #"\bpanic\b"#),
+            ("exception", #"\bexception\b"#)
+        ]
+
+        var hits: [[String: Any]] = []
+        let lines = v2AgentRedactText(text)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        for (index, rawLine) in lines.enumerated() {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+
+            for (marker, pattern) in markerPatterns {
+                guard line.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil else {
+                    continue
+                }
+                hits.append([
+                    "line": index + 1,
+                    "marker": marker,
+                    "text": line
+                ])
+                break
+            }
+
+            if hits.count >= limit {
+                break
+            }
+        }
+
+        return hits
+    }
+
     private func v2AgentDetectedParser(command: String, output: String) -> String? {
         let normalizedCommand = command.lowercased()
+        if !output.isEmpty,
+           (normalizedCommand.contains("cargo") || normalizedCommand.contains("rustc")) {
+            return "rustc_short"
+        }
         if normalizedCommand.contains("tsc") { return "tsc" }
         if normalizedCommand.contains("pytest") { return "pytest" }
         if normalizedCommand.contains("flutter") && normalizedCommand.contains("test") { return "flutter_test" }
         if normalizedCommand.contains("xcodebuild") { return "xcodebuild" }
 
+        if output.range(of: #"(?m)^.+:\d+:\d+:\s+(?:error|warning)(?:\[[A-Z]\d+\])?:\s+.+$"#,
+                        options: [.regularExpression]) != nil {
+            return "rustc_short"
+        }
         if output.range(of: #"(?m)^.+\(\d+,\s*\d+\):\s*error\s+TS\d+:"#,
                         options: [.regularExpression]) != nil {
             return "tsc"
@@ -9441,6 +9648,28 @@ class TerminalController {
         var summary: String?
 
         switch tool {
+        case "rustc_short":
+            let matches = v2AgentRegexCaptureGroups(
+                pattern: #"^(.+?):(\d+):(\d+):\s+(error|warning)(?:\[(E\d+)\])?:\s+(.+)$"#,
+                text: safeOutput
+            )
+            diagnostics = matches.prefix(10).enumerated().map { index, match in
+                let severity = match[4].lowercased()
+                let code = match[5].isEmpty ? nil : match[5]
+                return v2AgentMakeDiagnostic(
+                    file: match[1],
+                    line: Int(match[2]),
+                    column: Int(match[3]),
+                    code: code,
+                    severity: severity,
+                    message: v2AgentRedactText(match[6]),
+                    isRootCause: index == 0
+                )
+            }
+            if !diagnostics.isEmpty {
+                summary = "cargo emitted \(diagnostics.count) compiler error\(diagnostics.count == 1 ? "" : "s")"
+            }
+
         case "tsc":
             let matches = v2AgentRegexCaptureGroups(
                 pattern: #"^(.+?)(?:\((\d+),\s*(\d+)\)|:(\d+):(\d+)\s*-\s*)(error|warning)\s+(TS\d+):\s+(.+)$"#,
@@ -9516,19 +9745,178 @@ class TerminalController {
             break
         }
 
-        let tail = v2AgentCompactTailLines(from: safeOutput, limit: diagnostics.isEmpty ? 8 : 5)
-        let fallbackSummary = tail.last ?? "command failed"
+        let failureMarkers = v2AgentFailureMarkerHits(from: safeOutput, limit: diagnostics.isEmpty ? 8 : 5)
+        let fallbackSummary = (failureMarkers.first?["text"] as? String)
+            ?? v2AgentCompactTailLines(from: safeOutput, limit: 1).last
+            ?? "command failed"
 
         var payload: [String: Any] = [
             "summary": summary ?? fallbackSummary,
-            "root_cause_count": diagnostics.isEmpty ? 0 : 1,
-            "tail": tail
+            "root_cause_count": diagnostics.isEmpty ? min(failureMarkers.count, 1) : 1
         ]
         if let tool {
             payload["tool"] = tool
         }
+        if !failureMarkers.isEmpty {
+            payload["failure_markers"] = failureMarkers
+        }
         if !diagnostics.isEmpty {
             payload["diagnostics"] = diagnostics
+        }
+        return payload
+    }
+
+    private func v2AgentTaskRootDiagnostic(_ diagnostics: [[String: Any]]) -> [String: Any]? {
+        diagnostics.first(where: { ($0["is_root_cause"] as? Bool) == true }) ?? diagnostics.first
+    }
+
+    private func v2AgentTaskFailureResolvedPath(
+        repoRoot: String?,
+        file: String
+    ) -> String {
+        if file.hasPrefix("/") {
+            return file
+        }
+        guard let repoRoot else {
+            return file
+        }
+        return URL(fileURLWithPath: repoRoot, isDirectory: true)
+            .appendingPathComponent(file)
+            .path
+    }
+
+    private func v2AgentTaskFailureSourceExcerpt(
+        path: String,
+        repoRoot: String?,
+        line: Int,
+        radius: Int = 2
+    ) -> [String: Any]? {
+        guard line > 0 else { return nil }
+
+        let resolvedPath = v2AgentTaskFailureResolvedPath(repoRoot: repoRoot, file: path)
+        guard let fileContents = try? String(contentsOfFile: resolvedPath, encoding: .utf8) else {
+            return nil
+        }
+
+        let allLines = fileContents.components(separatedBy: .newlines)
+        guard !allLines.isEmpty, line <= allLines.count else { return nil }
+
+        let startLine = max(1, line - radius)
+        let endLine = min(allLines.count, line + radius)
+        let excerptLines: [[String: Any]] = (startLine...endLine).map { excerptLine in
+            [
+                "line": excerptLine,
+                "text": allLines[excerptLine - 1]
+            ]
+        }
+
+        var payload: [String: Any] = [
+            "path": resolvedPath,
+            "focus_line": line,
+            "start_line": startLine,
+            "end_line": endLine,
+            "lines": excerptLines
+        ]
+        if let repoRoot,
+           let relativePath = v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: resolvedPath) {
+            payload["relative_path"] = relativePath
+        }
+        return payload
+    }
+
+    private func v2AgentTaskFailureModulePayload(
+        repoRoot: String,
+        path: String,
+        line: Int
+    ) -> [String: Any]? {
+        guard line > 0,
+              let normalizedPath = v2AgentBmuxIndexNormalizedRepoPath(repoRoot: repoRoot, value: path) else {
+            return nil
+        }
+
+        guard let moduleResult = v2AgentBmuxIndexPayload(
+            command: "module",
+            repoRoot: repoRoot,
+            payload: [
+                "path": normalizedPath,
+                "line": line
+            ]
+        ) else {
+            return nil
+        }
+
+        switch moduleResult {
+        case .success(let rawPayload):
+            let payload = v2AgentAugmentBmuxIndexPayload(repoRoot: repoRoot, payload: rawPayload)
+            var modulePayload: [String: Any] = [
+                "backend": payload["backend"] ?? "bmux-index",
+                "resolved": payload["resolved"] ?? false,
+                "mode": v2OrNull(payload["mode"]),
+                "index_state": v2OrNull(payload["index_state"]),
+                "path": v2OrNull(payload["path"]),
+                "line": v2OrNull(payload["line"])
+            ]
+            if let module = payload["module"] {
+                modulePayload["module"] = module
+            }
+            return modulePayload
+
+        case .failure:
+            return nil
+        }
+    }
+
+    private func v2AgentTaskFailureContextPayload(
+        task: AgentTask,
+        resultPayload: [String: Any]
+    ) -> [String: Any]? {
+        let repoRoot = v2AgentRepositoryRoot(startingAt: task.workingDirectory)
+        let diagnostics = (resultPayload["diagnostics"] as? [[String: Any]]) ?? []
+        if let rootDiagnostic = v2AgentTaskRootDiagnostic(diagnostics) {
+            let diagnosticFile = v2AgentString(rootDiagnostic["file"])
+            let diagnosticLine = rootDiagnostic["line"] as? Int
+
+            var payload: [String: Any] = [
+                "strategy": "root_diagnostic",
+                "root_diagnostic": rootDiagnostic
+            ]
+            if let repoRoot {
+                payload["repo_root"] = repoRoot
+            }
+
+            if let diagnosticFile,
+               let diagnosticLine {
+                if let excerpt = v2AgentTaskFailureSourceExcerpt(
+                    path: diagnosticFile,
+                    repoRoot: repoRoot,
+                    line: diagnosticLine
+                ) {
+                    payload["source_excerpt"] = excerpt
+                }
+                if let repoRoot,
+                   let module = v2AgentTaskFailureModulePayload(
+                    repoRoot: repoRoot,
+                    path: diagnosticFile,
+                    line: diagnosticLine
+                   ) {
+                    payload["module_context"] = module
+                }
+            }
+
+            return payload
+        }
+
+        let markers = (resultPayload["failure_markers"] as? [[String: Any]]) ?? []
+        guard let rootMarker = markers.first else {
+            return nil
+        }
+
+        var payload: [String: Any] = [
+            "strategy": "marker_search",
+            "root_marker": rootMarker
+        ]
+        if let repoRoot {
+            payload["repo_root"] = repoRoot
         }
         return payload
     }
@@ -9604,15 +9992,6 @@ class TerminalController {
                     payload["tail"] = v2AgentCompactTailLines(from: tailText, limit: requestedLines)
                     payload["tail_lines"] = requestedLines
                 }
-            } else if task.status == .failed,
-                      payload["tail"] == nil,
-                      let tailText = persistedFailureText ?? v2AgentReadTerminalText(
-                        terminalPanel: terminalPanel,
-                        includeScrollback: true,
-                        lineLimit: 8
-                      ) {
-                payload["tail"] = v2AgentCompactTailLines(from: tailText, limit: 8)
-                payload["tail_lines"] = 8
             }
         }
 
@@ -9625,6 +10004,7 @@ class TerminalController {
                 payload["summary"] = "command completed successfully"
             }
             payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "failure_markers")
             payload.removeValue(forKey: "root_cause_count")
             payload.removeValue(forKey: "log_path")
             if includeTailLines == nil {
@@ -9641,18 +10021,23 @@ class TerminalController {
                 payload["diagnostics"] = []
                 payload["root_cause_count"] = 0
             }
-            if payload["tail"] == nil {
-                payload["tail"] = []
+            if payload["failure_markers"] == nil {
+                payload["failure_markers"] = []
             }
             if payload["log_path"] == nil,
                let fallbackPath = v2AgentTaskLogPath(task: task) {
                 payload["log_path"] = fallbackPath
+            }
+            if payload["failure_context"] == nil,
+               let failureContext = v2AgentTaskFailureContextPayload(task: task, resultPayload: payload) {
+                payload["failure_context"] = failureContext
             }
 
         case .cancelled:
             payload["ok"] = false
             payload["summary"] = "command was cancelled"
             payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "failure_markers")
             payload.removeValue(forKey: "root_cause_count")
             payload.removeValue(forKey: "log_path")
             if includeTailLines == nil {
@@ -9664,6 +10049,7 @@ class TerminalController {
             payload["ok"] = false
             payload["summary"] = "command is queued"
             payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "failure_markers")
             payload.removeValue(forKey: "root_cause_count")
             payload.removeValue(forKey: "log_path")
             if includeTailLines == nil {
@@ -9675,6 +10061,7 @@ class TerminalController {
             payload["ok"] = false
             payload["summary"] = "command is still running"
             payload.removeValue(forKey: "diagnostics")
+            payload.removeValue(forKey: "failure_markers")
             payload.removeValue(forKey: "root_cause_count")
             payload.removeValue(forKey: "log_path")
             if includeTailLines == nil {
@@ -9759,11 +10146,19 @@ class TerminalController {
     }
 
     private func v2AgentAvailableTools() -> [String] {
-        if let cached = withV2AgentState({ v2AgentAvailableToolsCache }) {
-            return cached
+        let currentPATH = ProcessInfo.processInfo.environment["PATH"]
+            ?? getenv("PATH").map { String(cString: $0) }
+            ?? ""
+        let cached = withV2AgentState {
+            (tools: v2AgentAvailableToolsCache, path: v2AgentAvailableToolsCachePATH)
+        }
+        if let cachedTools = cached.tools, cached.path == currentPATH {
+            return cachedTools
         }
 
         let candidates = [
+            "cargo",
+            "rustc",
             "bun",
             "node",
             "tsc",
@@ -9776,12 +10171,14 @@ class TerminalController {
         let detected = candidates.filter { v2AgentResolvedCommandPath($0) != nil }
         withV2AgentState {
             v2AgentAvailableToolsCache = detected
+            v2AgentAvailableToolsCachePATH = currentPATH
         }
         return detected
     }
 
     private func v2AgentAvailableParsers(from availableTools: [String]) -> [String] {
         var parsers: [String] = []
+        if availableTools.contains("cargo") || availableTools.contains("rustc") { parsers.append("rustc_short") }
         if availableTools.contains("tsc") { parsers.append("tsc") }
         if availableTools.contains("pytest") { parsers.append("pytest") }
         if availableTools.contains("flutter") { parsers.append("flutter_test") }
@@ -9796,6 +10193,15 @@ class TerminalController {
         guard let repoRoot else { return [] }
         let fileManager = FileManager.default
         var profiles: [String] = []
+
+        if availableTools.contains("cargo") {
+            let cargoManifestPath = URL(fileURLWithPath: repoRoot, isDirectory: true)
+                .appendingPathComponent("Cargo.toml")
+                .path
+            if fileManager.fileExists(atPath: cargoManifestPath) {
+                profiles.append("verify.rust")
+            }
+        }
 
         if availableTools.contains("node") || availableTools.contains("bun") {
             let packageJSONPath = URL(fileURLWithPath: repoRoot, isDirectory: true)
@@ -9944,7 +10350,7 @@ class TerminalController {
     ) -> [String: Any] {
         let repoRoot = v2AgentRepositoryRoot(startingAt: task.workingDirectory)
         let diagnostics = Array(((resultPayload["diagnostics"] as? [[String: Any]]) ?? []).prefix(5))
-        let tail = Array(((resultPayload["tail"] as? [String]) ?? []).prefix(5))
+        let failureMarkers = Array(((resultPayload["failure_markers"] as? [[String: Any]]) ?? []).prefix(5))
 
         var metadata: [String: Any] = [
             "label": task.label,
@@ -9978,8 +10384,8 @@ class TerminalController {
         if !diagnostics.isEmpty {
             metadata["diagnostics"] = diagnostics
         }
-        if !tail.isEmpty {
-            metadata["tail"] = tail
+        if !failureMarkers.isEmpty {
+            metadata["failure_markers"] = failureMarkers
         }
 
         return [
@@ -10199,15 +10605,15 @@ class TerminalController {
     private func v2AgentSearchableFileCount(repoRoot: String) -> Int {
         let fileManager = FileManager.default
         let allowedExtensions = Set([
-            "swift", "ts", "tsx", "js", "jsx", "json", "css", "scss",
+            "swift", "rs", "ts", "tsx", "js", "jsx", "json", "css", "scss",
             "html", "md", "mjs", "cjs", "yaml", "yml", "dart", "py", "zig"
         ])
         let allowedFilenames = Set([
-            "Package.swift", "bun.lock", "bun.lockb", "package.json",
+            "Package.swift", "Cargo.toml", "bun.lock", "bun.lockb", "package.json",
             "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "pubspec.yaml"
         ])
         let ignoredDirectories = Set([
-            ".git", ".build", "DerivedData", "node_modules", ".next", "dist", "build"
+            ".git", ".build", "DerivedData", "node_modules", ".next", "dist", "build", "target"
         ])
 
         guard let enumerator = fileManager.enumerator(

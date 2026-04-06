@@ -52,7 +52,7 @@ def _wait_for_state_field(
 def main() -> int:
     tag = os.environ.get("CMUX_TAG") or ""
     if not tag:
-        print("Tip: set CMUX_TAG=<tag> when running this test to avoid socket conflicts.")
+        print("Tip: set CMUX_SOCKET_PATH=<path> when running this test against a non-default socket.")
 
     try:
         with bmux() as client:

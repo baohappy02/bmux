@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -eq 0 ]]; then
-  echo "error: reload2 requires a tag (example: ./scripts/reload2.sh --tag dev)" >&2
-  exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ $# -gt 0 ]]; then
+  echo "warning: reload2.sh forwards to reloadp.sh and ignores extra arguments." >&2
 fi
-
-echo "warning: reload2.sh is deprecated; forwarding to ./scripts/reload.sh --install-applications" >&2
-./scripts/reload.sh "$@" --install-applications
+exec "$SCRIPT_DIR/reloadp.sh"

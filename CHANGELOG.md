@@ -60,7 +60,7 @@ All notable changes to cmux are documented here.
 - Include hardware details in feedback submissions ([#1726](https://github.com/manaflow-ai/cmux/pull/1726))
 - Coalesce scrollbar updates during bulk output for improved performance ([#2116](https://github.com/manaflow-ai/cmux/pull/2116))
 - Reduce shell integration prompt latency ([#2109](https://github.com/manaflow-ai/cmux/pull/2109))
-- Skip quit confirmation for tagged DEV builds ([#2288](https://github.com/manaflow-ai/cmux/pull/2288))
+- Skip quit confirmation for alternate debug bundle variants ([#2288](https://github.com/manaflow-ai/cmux/pull/2288))
 - Use dedicated setting for sidebar port link browser preference ([#2219](https://github.com/manaflow-ai/cmux/pull/2219))
 - Skip sidebar PR lookup on main/master branches ([#2110](https://github.com/manaflow-ai/cmux/pull/2110))
 - Stabilize sidebar directory ordering when split focus changes ([#1798](https://github.com/manaflow-ai/cmux/pull/1798))
@@ -165,7 +165,7 @@ All notable changes to cmux are documented here.
 - Menu bar visibility setting ([#1330](https://github.com/manaflow-ai/cmux/pull/1330))
 
 ### Changed
-- CLI Sentry events are now tagged with the app release ([#1408](https://github.com/manaflow-ai/cmux/pull/1408))
+- CLI Sentry events are now labeled with the app release ([#1408](https://github.com/manaflow-ai/cmux/pull/1408))
 - Stable socket listener now falls back to a user-scoped path, and repeated startup failures are throttled ([#1351](https://github.com/manaflow-ai/cmux/pull/1351), [#1415](https://github.com/manaflow-ai/cmux/pull/1415))
 
 ### Fixed
@@ -249,7 +249,7 @@ All notable changes to cmux are documented here.
 - Use-after-free in `ghostty_surface_refresh` after sleep/wake ([#432](https://github.com/manaflow-ai/cmux/issues/432), [#619](https://github.com/manaflow-ai/cmux/pull/619))
 - Startup SIGSEGV by pre-warming locale before `SentrySDK.start` ([#927](https://github.com/manaflow-ai/cmux/pull/927))
 - IME issues: Shift+Space toggle inserting a space ([#641](https://github.com/manaflow-ai/cmux/issues/641), [#670](https://github.com/manaflow-ai/cmux/pull/670)), Ctrl fast path blocking IME events, browser address bar Japanese IME ([#789](https://github.com/manaflow-ai/cmux/issues/789), [#867](https://github.com/manaflow-ai/cmux/pull/867)), and Cmd shortcuts during IME composition
-- CLI socket autodiscovery for tagged sockets ([#832](https://github.com/manaflow-ai/cmux/pull/832))
+- CLI socket autodiscovery for named sockets ([#832](https://github.com/manaflow-ai/cmux/pull/832))
 - Flaky CLI socket listener recovery ([#952](https://github.com/manaflow-ai/cmux/issues/952), [#954](https://github.com/manaflow-ai/cmux/pull/954))
 - Side-docked dev tools resize ([#712](https://github.com/manaflow-ai/cmux/pull/712))
 - Dvorak Cmd+C colliding with the notifications shortcut ([#762](https://github.com/manaflow-ai/cmux/pull/762))

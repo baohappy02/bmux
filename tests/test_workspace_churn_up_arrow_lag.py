@@ -165,7 +165,7 @@ def get_bmux_pid_for_socket(socket_path: Optional[str]) -> Optional[int]:
                     return pid
 
     result = subprocess.run(
-        ["pgrep", "-f", r"bmux DEV.*\.app/Contents/MacOS/bmux DEV"],
+        ["pgrep", "-f", r"bmux.*\.app/Contents/MacOS/bmux"],
         capture_output=True,
         text=True,
     )
@@ -179,12 +179,12 @@ def resolve_target_socket() -> str:
     socket_path = os.environ.get("CMUX_SOCKET_PATH")
     if not socket_path:
         raise bmuxError(
-            "CMUX_SOCKET_PATH is required. Point it to a tagged dev socket (for example /tmp/bmux-debug-<tag>.sock)."
+            "CMUX_SOCKET_PATH is required. Point it to the socket you want to test."
         )
     base = os.path.basename(socket_path)
     if not ALLOW_MAIN_SOCKET and base in {"bmux.sock", "bmux-debug.sock"}:
         raise bmuxError(
-            f"Refusing to run against main socket '{socket_path}'. Set CMUX_SOCKET_PATH to a tagged dev instance."
+            f"Refusing to run against main socket '{socket_path}'. Set CMUX_SOCKET_PATH to a non-default socket."
         )
     return socket_path
 

@@ -62,7 +62,7 @@ def get_bmux_pid() -> int | None:
     )
     if result.returncode != 0:
         result = subprocess.run(
-            ["pgrep", "-f", r"bmux DEV\.app/Contents/MacOS/bmux"],
+            ["pgrep", "-f", r"bmux\.app/Contents/MacOS/bmux"],
             capture_output=True, text=True,
         )
     if result.returncode != 0:

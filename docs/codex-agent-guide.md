@@ -19,9 +19,11 @@ For a single managed command, skip the full attach/capabilities/layout dance:
 2. Stop if the payload returns `paused_for_user: true`
 3. Use `bmux agent task result --job <job-id> --json` only when the user wants you to continue
 
+`task run` auto-attaches to the current focus, reuses a visible managed task terminal when one already exists, and otherwise creates a right split instead of reusing the attached prompt surface.
+
 Only create a dedicated surface first when reuse matters:
 
-1. `bmux agent ensure terminal --split down --focus false --json`
+1. `bmux agent ensure terminal --focus false --json`
 2. `bmux agent task run --surface <surface> --pause-for-user true --cmd "cargo test" --json`
 
 Use the longer session loop only when the task is multi-step or you need discovery:
@@ -41,7 +43,10 @@ bmux agent task run --pause-for-user true --cmd "cargo test" --json
 
 When `--session` is omitted on `open`, `ensure`, `task run`, `task run-many`, or `task run-profile`, bmux auto-attaches to the current focus and returns `session_id` in the payload.
 After that, `task wait`, `task result`, `task logs`, and `task cancel` can be called with `--job` alone when the session is not already cached by the caller.
+Managed task dispatch does not reuse the attached surface for noisy commands; it reuses an already visible task terminal or creates a right split.
 For noisy commands, bmux may also pause by default; if the payload comes back with `paused_for_user: true`, stop and do not auto-wait.
+For intentionally unattended work, pass `--pause-for-user false` and let `task wait` return the final structured result when the job exits.
+Do not fall back to background exec when bmux managed task terminals are available.
 
 ## Skill Loop
 
@@ -64,19 +69,22 @@ Rules:
 ## Verify Loop
 
 ```bash
-bmux agent task run-profile --session <sid> --pause-for-user false verify.ts --json
+bmux agent task run-profile --session <sid> --pause-for-user false verify.rust --json
 bmux agent task wait --session <sid> --job-id <job> --json
-bmux agent task result --session <sid> --job-id <job> --json
 ```
 
 Success should stay small.
 
 Failure should point to:
 
-1. parsed diagnostics
-2. short tail
-3. `log_path`
-4. `agent artifact list`
+1. `failure_markers`
+2. parsed diagnostics
+3. `failure_context`
+4. `log_path`
+5. `agent artifact list`
+
+Only call `task result` or `task logs` after `task wait` if the returned failure payload is still insufficient.
+If bmux cannot create a visible split because of the visibility guard, surface that structured error instead of silently running in a hidden tab or shell.
 
 ## User-Gated Noisy Commands
 
@@ -85,7 +93,7 @@ start it with a pause contract instead of immediately pulling logs back into the
 
 ```bash
 bmux agent task run --pause-for-user true --cmd "cargo test" --json
-bmux agent task run-profile --pause-for-user true verify.ts --json
+bmux agent task run-profile --pause-for-user true verify.rust --json
 ```
 
 The response should stay compact and machine-readable:
@@ -95,7 +103,7 @@ The response should stay compact and machine-readable:
 - `automatic_log_ingest: false`
 
 After that, stop and wait for the user.
-Only fetch `task result`, a targeted tail, or logs after the user says to continue or provides a failure snippet.
+Only fetch `task result` or logs after the user says to continue or provides a failure snippet.
 Do not call `task wait` against a paused payload unless the user explicitly redirected you to continue unattended.
 
 ## Dev Server Loop
@@ -156,7 +164,7 @@ Use these to compare token and latency cost by workflow:
 2. `bmux agent state summary --session <sid> --json`
 3. debug log lines written by `agent.event ...` in DEBUG builds
 
-Build with a tag, then inspect the tagged debug log:
+Build normally, then inspect the debug log:
 
 ```bash
 tail -f "$(cat /tmp/cmux-last-debug-log-path 2>/dev/null || echo /tmp/cmux-debug.log)"

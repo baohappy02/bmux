@@ -421,6 +421,9 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertEqual(capabilityFlags["managed_task_execution"] as? Bool, true)
         XCTAssertEqual(capabilityFlags["compact_task_results"] as? Bool, true)
         XCTAssertEqual(capabilityFlags["pause_for_user_contract"] as? Bool, true)
+        XCTAssertEqual(capabilityFlags["failure_context_payloads"] as? Bool, true)
+        XCTAssertEqual(capabilityFlags["failure_marker_payloads"] as? Bool, true)
+        XCTAssertEqual(capabilityFlags["visible_task_terminal_defaults"] as? Bool, true)
 
         let guidance = try XCTUnwrap(result["task_execution_guidance"] as? [String])
         XCTAssertTrue(guidance.contains { $0.contains("agent.task.run") })
@@ -444,9 +447,19 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertEqual(policy["default_execution_class"] as? String, "local_verify")
         let managedTaskDefaults = try XCTUnwrap(policy["managed_task_defaults"] as? [String: Any])
         XCTAssertEqual(managedTaskDefaults["success_channel"] as? String, "agent.task.result")
+        XCTAssertEqual(managedTaskDefaults["unattended_completion_channel"] as? String, "agent.task.wait")
         XCTAssertEqual(managedTaskDefaults["logs_on_success"] as? String, "avoid")
-        XCTAssertEqual(managedTaskDefaults["logs_on_failure"] as? String, "on_demand")
+        XCTAssertEqual(managedTaskDefaults["logs_on_failure"] as? String, "after_failure_markers_and_context")
+        XCTAssertEqual(managedTaskDefaults["failure_markers_on_failure"] as? String, "automatic")
+        XCTAssertEqual(managedTaskDefaults["failure_context_on_failure"] as? String, "automatic")
         XCTAssertEqual(managedTaskDefaults["pause_for_user_for_noisy_commands"] as? Bool, true)
+        XCTAssertEqual(managedTaskDefaults["ensure_visible_terminal_before_dispatch"] as? Bool, true)
+        XCTAssertEqual(managedTaskDefaults["default_task_terminal_split"] as? String, "right")
+        XCTAssertEqual(managedTaskDefaults["reuse_attached_surface_for_noisy_tasks"] as? Bool, false)
+        XCTAssertEqual(
+            managedTaskDefaults["background_exec_fallback"] as? String,
+            "disallowed_when_managed_task_terminals_are_available"
+        )
         let codeIntelligence = try XCTUnwrap(result["code_intelligence"] as? [String: Any])
         let codeGuidance = try XCTUnwrap(codeIntelligence["guidance"] as? [String])
         XCTAssertTrue(
@@ -463,6 +476,36 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
             taskExecutionGuidance.contains {
                 $0.localizedCaseInsensitiveContains("single managed command")
                     && $0.localizedCaseInsensitiveContains("agent.task.run directly")
+            }
+        )
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("pause_for_user=false")
+                    && $0.localizedCaseInsensitiveContains("agent.task.wait")
+            }
+        )
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("failure_markers")
+                    && $0.localizedCaseInsensitiveContains("failure_context")
+                    && $0.localizedCaseInsensitiveContains("raw logs")
+            }
+        )
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("separate visible task terminal")
+                    && $0.localizedCaseInsensitiveContains("without a separate attach or ensure step")
+            }
+        )
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("right split")
+                    && $0.localizedCaseInsensitiveContains("reusable task terminal")
+            }
+        )
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("background shell execution")
             }
         )
         XCTAssertTrue(
@@ -569,7 +612,7 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertEqual(Array(try fakeCommandLog(at: fakeDeps.logURL).prefix(4)), ["status", "doctor", "status", "doctor"])
     }
 
-    func testAgentTaskRunWithoutSplitReusesAttachedVisibleTerminal() async throws {
+    func testAgentTaskRunWithoutSplitCreatesDedicatedVisibleTaskTerminalSplit() async throws {
         let socketPath = makeSocketPath("task-visible")
         let manager = TabManager()
         guard let workspace = manager.selectedWorkspace,
@@ -578,6 +621,7 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
             return
         }
         let initialPanelCount = workspace.panels.count
+        let initialPaneCount = workspace.bonsplitController.allPaneIds.count
 
         TerminalController.shared.start(
             tabManager: manager,
@@ -626,13 +670,18 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
 
         XCTAssertEqual(taskResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(taskResponse)")
         let result = try XCTUnwrap(taskResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(taskResponse)")
-        XCTAssertEqual(result["surface_id"] as? String, focusedPanelId.uuidString)
-        XCTAssertEqual(result["placement"] as? String, "surface")
-        XCTAssertEqual(result["split_applied"] as? Bool, false)
-        XCTAssertEqual(workspace.panels.count, initialPanelCount)
+        let taskSurfaceId = try XCTUnwrap(UUID(uuidString: try XCTUnwrap(result["surface_id"] as? String)))
+        XCTAssertNotEqual(taskSurfaceId, focusedPanelId)
+        XCTAssertEqual(result["placement"] as? String, "split")
+        XCTAssertEqual(result["split_applied"] as? Bool, true)
+        XCTAssertEqual(workspace.panels.count, initialPanelCount + 1)
+        XCTAssertEqual(workspace.bonsplitController.allPaneIds.count, initialPaneCount + 1)
+        XCTAssertEqual(workspace.focusedPanelId, focusedPanelId)
+        let taskPaneId = try XCTUnwrap(workspace.paneId(forPanelId: taskSurfaceId))
+        XCTAssertEqual(workspace.effectiveSelectedPanelId(inPane: taskPaneId), taskSurfaceId)
     }
 
-    func testAgentEnsureWithoutSessionAutoAttachesCurrentFocus() throws {
+    func testAgentEnsureWithoutSessionAutoAttachesAndCreatesDedicatedVisibleTaskTerminal() throws {
         let socketPath = makeSocketPath("ensure-auto")
         let manager = TabManager()
         guard let workspace = manager.selectedWorkspace,
@@ -641,6 +690,7 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
             return
         }
         let initialPanelCount = workspace.panels.count
+        let initialPaneCount = workspace.bonsplitController.allPaneIds.count
 
         TerminalController.shared.start(
             tabManager: manager,
@@ -662,9 +712,16 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
         XCTAssertTrue(result["session_auto_attached"] as? Bool ?? false)
         XCTAssertNotNil(result["session_id"] as? String)
-        XCTAssertEqual(result["surface_id"] as? String, focusedPanelId.uuidString)
-        XCTAssertEqual(result["created"] as? Bool, false)
-        XCTAssertEqual(workspace.panels.count, initialPanelCount)
+        let taskSurfaceId = try XCTUnwrap(UUID(uuidString: try XCTUnwrap(result["surface_id"] as? String)))
+        XCTAssertNotEqual(taskSurfaceId, focusedPanelId)
+        XCTAssertEqual(result["created"] as? Bool, true)
+        XCTAssertEqual(result["placement"] as? String, "split")
+        XCTAssertEqual(result["split_applied"] as? Bool, true)
+        XCTAssertEqual(workspace.panels.count, initialPanelCount + 1)
+        XCTAssertEqual(workspace.bonsplitController.allPaneIds.count, initialPaneCount + 1)
+        XCTAssertEqual(workspace.focusedPanelId, focusedPanelId)
+        let taskPaneId = try XCTUnwrap(workspace.paneId(forPanelId: taskSurfaceId))
+        XCTAssertEqual(workspace.effectiveSelectedPanelId(inPane: taskPaneId), taskSurfaceId)
     }
 
     func testAgentTaskRunWithoutSessionAutoAttachesAndAllowsJobOnlyReads() throws {
@@ -676,6 +733,7 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
             return
         }
         let initialPanelCount = workspace.panels.count
+        let initialPaneCount = workspace.bonsplitController.allPaneIds.count
 
         TerminalController.shared.start(
             tabManager: manager,
@@ -699,10 +757,15 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         let taskPayload = try XCTUnwrap(taskResult["task"] as? [String: Any])
         let jobId = try XCTUnwrap(taskPayload["job_id"] as? String)
         XCTAssertTrue(taskResult["session_auto_attached"] as? Bool ?? false)
-        XCTAssertEqual(taskResult["surface_id"] as? String, focusedPanelId.uuidString)
-        XCTAssertEqual(taskResult["placement"] as? String, "surface")
-        XCTAssertEqual(taskResult["split_applied"] as? Bool, false)
-        XCTAssertEqual(workspace.panels.count, initialPanelCount)
+        let taskSurfaceId = try XCTUnwrap(UUID(uuidString: try XCTUnwrap(taskResult["surface_id"] as? String)))
+        XCTAssertNotEqual(taskSurfaceId, focusedPanelId)
+        XCTAssertEqual(taskResult["placement"] as? String, "split")
+        XCTAssertEqual(taskResult["split_applied"] as? Bool, true)
+        XCTAssertEqual(workspace.panels.count, initialPanelCount + 1)
+        XCTAssertEqual(workspace.bonsplitController.allPaneIds.count, initialPaneCount + 1)
+        XCTAssertEqual(workspace.focusedPanelId, focusedPanelId)
+        let taskPaneId = try XCTUnwrap(workspace.paneId(forPanelId: taskSurfaceId))
+        XCTAssertEqual(workspace.effectiveSelectedPanelId(inPane: taskPaneId), taskSurfaceId)
 
         let waitResponse = try sendV2Request(
             method: "agent.task.wait",
@@ -733,6 +796,65 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertEqual(result["status"] as? String, "succeeded")
         XCTAssertEqual(result["ok"] as? Bool, true)
         XCTAssertEqual(result["session_inferred_from_job"] as? Bool, true)
+    }
+
+    func testAgentTaskRunReusesManagedTaskTerminalSurface() throws {
+        let socketPath = makeSocketPath("task-managed-reuse")
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace,
+              let focusedPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with a focused panel")
+            return
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let attachResponse = try sendV2Request(
+            method: "agent.attach",
+            params: ["workspace_id": workspace.id.uuidString],
+            to: socketPath
+        )
+        XCTAssertEqual(attachResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(attachResponse)")
+        let attachResult = try XCTUnwrap(attachResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(attachResponse)")
+        let sessionId = try XCTUnwrap(attachResult["session_id"] as? String)
+
+        let ensureResponse = try sendV2Request(
+            method: "agent.ensure",
+            params: [
+                "session_id": sessionId,
+                "target": "terminal"
+            ],
+            to: socketPath
+        )
+        XCTAssertEqual(ensureResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(ensureResponse)")
+        let ensureResult = try XCTUnwrap(ensureResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(ensureResponse)")
+        let managedSurfaceId = try XCTUnwrap(UUID(uuidString: try XCTUnwrap(ensureResult["surface_id"] as? String)))
+        XCTAssertEqual(ensureResult["created"] as? Bool, true)
+
+        let panelCountAfterEnsure = workspace.panels.count
+        let paneCountAfterEnsure = workspace.bonsplitController.allPaneIds.count
+
+        let taskResponse = try sendV2Request(
+            method: "agent.task.run",
+            params: [
+                "session_id": sessionId,
+                "command": "printf managed-task-terminal"
+            ],
+            to: socketPath
+        )
+        XCTAssertEqual(taskResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskResult = try XCTUnwrap(taskResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(taskResponse)")
+        XCTAssertEqual(taskResult["surface_id"] as? String, managedSurfaceId.uuidString)
+        XCTAssertEqual(taskResult["placement"] as? String, "surface")
+        XCTAssertEqual(taskResult["split_applied"] as? Bool, false)
+        XCTAssertEqual(workspace.panels.count, panelCountAfterEnsure)
+        XCTAssertEqual(workspace.bonsplitController.allPaneIds.count, paneCountAfterEnsure)
+        XCTAssertEqual(workspace.focusedPanelId, focusedPanelId)
     }
 
     func testAgentTaskRunDefaultsPauseForUserForNoisyCommands() throws {
@@ -799,6 +921,116 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertNil(taskResult["paused_for_user"])
         XCTAssertNil(taskResult["next_action"])
         XCTAssertEqual(taskPayload["pause_for_user"] as? Bool, false)
+    }
+
+    func testAgentTaskWaitReturnsFailureContextForCompilerDiagnostics() throws {
+        let socketPath = makeSocketPath("task-triage")
+        let repoURL = try makeFakeRepository(named: "bmux-task-triage")
+        let sourceURL = repoURL.appendingPathComponent("Sources/App.swift")
+        try """
+        struct AppFeature {
+            func currentName() {}
+        }
+        """.write(to: sourceURL, atomically: true, encoding: .utf8)
+
+        let fake = try makeFakeBmuxIndexScript(for: repoURL)
+        let scriptURL = try makeFailingCompilerScript(
+            name: "task-triage",
+            diagnostic: "\(sourceURL.path):2:10: error: cannot find 'LegacyName' in scope"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fake.scriptURL)
+            try? FileManager.default.removeItem(at: fake.logURL)
+            try? FileManager.default.removeItem(at: scriptURL)
+        }
+
+        let previousPath = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"]
+        setenv("BMUX_INDEX_PATH", fake.scriptURL.path, 1)
+        defer {
+            if let previousPath {
+                setenv("BMUX_INDEX_PATH", previousPath, 1)
+            } else {
+                unsetenv("BMUX_INDEX_PATH")
+            }
+        }
+
+        let manager = TabManager(
+            initialWorkingDirectory: repoURL.path,
+            dependencyBootstrapRunner: { _ in },
+            bmuxIndexWarmRunner: { _ in }
+        )
+        guard let workspace = manager.selectedWorkspace else {
+            XCTFail("Expected selected workspace")
+            return
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let taskResponse = try sendV2Request(
+            method: "agent.task.run",
+            params: [
+                "workspace_id": workspace.id.uuidString,
+                "cwd": repoURL.path,
+                "command": scriptURL.path,
+                "pause_for_user": false
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(taskResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskResult = try XCTUnwrap(taskResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskPayload = try XCTUnwrap(taskResult["task"] as? [String: Any])
+        let jobId = try XCTUnwrap(taskPayload["job_id"] as? String)
+
+        let waitResponse = try sendV2Request(
+            method: "agent.task.wait",
+            params: [
+                "job_id": jobId,
+                "timeout_ms": 10_000
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(waitResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(waitResponse)")
+        let waitResult = try XCTUnwrap(waitResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(waitResponse)")
+        XCTAssertEqual(waitResult["status"] as? String, "failed")
+        XCTAssertEqual(waitResult["ok"] as? Bool, false)
+        XCTAssertNil(waitResult["tail"])
+
+        let diagnostics = try XCTUnwrap(waitResult["diagnostics"] as? [[String: Any]])
+        XCTAssertEqual(diagnostics.first?["file"] as? String, sourceURL.path)
+        XCTAssertEqual(diagnostics.first?["line"] as? Int, 2)
+
+        let failureMarkers = try XCTUnwrap(waitResult["failure_markers"] as? [[String: Any]])
+        XCTAssertEqual(failureMarkers.first?["marker"] as? String, "error")
+        XCTAssertEqual(
+            failureMarkers.first?["text"] as? String,
+            "\(sourceURL.path):2:10: error: cannot find 'LegacyName' in scope"
+        )
+
+        let failureContext = try XCTUnwrap(waitResult["failure_context"] as? [String: Any])
+        XCTAssertEqual(failureContext["strategy"] as? String, "root_diagnostic")
+        XCTAssertEqual(failureContext["repo_root"] as? String, repoURL.path)
+        let rootDiagnostic = try XCTUnwrap(failureContext["root_diagnostic"] as? [String: Any])
+        XCTAssertEqual(rootDiagnostic["message"] as? String, "cannot find 'LegacyName' in scope")
+
+        let excerpt = try XCTUnwrap(failureContext["source_excerpt"] as? [String: Any])
+        XCTAssertEqual(excerpt["path"] as? String, sourceURL.path)
+        XCTAssertEqual(excerpt["focus_line"] as? Int, 2)
+        let excerptLines = try XCTUnwrap(excerpt["lines"] as? [[String: Any]])
+        XCTAssertTrue(excerptLines.contains { ($0["text"] as? String) == "    func currentName() {}" })
+
+        let moduleContext = try XCTUnwrap(failureContext["module_context"] as? [String: Any])
+        XCTAssertEqual(moduleContext["backend"] as? String, "bmux-index")
+        let module = try XCTUnwrap(moduleContext["module"] as? [String: Any])
+        XCTAssertEqual(module["name"] as? String, "App")
+        XCTAssertEqual(Array(try fakeCommandLog(at: fake.logURL).prefix(2)), ["prepare", "module"])
     }
 
     func testAgentSearchMapsBmuxIndexResultsIntoHits() async throws {
@@ -1034,6 +1266,8 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
             .replacingOccurrences(of: "__REPO__", with: repoURL.path)
         let routeResponse = #"{"id":"1","command":"route","ok":true,"payload":{"ok":true,"repo":"__REPO__","index_state":"warm","strategy":"code_search","reason":"Use batched search for rough copy hunting.","commands":[{"command":"prepare","repo":"__REPO__","rationale":"Warm the serve session."},{"command":"search_many","repo":"__REPO__","queries":["find the tutorial copy","Tap the answer"],"limit":6,"open_paths":["Sources/App.swift"],"recent_paths":["Sources/App.swift"],"changed_paths":[],"literal_terms":["Tap the answer"],"rationale":"Search multiple hints in one indexed call."}]}}"#
             .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+        let moduleResponse = #"{"id":"1","command":"module","ok":true,"payload":{"ok":true,"repo":"__REPO__","path":"Sources/App.swift","line":2,"index_state":"warm","mode":"path_first_module","resolved":true,"module":{"name":"App","kind":"source_file","confidence":0.91,"path_prefix":"Sources/App.swift"}}}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
         let artifactExtractResponse = #"{"id":"1","command":"artifact_extract","ok":true,"payload":{"ok":true,"source_path":"__ARTIFACT__","backend":"tesseract","format":"image","character_count":18,"truncated":false,"text_preview":"Tap the answer now","literal_terms":["Tap the answer now"]}}"#
         let artifactSearchResponse = #"{"id":"1","command":"artifact_search","ok":true,"payload":{"ok":true,"repo":"__REPO__","source_path":"__ARTIFACT__","backend":"tesseract","format":"image","character_count":18,"truncated":false,"text_preview":"Tap the answer now","literal_terms":["Tap the answer now"],"search":{"ok":true,"repo":"__REPO__","limit":3,"index_state":"warm","mode":"hybrid_auto","applied_terms":["Tap the answer now"],"path_hit_limit":3,"searches":[{"query":"find the screenshot copy","results":[{"path":"Sources/App.swift","line_start":1,"line_end":3,"snippet":"func greetUser() -> String","score":9.5,"kind":"function","language":"swift"}]}]}}}"#
             .replacingOccurrences(of: "__REPO__", with: repoURL.path)
@@ -1069,6 +1303,9 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
             *'"command":"route"'*)
               printf '%s\\n' '\(routeResponse)'
               ;;
+            *'"command":"module"'*)
+              printf '%s\\n' '\(moduleResponse)'
+              ;;
             *'"command":"artifact_extract"'*)
               printf '%s\\n' '\(artifactExtractResponse)'
               ;;
@@ -1088,6 +1325,19 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
         return (scriptURL, logURL)
+    }
+
+    private func makeFailingCompilerScript(name: String, diagnostic: String) throws -> URL {
+        let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString).sh")
+        let escapedDiagnostic = diagnostic.replacingOccurrences(of: "'", with: "'\"'\"'")
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '\(escapedDiagnostic)'
+        exit 1
+        """
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
     }
 
     private func makeFakeBmuxDepsScript(for repoURL: URL) throws -> (scriptURL: URL, logURL: URL) {

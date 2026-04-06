@@ -32,7 +32,7 @@ def main() -> int:
     socket_path = bmux.default_socket_path()
     if not os.path.exists(socket_path):
         print(f"SKIP: Socket not found at {socket_path}")
-        print("Tip: start bmux first (or set CMUX_TAG / CMUX_SOCKET_PATH).")
+        print("Tip: start bmux first (or set CMUX_SOCKET_PATH).")
         return 0
 
     bundle_id = bmux.default_bundle_id()

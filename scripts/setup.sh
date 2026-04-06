@@ -84,4 +84,4 @@ ln -sfn "$CACHE_XCFRAMEWORK" GhosttyKit.xcframework
 echo "==> Setup complete!"
 echo ""
 echo "You can now build and run the app:"
-echo "  ./scripts/reload.sh --tag dev --launch"
+echo "  ./scripts/reloadp.sh"

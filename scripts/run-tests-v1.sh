@@ -12,7 +12,7 @@ fi
 cd "$(dirname "$0")/.."
 
 DERIVED_DATA_PATH="$HOME/Library/Developer/Xcode/DerivedData/bmux-tests-v1"
-APP="$DERIVED_DATA_PATH/Build/Products/Debug/bmux DEV.app"
+APP="$DERIVED_DATA_PATH/Build/Products/Debug/bmux.app"
 RUN_TAG="tests-v1"
 
 echo "== build =="
@@ -29,12 +29,11 @@ xcodebuild \
   build >/dev/null
 
 if [ ! -d "$APP" ]; then
-  echo "ERROR: bmux DEV.app not found at expected path: $APP" >&2
+  echo "ERROR: bmux.app not found at expected path: $APP" >&2
   exit 1
 fi
 
 cleanup() {
-  pkill -x "bmux DEV" || true
   pkill -x "bmux" || true
   rm -f /tmp/bmux*.sock || true
 }
@@ -44,7 +43,7 @@ launch_and_wait() {
   # Wait briefly for the previous instance to fully terminate; LaunchServices can flake if we
   # relaunch too quickly.
   for _ in {1..50}; do
-    pgrep -x "bmux DEV" >/dev/null 2>&1 || break
+    pgrep -x "bmux" >/dev/null 2>&1 || break
     sleep 0.1
   done
 
@@ -52,7 +51,7 @@ launch_and_wait() {
   defaults write com.bmuxterm.app.debug socketControlMode -string full >/dev/null 2>&1 || true
 
   # Launch directly with UI test mode enabled so startup follows deterministic test codepaths.
-  CMUX_TAG="$RUN_TAG" CMUX_UI_TEST_MODE=1 "$APP/Contents/MacOS/bmux DEV" >/dev/null 2>&1 &
+  CMUX_TAG="$RUN_TAG" CMUX_UI_TEST_MODE=1 "$APP/Contents/MacOS/bmux" >/dev/null 2>&1 &
 
   SOCK=""
   for _ in {1..120}; do

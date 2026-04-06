@@ -180,10 +180,6 @@ struct bmuxApp: App {
     init() {
         UITestLaunchManifest.applyIfPresent()
 
-        if SocketControlSettings.shouldBlockUntaggedDebugLaunch() {
-            Self.terminateForMissingLaunchTag()
-        }
-
         Self.configureGhosttyEnvironment()
 
         // Apply saved language preference before any UI loads
@@ -203,7 +199,7 @@ struct bmuxApp: App {
             defaults.set(legacy ? SocketControlMode.bmuxOnly.rawValue : SocketControlMode.off.rawValue,
                          forKey: SocketControlSettings.appStorageKey)
         }
-        // Skip keychain migration for DEV/staging builds. Each tagged build gets a
+        // Skip keychain migration for alternate debug/staging bundles. Each variant gets a
         // unique bundle ID with its own UserDefaults domain, so migration would run
         // on every launch and trigger a macOS keychain access prompt (the legacy
         // keychain item was created by a differently-signed app).
@@ -217,14 +213,6 @@ struct bmuxApp: App {
         // UI tests depend on AppDelegate wiring happening even if SwiftUI view appearance
         // callbacks (e.g. `.onAppear`) are delayed or skipped.
         appDelegate.configure(tabManager: tabManager, notificationStore: notificationStore, sidebarState: sidebarState)
-    }
-
-    private static func terminateForMissingLaunchTag() -> Never {
-        let message = "error: refusing to launch untagged bmux DEV; start with ./scripts/reload.sh --tag <name> (or set CMUX_TAG for test harnesses)"
-        fputs("\(message)\n", stderr)
-        fflush(stderr)
-        NSLog("%@", message)
-        Darwin.exit(64)
     }
 
     private static func configureGhosttyEnvironment() {

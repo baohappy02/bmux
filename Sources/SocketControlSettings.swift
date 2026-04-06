@@ -369,57 +369,6 @@ struct SocketControlSettings {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    static func shouldBlockUntaggedDebugLaunch(
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        bundleIdentifier: String? = Bundle.main.bundleIdentifier,
-        isDebugBuild: Bool = SocketControlSettings.isDebugBuild
-    ) -> Bool {
-        guard isDebugBuild else { return false }
-        if isRunningUnderXCTest(environment: environment) {
-            return false
-        }
-        // XCUITest launches the app as a separate process without XCTest env vars,
-        // so isRunningUnderXCTest() misses it. Check for any CMUX_UI_TEST_ env var.
-        if environment.keys.contains(where: { $0.hasPrefix("CMUX_UI_TEST_") }) {
-            return false
-        }
-
-        guard let bundleIdentifier = bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !bundleIdentifier.isEmpty else {
-            return false
-        }
-
-        if bundleIdentifier.hasPrefix("\(baseDebugBundleIdentifier).") {
-            return false
-        }
-
-        guard bundleIdentifier == baseDebugBundleIdentifier else {
-            return false
-        }
-
-        return launchTag(environment: environment) == nil
-    }
-
-    static func isRunningUnderXCTest(environment: [String: String]) -> Bool {
-        let indicators = [
-            "XCTestConfigurationFilePath",
-            "XCTestBundlePath",
-            "XCTestSessionIdentifier",
-            "XCInjectBundle",
-            "XCInjectBundleInto",
-        ]
-        if indicators.contains(where: { key in
-            guard let value = environment[key] else { return false }
-            return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }) {
-            return true
-        }
-        if environment["DYLD_INSERT_LIBRARIES"]?.contains("libXCTest") == true {
-            return true
-        }
-        return false
-    }
-
     static func socketPath(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         bundleIdentifier: String? = Bundle.main.bundleIdentifier,
@@ -434,7 +383,7 @@ struct SocketControlSettings {
             probeStableDefaultPathEntry: probeStableDefaultPathEntry
         )
 
-        if let taggedDebugPath = taggedDebugSocketPath(
+        if let isolatedDebugPath = isolatedDebugSocketPath(
             bundleIdentifier: bundleIdentifier,
             environment: environment
         ) {
@@ -443,7 +392,7 @@ struct SocketControlSettings {
                !override.isEmpty {
                 return override
             }
-            return taggedDebugPath
+            return isolatedDebugPath
         }
 
         guard let override = environment["CMUX_SOCKET_PATH"], !override.isEmpty else {
@@ -467,8 +416,8 @@ struct SocketControlSettings {
         currentUserID: uid_t = getuid(),
         probeStableDefaultPathEntry: (String) -> StableDefaultSocketPathEntry = inspectStableDefaultSocketPathEntry
     ) -> String {
-        if let taggedDebugPath = taggedDebugSocketPath(bundleIdentifier: bundleIdentifier, environment: [:]) {
-            return taggedDebugPath
+        if let isolatedDebugPath = isolatedDebugSocketPath(bundleIdentifier: bundleIdentifier, environment: [:]) {
+            return isolatedDebugPath
         }
         if bundleIdentifier == "com.bmuxterm.app.nightly" {
             return "/tmp/bmux-nightly.sock"
@@ -533,13 +482,13 @@ struct SocketControlSettings {
             || bundleIdentifier.hasPrefix("com.bmuxterm.app.debug.")
     }
 
-    /// Tagged DEV builds have bundle IDs like `com.bmuxterm.app.debug.<tag>`.
-    static func isTaggedDevBuild(bundleIdentifier: String? = Bundle.main.bundleIdentifier) -> Bool {
+    /// Alternate debug bundle variants can use bundle IDs like `com.bmuxterm.app.debug.<tag>`.
+    static func isAlternateDebugBuild(bundleIdentifier: String? = Bundle.main.bundleIdentifier) -> Bool {
         guard let bundleIdentifier else { return false }
         return bundleIdentifier.hasPrefix("\(baseDebugBundleIdentifier).")
     }
 
-    static func taggedDebugSocketPath(
+    static func isolatedDebugSocketPath(
         bundleIdentifier: String?,
         environment: [String: String]
     ) -> String? {

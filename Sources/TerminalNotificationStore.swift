@@ -578,7 +578,7 @@ enum NotificationPaneFlashSettings {
     }
 }
 
-enum TaggedRunBadgeSettings {
+enum RunBadgeSettings {
     static let environmentKey = "CMUX_TAG"
     private static let maxTagLength = 10
 
@@ -764,7 +764,7 @@ final class TerminalNotificationStore: ObservableObject {
             return String(unreadCount)
         }()
 
-        if let tag = TaggedRunBadgeSettings.normalizedTag(runTag) {
+        if let tag = RunBadgeSettings.normalizedTag(runTag) {
             if let unreadLabel {
                 return "\(tag):\(unreadLabel)"
             }
@@ -1411,7 +1411,7 @@ final class TerminalNotificationStore: ObservableObject {
         let label = Self.dockBadgeLabel(
             unreadCount: unreadCount,
             isEnabled: NotificationBadgeSettings.isDockBadgeEnabled(),
-            runTag: TaggedRunBadgeSettings.normalizedTag()
+            runTag: RunBadgeSettings.normalizedTag()
         )
         NSApp?.dockTile.badgeLabel = label
     }

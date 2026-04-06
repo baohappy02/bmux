@@ -67,7 +67,7 @@ export default function ApiPage() {
             </td>
           </tr>
           <tr>
-            <td>{t("taggedDebug")}</td>
+            <td>{t("isolatedDebug")}</td>
             <td>
               <code>/tmp/cmux-debug-&lt;tag&gt;.sock</code>
             </td>

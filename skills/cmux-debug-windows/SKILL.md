@@ -11,8 +11,7 @@ Keep this workflow focused on existing debug windows and menu entries. Do not ad
 
 1. Verify debug menu wiring in `Sources/cmuxApp.swift` under `CommandMenu("Debug")`.
    - Menu path in app: `Debug` → `Debug Windows` → window entry.
-   - The `Debug` menu only exists in the dev DEBUG build (`./scripts/reload.sh --tag dev ...`).
-   - The installed app at `/Applications/bmux.app` does not show this menu.
+   - Use the currently installed `/Applications/bmux.app` build for this workflow.
 2. Keep these actions available in `Menu("Debug Windows")`:
 - `Sidebar Debug…`
 - `Background Debug…`
@@ -23,9 +22,9 @@ Keep this workflow focused on existing debug windows and menu entries. Do not ad
 ```bash
 skills/cmux-debug-windows/scripts/debug_windows_snapshot.sh --copy
 ```
-5. After code edits, run build + tagged reload:
+5. After code edits, rebuild and relaunch:
 ```bash
-./scripts/reload.sh --tag dev
+./scripts/reloadp.sh
 ```
 
 ## Key Files

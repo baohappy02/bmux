@@ -9,8 +9,8 @@ Requires:
   - bmux running with allowAll socket mode
   - bash shell integration sourced (bmux-bash-integration.bash)
 
-Run with a tagged instance:
-  CMUX_TAG=<tag> python3 tests/test_split_cwd_inheritance.py
+Run with CMUX_SOCKET_PATH=<path> when targeting a non-default socket:
+  CMUX_SOCKET_PATH=/tmp/bmux-debug.sock python3 tests/test_split_cwd_inheritance.py
 """
 
 from __future__ import annotations

@@ -8,7 +8,7 @@ Use it after:
 
 1. quitting Codex
 2. quitting bmux
-3. reopening the tagged bmux dev build
+3. reopening `/Applications/bmux.app`
 4. reopening Codex
 
 The goal is to verify:
@@ -32,7 +32,7 @@ Before starting, make sure these paths still exist:
 
 Expected runtime defaults:
 
-1. current bmux CLI is auto-discovered from `BMUX_CLI`, `/tmp/bmux-cli`, `bmux-dev`, or `bmux`
+1. current bmux CLI is auto-discovered from `BMUX_CLI` or `bmux`
 2. current bmux socket is auto-discovered from `BMUX_SOCKET_PATH`, `CMUX_SOCKET_PATH`, `/tmp/bmux-last-socket-path`, or `/tmp/cmux-last-socket-path`
 3. JavaScript package manager preference is `bun`
 4. pricing-first behavior is enabled in global Codex instructions
@@ -41,7 +41,7 @@ Expected runtime defaults:
 
 1. Quit Codex completely.
 2. Quit the running bmux app completely.
-3. Launch the tagged bmux dev build you want to verify.
+3. Launch `/Applications/bmux.app`.
 4. Open a clean workspace.
 5. Open Codex again.
 

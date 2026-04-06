@@ -24,21 +24,13 @@
    - Build the GhosttyKit.xcframework from source
    - Create the necessary symlinks
 
-3. Build the debug app:
+3. Build and launch the installed app:
    ```bash
-   ./scripts/reload.sh --tag dev --launch
+   ./scripts/reloadp.sh
    ```
-   Reuse the `dev` tag so you keep only one dev build around. When you want the installed app updated too, run:
+   Clean leftover local build artifacts with:
    ```bash
-   ./scripts/reload.sh --tag dev --launch --install-applications
-   ```
-   Keep the local machine clean with:
-   ```bash
-   ./scripts/prune-local-apps.sh --keep-tag dev
-   ```
-   When you are done testing and want only the installed app left:
-   ```bash
-   ./scripts/prune-local-apps.sh --main-only
+   ./scripts/prune-local-apps.sh
    ```
 
 ## Development Scripts
@@ -46,11 +38,9 @@
 | Script | Description |
 |--------|-------------|
 | `./scripts/setup.sh` | One-time setup (submodules + xcframework) |
-| `./scripts/reload.sh --tag dev` | Build the single dev app variant |
-| `./scripts/reload.sh --tag dev --launch --install-applications` | Build dev, launch it, and replace `/Applications/bmux.app` with the matching Release build |
 | `./scripts/reloadp.sh` | Rebuild, install, and launch `/Applications/bmux.app` |
-| `./scripts/prune-local-apps.sh --keep-tag dev` | Keep `/Applications/bmux.app` plus one tagged dev app, remove release staging bundles and stray debug leftovers |
-| `./scripts/prune-local-apps.sh --main-only` | Remove all local dev app bundles and keep only `/Applications/bmux.app` |
+| `./scripts/reload.sh` | Compatibility wrapper that forwards to `./scripts/reloadp.sh` |
+| `./scripts/prune-local-apps.sh` | Remove leftover local build artifacts outside `/Applications/bmux.app` |
 | `./scripts/rebuild.sh` | Clean rebuild |
 
 ## Rebuilding GhosttyKit
@@ -67,7 +57,7 @@ zig build -Demit-xcframework=true -Doptimize=ReleaseFast
 ### Basic tests (run on VM)
 
 ```bash
-ssh cmux-vm 'cd /Users/cmux/GhosttyTabs && xcodebuild -project GhosttyTabs.xcodeproj -scheme cmux -configuration Debug -destination "platform=macOS" build && pkill -x "cmux DEV" || true && APP=$(find /Users/cmux/Library/Developer/Xcode/DerivedData -path "*/Build/Products/Debug/cmux DEV.app" -print -quit) && open "$APP" && for i in {1..20}; do [ -S /tmp/cmux.sock ] && break; sleep 0.5; done && python3 tests/test_update_timing.py && python3 tests/test_signals_auto.py && python3 tests/test_ctrl_socket.py && python3 tests/test_notifications.py'
+ssh bmux-vm 'cd /Users/bmux/GhosttyTabs && ./scripts/run-tests-v1.sh'
 ```
 
 ### UI tests (run on VM)

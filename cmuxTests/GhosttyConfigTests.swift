@@ -1828,87 +1828,6 @@ final class SocketControlSettingsTests: XCTestCase {
         XCTAssertEqual(path, SocketControlSettings.userScopedStableSocketPath(currentUserID: 501))
     }
 
-    func testUntaggedDebugBundleBlockedWithoutLaunchTag() {
-        XCTAssertTrue(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: [:],
-                bundleIdentifier: "com.cmuxterm.app.debug",
-                isDebugBuild: true
-            )
-        )
-    }
-
-    func testUntaggedDebugBundleAllowedWithLaunchTag() {
-        XCTAssertFalse(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: ["CMUX_TAG": "tests-v1"],
-                bundleIdentifier: "com.cmuxterm.app.debug",
-                isDebugBuild: true
-            )
-        )
-    }
-
-    func testTaggedDebugBundleAllowedWithoutLaunchTag() {
-        XCTAssertFalse(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: [:],
-                bundleIdentifier: "com.cmuxterm.app.debug.tests-v1",
-                isDebugBuild: true
-            )
-        )
-    }
-
-    func testReleaseBuildIgnoresLaunchTagGate() {
-        XCTAssertFalse(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: [:],
-                bundleIdentifier: "com.cmuxterm.app.debug",
-                isDebugBuild: false
-            )
-        )
-    }
-
-    func testXCTestLaunchIgnoresLaunchTagGate() {
-        XCTAssertFalse(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: ["XCTestConfigurationFilePath": "/tmp/fake.xctestconfiguration"],
-                bundleIdentifier: "com.cmuxterm.app.debug",
-                isDebugBuild: true
-            )
-        )
-    }
-
-    func testXCTestInjectBundleLaunchIgnoresLaunchTagGate() {
-        XCTAssertFalse(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: ["XCInjectBundle": "/tmp/fake.xctest"],
-                bundleIdentifier: "com.cmuxterm.app.debug",
-                isDebugBuild: true
-            )
-        )
-    }
-
-    func testXCTestDyldLaunchIgnoresLaunchTagGate() {
-        XCTAssertFalse(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: ["DYLD_INSERT_LIBRARIES": "/usr/lib/libXCTestBundleInject.dylib"],
-                bundleIdentifier: "com.cmuxterm.app.debug",
-                isDebugBuild: true
-            )
-        )
-    }
-
-    func testXCUITestLaunchEnvironmentIgnoresLaunchTagGate() {
-        // XCUITest launches the app as a separate process without XCTest env vars.
-        // The app receives CMUX_UI_TEST_* vars via XCUIApplication.launchEnvironment.
-        XCTAssertFalse(
-            SocketControlSettings.shouldBlockUntaggedDebugLaunch(
-                environment: ["CMUX_UI_TEST_MODE": "1"],
-                bundleIdentifier: "com.cmuxterm.app.debug",
-                isDebugBuild: true
-            )
-        )
-    }
 }
 
 final class UITestLaunchManifestTests: XCTestCase {
@@ -2488,17 +2407,17 @@ final class GhosttyMouseFocusTests: XCTestCase {
         }
     }
 
-    func testLoadedCJKScanPathsSkipsReleaseAppSupportWhenTaggedConfigExists() throws {
+    func testLoadedCJKScanPathsSkipsReleaseAppSupportWhenCurrentBundleConfigExists() throws {
         let appSupport = FileManager.default.temporaryDirectory
             .appendingPathComponent("cmux-test-cjk-app-support-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: appSupport, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: appSupport) }
 
-        let taggedDir = appSupport.appendingPathComponent("com.example.cmux-dev", isDirectory: true)
-        try FileManager.default.createDirectory(at: taggedDir, withIntermediateDirectories: true)
-        let taggedConfig = taggedDir.appendingPathComponent("config", isDirectory: false)
+        let currentBundleDir = appSupport.appendingPathComponent("com.example.cmux", isDirectory: true)
+        try FileManager.default.createDirectory(at: currentBundleDir, withIntermediateDirectories: true)
+        let currentBundleConfig = currentBundleDir.appendingPathComponent("config", isDirectory: false)
         try "font-family = JetBrains Mono\n"
-            .write(to: taggedConfig, atomically: true, encoding: .utf8)
+            .write(to: currentBundleConfig, atomically: true, encoding: .utf8)
 
         let releaseDir = appSupport.appendingPathComponent("com.mitchellh.ghostty", isDirectory: true)
         try FileManager.default.createDirectory(at: releaseDir, withIntermediateDirectories: true)
@@ -2507,11 +2426,11 @@ final class GhosttyMouseFocusTests: XCTestCase {
             .write(to: releaseConfig, atomically: true, encoding: .utf8)
 
         let paths = GhosttyApp.loadedCJKScanPaths(
-            currentBundleIdentifier: "com.example.cmux-dev",
+            currentBundleIdentifier: "com.example.cmux",
             appSupportDirectory: appSupport
         )
 
-        XCTAssertTrue(paths.contains(taggedConfig.path))
+        XCTAssertTrue(paths.contains(currentBundleConfig.path))
         XCTAssertFalse(paths.contains(releaseConfig.path))
         XCTAssertTrue(
             GhosttyApp.shouldInjectCJKFontFallback(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test: CLI should auto-discover tagged debug sockets from CMUX_TAG."""
+"""Regression test: CLI should auto-discover named debug sockets from CMUX_TAG."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ def main() -> int:
         print(f"stderr={proc.stderr!r}")
         return 1
 
-    print("PASS: bmux ping auto-discovers tagged socket from CMUX_TAG")
+    print("PASS: bmux ping auto-discovers named socket from CMUX_TAG")
     return 0
 
 

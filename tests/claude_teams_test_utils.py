@@ -18,5 +18,5 @@ def resolve_bmux_cli() -> str:
             return candidate
 
     raise RuntimeError(
-        "Unable to find bmux CLI binary. Set CMUX_CLI_BIN or run ./scripts/reload.sh --tag <tag> first."
+        "Unable to find bmux CLI binary. Set CMUX_CLI_BIN or rebuild /Applications/bmux.app with ./scripts/reloadp.sh."
     )

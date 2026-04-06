@@ -62,8 +62,8 @@ def _sanitize_tag_slug(raw: str) -> str:
 
 
 def _sanitize_bundle_suffix(raw: str) -> str:
-    # Must match scripts/reload.sh sanitize_bundle() so tagged tests can
-    # reliably target the correct app via AppleScript.
+    # Must match the bundle suffix normalization used by isolated test runs so
+    # AppleScript targets the correct app.
     cleaned = re.sub(r"[^a-z0-9]+", ".", (raw or "").strip().lower())
     cleaned = re.sub(r"\.+", ".", cleaned).strip(".")
     return cleaned or "agent"
@@ -122,20 +122,20 @@ def _default_socket_path() -> str:
     tag = os.environ.get("CMUX_TAG")
     if tag:
         slug = _sanitize_tag_slug(tag)
-        tagged_candidates = [
+        isolated_candidates = [
             f"/tmp/bmux-debug-{slug}.sock",
             f"/tmp/bmux-{slug}.sock",
         ]
-        for path in tagged_candidates:
+        for path in isolated_candidates:
             if os.path.exists(path) and _can_connect(path):
                 return path
         # If nothing is connectable yet (e.g. the app is still starting),
         # fall back to the first existing candidate.
-        for path in tagged_candidates:
+        for path in isolated_candidates:
             if os.path.exists(path):
                 return path
         # Prefer the debug naming convention when we have to guess.
-        return tagged_candidates[0]
+        return isolated_candidates[0]
 
     override = os.environ.get("CMUX_SOCKET_PATH")
     if override:
@@ -150,19 +150,19 @@ def _default_socket_path() -> str:
         if os.path.exists(last_socket) and _can_connect(last_socket):
             return last_socket
 
-    # Prefer the non-tagged sockets when present.
+    # Prefer the default sockets when present.
     candidates = ["/tmp/bmux-debug.sock", _STABLE_SOCKET_PATH, _LEGACY_STABLE_SOCKET_PATH]
     for path in candidates:
         if os.path.exists(path) and _can_connect(path):
             return path
 
     # Otherwise, fall back to the newest discovered socket if there is one.
-    tagged = glob.glob("/tmp/bmux-debug-*.sock")
-    tagged.extend(glob.glob(os.path.join(_APP_SUPPORT_DIR, "bmux*.sock")))
-    tagged = [p for p in tagged if os.path.exists(p)]
-    if tagged:
-        tagged.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        for p in tagged:
+    isolated = glob.glob("/tmp/bmux-debug-*.sock")
+    isolated.extend(glob.glob(os.path.join(_APP_SUPPORT_DIR, "bmux*.sock")))
+    isolated = [p for p in isolated if os.path.exists(p)]
+    if isolated:
+        isolated.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for p in isolated:
             if _can_connect(p, timeout=0.1, retries=2):
                 return p
 

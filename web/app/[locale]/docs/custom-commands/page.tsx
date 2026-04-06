@@ -278,9 +278,9 @@ export default function CustomCommandsPage() {
     },
     {
       "name": "Reload",
-      "description": "Build and launch the single dev app variant",
+      "description": "Build, install, and relaunch /Applications/bmux.app",
       "keywords": ["reload", "build", "run", "launch"],
-      "command": "./scripts/reload.sh --tag dev --launch"
+      "command": "./scripts/reloadp.sh"
     },
     {
       "name": "Run Unit Tests",

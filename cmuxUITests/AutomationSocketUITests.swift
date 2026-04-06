@@ -50,8 +50,8 @@ final class AutomationSocketUITests: XCTestCase {
         app.launchArguments += ["-\(modeKey)", mode]
         app.launchEnvironment["CMUX_SOCKET_PATH"] = socketPath
         app.launchEnvironment["CMUX_UI_TEST_SOCKET_SANITY"] = "1"
-        // Debug launches require a tag outside reload.sh; provide one in UITests so CI
-        // does not fail with "Application ... does not have a process ID".
+        // Provide a run-specific launch tag so UITests get an isolated socket and avoid
+        // cross-run collisions.
         app.launchEnvironment["CMUX_TAG"] = launchTag
         return app
     }

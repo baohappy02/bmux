@@ -22,7 +22,7 @@ def _resolve_socket_path() -> str:
     if not socket_path:
         raise bmuxError("CMUX_SOCKET is required (expected /tmp/bmux-debug-<tag>.sock)")
     if not re.fullmatch(r"/tmp/bmux-debug-[^/]+\.sock", socket_path):
-        raise bmuxError(f"CMUX_SOCKET must be a tagged debug socket, got: {socket_path!r}")
+        raise bmuxError(f"CMUX_SOCKET must point to a named debug socket, got: {socket_path!r}")
     return socket_path
 
 

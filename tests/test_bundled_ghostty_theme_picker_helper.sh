@@ -7,7 +7,7 @@ CONFIGURATION="${CMUX_CONFIGURATION:-Debug}"
 
 case "$CONFIGURATION" in
   Debug)
-    APP_NAME="bmux DEV.app"
+    APP_NAME="bmux.app"
     ;;
   Release)
     APP_NAME="bmux.app"

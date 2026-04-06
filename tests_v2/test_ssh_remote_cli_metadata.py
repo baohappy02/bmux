@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression: `bmux ssh` creates a remote-tagged workspace with remote metadata."""
+"""Regression: `bmux ssh` creates a remote-labeled workspace with remote metadata."""
 
 from __future__ import annotations
 

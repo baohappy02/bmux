@@ -439,7 +439,7 @@
       "pathHeader": "Шлях",
       "release": "Release",
       "debug": "Debug",
-      "taggedDebug": "Тегована debug-збірка",
+      "isolatedDebug": "Тегована debug-збірка",
       "socketOverride": "Перевизначте за допомогою змінної середовища CMUX_SOCKET_PATH. Надсилайте один JSON-запит з переводом рядка за один виклик:",
       "socketCallout": "JSON-запити до сокету мають використовувати method та params. Застарілі JSON-пейлоади v1, такі як <legacy>'{'\"command\":\"...\"'}'</legacy>, не підтримуються.",
       "accessModes": "Режими доступу",

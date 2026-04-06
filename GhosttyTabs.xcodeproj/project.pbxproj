@@ -1031,7 +1031,7 @@
 					Carbon,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.bmuxterm.app.debug;
-				PRODUCT_NAME = "bmux DEV";
+				PRODUCT_NAME = "bmux";
 				SPARKLE_PUBLIC_KEY = "avjcgKibf1FTvhIjLBxhd+0HSpsXU4D0IGlVk8cgqRc=";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "bmux-Bridging-Header.h";
@@ -1214,7 +1214,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_VERSION = 5.0;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bmux DEV.app/Contents/MacOS/bmux DEV";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bmux.app/Contents/MacOS/bmux";
 				TEST_TARGET_NAME = GhosttyTabs;
 			};
 			name = Debug;

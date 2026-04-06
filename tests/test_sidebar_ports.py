@@ -5,8 +5,8 @@ End-to-end test for sidebar listening ports auto-detection.
 This covers regressions where a listening server (e.g. `python3 -m http.server`)
 doesn't show up in the sidebar ports row.
 
-Run with a tagged instance to avoid unix socket conflicts:
-  CMUX_TAG=<tag> python3 tests/test_sidebar_ports.py
+Run with CMUX_SOCKET_PATH=<path> when targeting a non-default socket:
+  CMUX_SOCKET_PATH=/tmp/bmux-debug.sock python3 tests/test_sidebar_ports.py
 """
 
 from __future__ import annotations
@@ -203,7 +203,7 @@ def _wait_for_lsof_listen_gone(port: int, timeout: float = 8.0) -> None:
 def main() -> int:
     tag = os.environ.get("CMUX_TAG") or ""
     if not tag:
-        print("Tip: set CMUX_TAG=<tag> when running this test to avoid socket conflicts.")
+        print("Tip: set CMUX_SOCKET_PATH=<path> when running this test against a non-default socket.")
 
     base = Path("/tmp") / f"bmux_ports_test_{os.getpid()}"
     pid_file = base / "server.pid"

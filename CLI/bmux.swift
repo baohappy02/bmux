@@ -223,11 +223,11 @@ private final class CLISocketSentryTelemetry {
         if !tmpSockets.isEmpty {
             context["tmp_bmux_sockets"] = tmpSockets
         }
-        let taggedSockets = tmpSockets.filter { $0 != CLISocketPathResolver.legacyDefaultSocketPath }
+        let nonDefaultSockets = tmpSockets.filter { $0 != CLISocketPathResolver.legacyDefaultSocketPath }
         if CLISocketPathResolver.isImplicitDefaultPath(socketPath),
            (envSocketPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true),
-           !taggedSockets.isEmpty {
-            context["possible_root_cause"] = "CMUX_SOCKET_PATH/CMUX_SOCKET missing while tagged sockets exist"
+           !nonDefaultSockets.isEmpty {
+            context["possible_root_cause"] = "CMUX_SOCKET_PATH/CMUX_SOCKET missing while non-default sockets exist"
         }
 
         return context
@@ -16679,7 +16679,7 @@ struct CMUXCLI {
           CMUX_TAB_ID         Optional alias used by `tab-action`/`rename-tab` as default --tab.
           CMUX_SURFACE_ID     Auto-set in bmux terminals. Used as default --surface.
           CMUX_SOCKET_PATH    Override the Unix socket path. Without this, the CLI defaults
-                              to ~/Library/Application Support/bmux/bmux.sock and auto-discovers tagged/debug sockets.
+                              to ~/Library/Application Support/bmux/bmux.sock and auto-discovers other debug sockets.
         """
     }
 

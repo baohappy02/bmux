@@ -766,7 +766,7 @@ final class MultiWindowNotificationsUITests: XCTestCase {
             appendCLIPathCandidates(fromProductsDirectory: productsDir, strategy: strategy, to: &candidates)
         }
 
-        candidates.append("/tmp/cmux-\(launchTag)/Build/Products/Debug/cmux DEV.app/Contents/Resources/bin/cmux")
+        candidates.append("/tmp/cmux-\(launchTag)/Build/Products/Debug/cmux.app/Contents/Resources/bin/cmux")
         candidates.append("/tmp/cmux-\(launchTag)/Build/Products/Debug/cmux.app/Contents/Resources/bin/cmux")
         if strategy == .any {
             candidates.append("/tmp/cmux-\(launchTag)/Build/Products/Debug/cmux")
@@ -803,7 +803,7 @@ final class MultiWindowNotificationsUITests: XCTestCase {
         strategy: CmuxCLIStrategy,
         to candidates: inout [String]
     ) {
-        candidates.append("\(productsDir)/cmux DEV.app/Contents/Resources/bin/cmux")
+        candidates.append("\(productsDir)/cmux.app/Contents/Resources/bin/cmux")
         candidates.append("\(productsDir)/cmux.app/Contents/Resources/bin/cmux")
         if strategy == .any {
             candidates.append("\(productsDir)/cmux")
@@ -935,9 +935,9 @@ final class MultiWindowNotificationsUITests: XCTestCase {
 
     private func expectedSocketCandidates(includeGlobalFallback: Bool) -> [String] {
         var candidates = [socketPath]
-        let taggedDebugSocket = "/tmp/cmux-debug-\(launchTag).sock"
-        if !taggedDebugSocket.isEmpty {
-            candidates.append(taggedDebugSocket)
+        let isolatedDebugSocket = "/tmp/cmux-debug-\(launchTag).sock"
+        if !isolatedDebugSocket.isEmpty {
+            candidates.append(isolatedDebugSocket)
         }
         if includeGlobalFallback {
             candidates.append(contentsOf: discoverTmpSocketCandidates(limit: 12))

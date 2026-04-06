@@ -8,25 +8,27 @@ export const DEFAULT_SKILLS: SkillInput[] = [
     origin: "manual",
     title: "Verify loop before log dives",
     summary:
-      "Use bmux managed verify jobs with explicit pause control: stop on paused jobs, otherwise read compact task results before opening logs.",
+      "Use bmux managed verify jobs with explicit pause control: let bmux offload into a separate visible task terminal, stop on paused jobs, otherwise let task wait return the final compact result before opening logs.",
     tags: ["verify", "task", "result", "diagnostics", "low-token"],
     contentMarkdown: `When to use
 - You need to validate a code change or reproduce a build or test failure.
 
 Steps
-1. Run \`bmux agent task run-profile --session <sid> --profile verify.ts --json\`.
+1. Run \`bmux agent task run-profile --session <sid> --profile <repo-appropriate verify profile such as verify.rust> --json\`.
 2. If the payload returns \`paused_for_user: true\`, stop and wait for the user instead of calling \`task wait\`, \`task result\`, or \`task logs\`.
-3. Only when the task is intentionally unattended, run \`bmux agent task run-profile --session <sid> --pause-for-user false --profile verify.ts --json\`, then use \`bmux agent task wait --session <sid> --job <job-id> --json\`.
-4. Read \`bmux agent task result --session <sid> --job <job-id> --json\` before asking for logs.
-5. Only fetch \`task logs\` or \`artifact list\` if the result payload is not enough.
+3. Only when the task is intentionally unattended, run \`bmux agent task run-profile --session <sid> --pause-for-user false --profile <repo-appropriate verify profile such as verify.rust> --json\`, then use \`bmux agent task wait --session <sid> --job <job-id> --json\`.
+4. \`task run-profile\` reuses a visible managed task terminal when one already exists; otherwise it creates a right split instead of reusing the attached prompt surface.
+5. Treat the \`task wait\` payload as the completion channel for unattended work. On failure, read \`failure_markers\`, then \`failure_context\`, then parsed diagnostics before asking for logs.
+6. Only fetch \`task result\`, \`task logs\`, or \`artifact list\` if the \`task wait\` payload is still not enough.
 
 Verify
-- Prefer parsed diagnostics, summary, and short tail from \`task result\`.
+- Prefer \`failure_markers\`, parsed diagnostics, summary, and \`failure_context\` from \`task wait\`.
 - Keep follow-up reads scoped to the failing job only.
 
 Stop conditions
 - For noisy verify work, assume bmux may pause by default and do not auto-wait past a paused payload.
-- If \`verify.ts\` is unavailable, inspect \`bmux agent capabilities\` for profiles and package manager first.`,
+- If bmux cannot create a visible split because of the visibility guard, surface that structured error instead of falling back to a hidden tab or background exec.
+- If a repo-appropriate verify profile is unavailable, inspect \`bmux agent capabilities\` for profiles and package manager first.`,
   },
   {
     slug: "coding-principles",
@@ -61,29 +63,31 @@ Stop conditions
     origin: "manual",
     title: "Use bmux managed terminals for noisy commands",
     summary:
-      "Prefer direct bmux task runs for single commands, open or ensure dedicated surfaces only when reuse matters, and keep logs compact.",
+      "Prefer direct bmux task runs for single commands; bmux auto-attaches, offloads into a separate visible task terminal, and keeps unattended follow-up compact.",
     tags: ["bmux-agent", "terminal", "task", "test", "build", "dev-server", "pause-for-user", "low-token"],
     contentMarkdown: `When to use
 - You need to run tests, builds, installs, migrations, benchmarks, or dev servers from bmux.
 
 Steps
-1. For a single managed command, prefer \`bmux agent task run\` directly. It can auto-attach to the current focus and choose the task terminal without a separate attach or ensure step.
+1. For a single managed command, prefer \`bmux agent task run\` directly. It can auto-attach to the current focus and dispatch into a separate visible task terminal without a separate attach or ensure step.
 2. Use \`bmux agent task run-profile\` when a named verify or dev-server profile already exists.
 3. Only call \`bmux agent capabilities\` when you need environment, profile, or helper discovery. Do not fetch it before every task.
-4. Only open or ensure a dedicated terminal first when the user needs a specific reusable visible surface before the command starts.
-5. Only call \`layout\` after topology changes or when the next step depends on pane or surface structure.
-6. For noisy or user-visible work, let bmux pause by default or pass \`--pause-for-user true\`, then stop if the task payload returns \`paused_for_user: true\`.
-7. Only for intentionally unattended work, pass \`--pause-for-user false\`, then use \`bmux agent task wait\` and \`bmux agent task result\`.
-8. Only fetch \`task logs\` or artifacts if the task failed or the user asked for them.
+4. When no reusable task terminal is already visible, bmux creates one as a right split instead of reusing the attached prompt surface.
+5. Only open or ensure a dedicated terminal first when the user needs a specific reusable visible surface before the command starts.
+6. Only call \`layout\` after topology changes or when the next step depends on pane or surface structure.
+7. For noisy or user-visible work, let bmux pause by default or pass \`--pause-for-user true\`, then stop if the task payload returns \`paused_for_user: true\`.
+8. Only for intentionally unattended work, pass \`--pause-for-user false\`, then use \`bmux agent task wait\` as the completion channel.
+9. On failed unattended work, consume \`failure_markers\` first, then \`failure_context\`, then diagnostics before pulling raw logs.
+10. Only fetch \`task result\`, \`task logs\`, or artifacts if the wait payload is insufficient or the user asked for them.
 
 Verify
-- Keep output compact and prefer task result over raw terminal capture.
-- If a split is refused by the visibility guard, accept the fallback tab or surface instead of forcing more panes.
+- Keep output compact and prefer \`task wait\` or \`task result\` over raw terminal capture.
+- If a split is refused by the visibility guard, surface the structured error instead of falling back to a hidden tab or background exec.
 
 Stop conditions
 - If the payload is paused for user, do not auto-wait or auto-tail logs.
 - If there is no live session, attach first.
-- If no visible surface can be ensured, keep the command attached instead of launching an unobserved detached job.`,
+- If no visible surface can be ensured, stop with the structured visibility-guard error instead of launching a hidden or background job.`,
   },
   {
     slug: "search-then-rg",

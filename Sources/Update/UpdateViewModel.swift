@@ -493,7 +493,7 @@ enum UpdateState: Equatable {
 
     enum ReleaseNotes {
         case commit(URL)
-        case tagged(URL)
+        case release(URL)
 
         init?(displayVersionString: String) {
             let version = displayVersionString
@@ -501,7 +501,7 @@ enum UpdateState: Equatable {
             if let semver = Self.extractSemanticVersion(from: version) {
                 let tag = semver.hasPrefix("v") ? semver : "v\(semver)"
                 if let url = URL(string: "https://github.com/manaflow-ai/bmux/releases/tag/\(tag)") {
-                    self = .tagged(url)
+                    self = .release(url)
                     return
                 }
             }
@@ -536,14 +536,14 @@ enum UpdateState: Equatable {
         var url: URL {
             switch self {
             case .commit(let url): return url
-            case .tagged(let url): return url
+            case .release(let url): return url
             }
         }
 
         var label: String {
             switch self {
             case .commit: return String(localized: "update.viewGitHubCommit", defaultValue: "View GitHub Commit")
-            case .tagged: return String(localized: "update.viewReleaseNotes", defaultValue: "View Release Notes")
+            case .release: return String(localized: "update.viewReleaseNotes", defaultValue: "View Release Notes")
             }
         }
     }

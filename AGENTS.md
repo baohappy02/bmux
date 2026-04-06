@@ -27,68 +27,26 @@ Run the setup script once to initialize submodules and build GhosttyKit:
 ./scripts/setup.sh
 ```
 
-Keep exactly two local app variants in normal development:
+Keep exactly one local app variant in normal development:
 
 1. `/Applications/bmux.app`
-2. one tagged dev build from `./scripts/reload.sh`
 
-Use a single stable dev tag such as `dev` unless you are explicitly testing isolation bugs.
+Use the installed app as the only runtime target for normal coding, verification, and agent work.
 
 ```bash
-./scripts/reload.sh --tag dev
-./scripts/reload.sh --tag dev --launch
-./scripts/reload.sh --tag dev --launch --install-applications
+./scripts/reloadp.sh
 ```
 
 Rules:
 
-- `reload.sh` is the canonical local dev loop.
-- `--launch` opens the tagged dev app after the build succeeds.
-- `--install-applications` also builds Release and replaces `/Applications/bmux.app` so the installed app matches current source.
-- `reload.sh` prunes the fallback untagged `bmux DEV.app` after cloning the tagged app.
-- `reload.sh --install-applications` and `reloadp.sh` prune the temporary Release `bmux.app` from `DerivedData` after copying into `/Applications`.
-- Do not keep multiple tagged dev apps around. Reuse one tag and replace the installed app when you want the stable copy updated.
-- Never `open` an untagged debug app from DerivedData manually.
+- `reloadp.sh` is the canonical local dev loop. It rebuilds and relaunches `/Applications/bmux.app`.
 - When using bmux MCP or `agent` commands from this repo, default the target to the bmux app, window, workspace, tab, and surface the user is currently using, not the last attached runtime.
-- Treat any reused MCP session whose `cli_path` points into `DerivedData` or a tagged dev app as stale unless the user explicitly asked to target that dev build. Re-attach from the currently focused bmux app before any `task run`, `task wait`, `task result`, `task logs`, `ensure`, `open`, or browser-agent action.
-
-Cleanup commands:
-
-```bash
-./scripts/prune-local-apps.sh --keep-tag dev
-./scripts/prune-local-apps.sh --main-only
-```
-
-- `--keep-tag dev` keeps `/Applications/bmux.app` and one test app: `bmux DEV dev.app`
-- `--main-only` removes all local test apps and leaves only `/Applications/bmux.app`
-
-`reload.sh` prints an `App path:` line with the absolute path to the built dev `.app`. Use that path to build a cmd-clickable `file://` URL. Steps:
-
-1. Grab the path from the `App path:` line in `reload.sh` output.
-2. Prepend `file://` and URL-encode spaces as `%20`. Do not hardcode any part of the path.
-3. Format it as a markdown link using the template for your agent type.
-
-Example. If `reload.sh` output contains:
-```
-App path:
-  /Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux DEV dev.app
-```
-
-**Claude Code** outputs:
-```markdown
-=======================================================
-[bmux DEV dev.app](file:///Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux%20DEV%20dev.app)
-=======================================================
-```
-
-**Codex** outputs:
-```
-=======================================================
-[dev: file:///Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux%20DEV%20dev.app](file:///Users/someone/Library/Developer/Xcode/DerivedData/bmux-dev/Build/Products/Debug/bmux%20DEV%20dev.app)
-=======================================================
-```
-
-Never use `/tmp/bmux-<tag>/...` app links in chat output.
+- Treat any reused MCP session whose `cli_path` does not point at `/Applications/bmux.app` as stale for normal work. Re-attach from the currently focused `/Applications/bmux.app` before any `task run`, `task wait`, `task result`, `task logs`, `ensure`, `open`, or browser-agent action.
+- If a change is wrong, undo or revert it in source control instead of switching runtimes.
+- For managed build, test, verify, and fix loops, default to `agent.task.run` or `agent.task.run-profile` so bmux dispatches into a separate visible task terminal. Reuse a visible managed task terminal when it already exists; otherwise create it as a right split instead of reusing the attached prompt surface.
+- Do not fall back to background exec when bmux managed task terminals are available. If bmux cannot create a visible split because of the visibility guard, surface the structured error instead of silently using a hidden tab or shell.
+- For intentionally unattended managed verify or fix loops, run the command in a visible bmux terminal with `pause_for_user=false`, then use `task wait` as the completion channel and consume `failure_markers` first, then `failure_context`, before reading raw logs.
+- Even in unattended loops, do not tail terminal noise live. Search the returned failure markers such as `error`, `failed`, `fatal`, `panic`, or `exception`; use `task logs` only when `task wait` or `task result` still leaves the failure under-specified.
 
 When rebuilding GhosttyKit.xcframework, always use Release optimizations:
 
@@ -116,11 +74,8 @@ All debug events (keys, mouse, focus, splits, tabs) go to a unified log in DEBUG
 tail -f "$(cat /tmp/cmux-last-debug-log-path 2>/dev/null || echo /tmp/cmux-debug.log)"
 ```
 
-- Untagged Debug app: `/tmp/cmux-debug.log`
-- Tagged Debug app (`./scripts/reload.sh --tag dev`): `/tmp/cmux-debug-dev.log`
-- `reload.sh` writes the current path to `/tmp/cmux-last-debug-log-path`
-- `reload.sh` writes the selected dev CLI path to `/tmp/cmux-last-cli-path`
-- `reload.sh` updates `/tmp/cmux-cli` and `$HOME/.local/bin/cmux-dev` to that CLI
+- Use `/tmp/cmux-last-debug-log-path` when present; otherwise fall back to `/tmp/cmux-debug.log`.
+- Do not rely on alternate debug log files or alternate CLI symlinks in the normal workflow.
 
 - Implementation: `vendor/bonsplit/Sources/Bonsplit/Public/DebugEventLog.swift`
 - Free function `dlog("message")` — logs with timestamp and appends to file in real time
@@ -190,8 +145,7 @@ The app has a **Debug** menu in the macOS menu bar (only in DEBUG builds). Use i
 - **E2E / UI tests:** trigger via `gh workflow run test-e2e.yml` (see cmuxterm-hq CLAUDE.md for details)
 - **Unit tests:** prefer `./scripts/test-unit.sh` for local runs. It wraps `xcodebuild -scheme bmux-unit`.
 - **Raw local xcodebuild:** not a trustworthy first diagnostic in restricted or sandboxed environments. DerivedData, module cache, and SwiftPM permission failures can mask the real code issue. If you must invoke `xcodebuild` directly, use an explicit writable `-derivedDataPath` and treat cache/permission failures as environment noise first.
-- **Python socket tests (tests_v2/):** these connect to a running cmux instance's socket. Never launch an untagged `cmux DEV.app` to run them. If you must test locally, use a tagged build's socket (`/tmp/cmux-debug-<tag>.sock`) with `CMUX_SOCKET=/tmp/cmux-debug-<tag>.sock`
-- **Never `open` an untagged `cmux DEV.app`** from DerivedData. It conflicts with the user's running debug instance.
+- **Python socket tests (tests_v2/):** these connect to a running cmux instance's socket. If you must test locally, point `CMUX_SOCKET` at the socket of the currently running `/Applications/bmux.app` instance.
 
 ## Ghostty submodule workflow
 

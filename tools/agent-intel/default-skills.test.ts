@@ -18,15 +18,26 @@ describe("default managed task skills", () => {
     expect(content).toContain("paused_for_user: true");
     expect(content).toContain("--pause-for-user false");
     expect(content).toContain("stop and wait for the user");
+    expect(content).toContain("verify.rust");
+    expect(content).toContain("failure_markers");
+    expect(content).toContain("failure_context");
+    expect(content).toContain("task wait");
+    expect(content).toContain("right split");
+    expect(content).toContain("background exec");
   });
 
-  test("managed terminal tasks prefer one-shot task runs and do not auto-wait after paused payloads", () => {
+  test("managed terminal tasks prefer one-shot task runs and unattended failure context before logs", () => {
     const content = skillContent("bmux-managed-terminal-tasks");
     expect(content).toContain("single managed command");
     expect(content).toContain("without a separate attach or ensure step");
+    expect(content).toContain("separate visible task terminal");
+    expect(content).toContain("right split");
     expect(content).toContain("Only call `layout` after topology changes");
     expect(content).toContain("paused_for_user: true");
     expect(content).toContain("--pause-for-user false");
-    expect(content).toContain("do not auto-wait");
+    expect(content).toContain("task wait");
+    expect(content).toContain("failure_markers");
+    expect(content).toContain("failure_context");
+    expect(content).toContain("background exec");
   });
 });

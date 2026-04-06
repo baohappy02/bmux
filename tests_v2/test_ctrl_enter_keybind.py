@@ -29,8 +29,8 @@ def infer_app_name_for_osascript(socket_path: str) -> str:
     Infer the app display name from the socket path.
 
     Examples:
-      - /tmp/bmux-debug.sock          -> "bmux DEV"
-      - /tmp/bmux-debug-foo.sock      -> "bmux DEV foo"
+      - /tmp/bmux-debug.sock          -> "bmux"
+      - /tmp/bmux-debug-foo.sock      -> "bmux foo"
       - ~/Library/Application Support/bmux/bmux.sock -> "bmux"
       - /tmp/bmux-foo.sock            -> "bmux foo"
     """
@@ -38,15 +38,15 @@ def infer_app_name_for_osascript(socket_path: str) -> str:
     if base.startswith("bmux-debug") and base.endswith(".sock"):
         suffix = base[len("bmux-debug") : -len(".sock")]
         if suffix.startswith("-") and suffix[1:]:
-            return f"bmux DEV {suffix[1:]}"
-        return "bmux DEV"
+            return f"bmux {suffix[1:]}"
+        return "bmux"
     if base.startswith("bmux") and base.endswith(".sock"):
         suffix = base[len("bmux") : -len(".sock")]
         if suffix.startswith("-") and suffix[1:]:
             return f"bmux {suffix[1:]}"
         return "bmux"
     # Fallback: tests usually run against Debug builds.
-    return "bmux DEV"
+    return "bmux"
 
 
 def run_osascript(script: str) -> None:
