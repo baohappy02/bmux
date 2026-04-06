@@ -8,7 +8,11 @@ import ObjectiveC.runtime
 import Bonsplit
 import UserNotifications
 
-#if canImport(cmux_DEV)
+#if canImport(bmux_DEV)
+@testable import bmux_DEV
+#elseif canImport(bmux)
+@testable import bmux
+#elseif canImport(cmux_DEV)
 @testable import cmux_DEV
 #elseif canImport(cmux)
 @testable import cmux
@@ -19,7 +23,7 @@ var cmuxUnitTestInspectorOverrideInstalled = false
 var cmuxUnitTestWKWebViewPerformKeyEquivalentOverrideInstalled = false
 var cmuxUnitTestWKWebViewPerformKeyEquivalentHook: ((WKWebView, NSEvent) -> Bool?)?
 
-extension CmuxWebView {
+extension BmuxWebView {
     @objc func cmuxUnitTestInspector() -> NSObject? {
         objc_getAssociatedObject(self, &cmuxUnitTestInspectorAssociationKey) as? NSObject
     }
@@ -48,20 +52,20 @@ func installCmuxUnitTestInspectorOverride() {
     guard !cmuxUnitTestInspectorOverrideInstalled else { return }
 
     guard let replacementMethod = class_getInstanceMethod(
-        CmuxWebView.self,
-        #selector(CmuxWebView.cmuxUnitTestInspector)
+        BmuxWebView.self,
+        #selector(BmuxWebView.cmuxUnitTestInspector)
     ) else {
         fatalError("Unable to locate test inspector replacement method")
     }
 
     let added = class_addMethod(
-        CmuxWebView.self,
+        BmuxWebView.self,
         NSSelectorFromString("_inspector"),
         method_getImplementation(replacementMethod),
         method_getTypeEncoding(replacementMethod)
     )
     guard added else {
-        fatalError("Unable to install CmuxWebView _inspector test override")
+        fatalError("Unable to install BmuxWebView _inspector test override")
     }
 
     cmuxUnitTestInspectorOverrideInstalled = true
@@ -184,7 +188,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "n", modifiers: [.command])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "n", modifiers: [.command], keyCode: 45) // kVK_ANSI_N
         XCTAssertNotNil(event)
 
@@ -196,7 +200,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "w", modifiers: [.command])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "w", modifiers: [.command], keyCode: 13) // kVK_ANSI_W
         XCTAssertNotNil(event)
 
@@ -208,7 +212,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "r", modifiers: [.command])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "r", modifiers: [.command], keyCode: 15) // kVK_ANSI_R
         XCTAssertNotNil(event)
 
@@ -220,7 +224,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "\r", modifiers: [])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "\r", modifiers: [], keyCode: 36) // kVK_Return
         XCTAssertNotNil(event)
 
@@ -232,7 +236,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "\r", modifiers: [.command])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "\r", modifiers: [.command], keyCode: 36) // kVK_Return
         XCTAssertNotNil(event)
 
@@ -244,7 +248,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let spy = ActionSpy()
         installMenu(spy: spy, key: "\r", modifiers: [])
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let event = makeKeyDownEvent(key: "\r", modifiers: [], keyCode: 76) // kVK_ANSI_KeypadEnter
         XCTAssertNotNil(event)
 
@@ -265,7 +269,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -298,7 +302,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -331,7 +335,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -367,7 +371,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -404,7 +408,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -478,7 +482,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         slot.autoresizingMask = [.width, .height]
         host.addSubview(slot)
 
-        let webView = CmuxWebView(frame: slot.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: slot.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         slot.addSubview(webView)
 
@@ -533,7 +537,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let anchor = NSView(frame: NSRect(x: 80, y: 60, width: 480, height: 260))
         contentView.addSubview(anchor)
 
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
 
         window.makeKeyAndOrderFront(nil)
         contentView.layoutSubtreeIfNeeded()
@@ -635,7 +639,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -702,7 +706,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         defer { window.orderOut(nil) }
 
         _ = window.makeFirstResponder(nil)
-        cmuxWithWindowFirstResponderBypass {
+        bmuxWithWindowFirstResponderBypass {
             XCTAssertFalse(
                 window.makeFirstResponder(responder),
                 "Bypass scope should block transient first-responder changes during devtools auto-restore"
@@ -790,7 +794,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -822,7 +826,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         _ = webView.performKeyEquivalent(with: event)
         XCTAssertFalse(
             spy.invoked,
-            "CmuxWebView should not route Cmd+` directly to the menu when WebKit is first responder"
+            "BmuxWebView should not route Cmd+` directly to the menu when WebKit is first responder"
         )
     }
 
@@ -843,7 +847,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -881,7 +885,7 @@ final class CmuxWebViewKeyEquivalentTests: XCTestCase {
         XCTAssertEqual(
             forwardedEvents.count,
             0,
-            "Did not expect CmuxWebView to preflight Cmd+F into page content while Web Inspector is focused"
+            "Did not expect BmuxWebView to preflight Cmd+F into page content while Web Inspector is focused"
         )
     }
 
@@ -961,7 +965,7 @@ final class CmuxWebViewContextMenuTests: XCTestCase {
 
     func testWillOpenMenuAddsOpenLinkInDefaultBrowserAndRoutesSelectionToDefaultBrowserOpener() {
         _ = NSApplication.shared
-        let webView = CmuxWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: NSRect(x: 0, y: 0, width: 800, height: 600), configuration: WKWebViewConfiguration())
         let menu = NSMenu()
         let openLinkItem = NSMenuItem(title: "Open Link", action: nil, keyEquivalent: "")
         openLinkItem.identifier = NSUserInterfaceItemIdentifier("WKMenuItemIdentifierOpenLink")
@@ -1003,7 +1007,7 @@ final class CmuxWebViewContextMenuTests: XCTestCase {
     }
 
     func testWillOpenMenuSkipsDefaultBrowserItemWhenContextHasNoOpenLinkEntry() {
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Back", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Forward", action: nil, keyEquivalent: ""))
@@ -1014,7 +1018,7 @@ final class CmuxWebViewContextMenuTests: XCTestCase {
     }
 
     func testWillOpenMenuHooksDownloadImageToDiskMenuVariant() {
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let menu = NSMenu()
         let originalTarget = NSObject()
         let originalAction = NSSelectorFromString("downloadImageToDisk:")
@@ -1031,7 +1035,7 @@ final class CmuxWebViewContextMenuTests: XCTestCase {
     }
 
     func testWillOpenMenuHooksDownloadLinkedFileToDiskMenuVariant() {
-        let webView = CmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: .zero, configuration: WKWebViewConfiguration())
         let menu = NSMenu()
         let originalTarget = NSObject()
         let originalAction = NSSelectorFromString("downloadLinkToDisk:")
@@ -2619,7 +2623,7 @@ final class BrowserIMEKeyDownRoutingTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -2668,7 +2672,7 @@ final class BrowserIMEKeyDownRoutingTests: XCTestCase {
         let container = NSView(frame: window.contentRect(forFrameRect: window.frame))
         window.contentView = container
 
-        let webView = CmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
+        let webView = BmuxWebView(frame: container.bounds, configuration: WKWebViewConfiguration())
         webView.autoresizingMask = [.width, .height]
         container.addSubview(webView)
 
@@ -3081,7 +3085,7 @@ final class BrowserHistoryStoreTests: XCTestCase {
 final class CmuxWebViewDragRoutingTests: XCTestCase {
     func testRejectsInternalPaneDragEvenWhenFilePromiseTypesArePresent() {
         XCTAssertTrue(
-            CmuxWebView.shouldRejectInternalPaneDrag([
+            BmuxWebView.shouldRejectInternalPaneDrag([
                 DragOverlayRoutingPolicy.bonsplitTabTransferType,
                 NSPasteboard.PasteboardType("com.apple.pasteboard.promised-file-url"),
             ])
@@ -3089,7 +3093,7 @@ final class CmuxWebViewDragRoutingTests: XCTestCase {
     }
 
     func testAllowsRegularExternalFileDrops() {
-        XCTAssertFalse(CmuxWebView.shouldRejectInternalPaneDrag([.fileURL]))
+        XCTAssertFalse(BmuxWebView.shouldRejectInternalPaneDrag([.fileURL]))
     }
 }
 
@@ -3112,55 +3116,55 @@ final class BrowserLinkOpenSettingsTests: XCTestCase {
     }
 
     func testTerminalLinksDefaultToCmuxBrowser() {
-        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser(defaults: defaults))
+        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowser(defaults: defaults))
     }
 
     func testTerminalLinksPreferenceUsesStoredValue() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowser(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowser(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowser(defaults: defaults))
     }
 
     func testSidebarPullRequestLinksDefaultToCmuxBrowser() {
-        XCTAssertTrue(BrowserLinkOpenSettings.openSidebarPullRequestLinksInCmuxBrowser(defaults: defaults))
+        XCTAssertTrue(BrowserLinkOpenSettings.openSidebarPullRequestLinksInBmuxBrowser(defaults: defaults))
     }
 
     func testSidebarPullRequestLinksPreferenceUsesStoredValue() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.openSidebarPullRequestLinksInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.openSidebarPullRequestLinksInCmuxBrowser(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.openSidebarPullRequestLinksInBmuxBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.openSidebarPullRequestLinksInBmuxBrowser(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.openSidebarPullRequestLinksInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.openSidebarPullRequestLinksInCmuxBrowser(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.openSidebarPullRequestLinksInBmuxBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.openSidebarPullRequestLinksInBmuxBrowser(defaults: defaults))
     }
 
     func testOpenCommandInterceptionDefaultsToCmuxBrowser() {
-        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInBmuxBrowser(defaults: defaults))
     }
 
     func testOpenCommandInterceptionUsesStoredValue() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInBmuxBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInBmuxBrowser(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.interceptTerminalOpenCommandInBmuxBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInBmuxBrowser(defaults: defaults))
     }
 
     func testOpenCommandInterceptionFallsBackToLegacyLinkToggleWhenUnset() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.interceptTerminalOpenCommandInBmuxBrowser(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInCmuxBrowser(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.interceptTerminalOpenCommandInBmuxBrowser(defaults: defaults))
     }
 
     func testSettingsInitialOpenCommandInterceptionValueFallsBackToLegacyLinkToggleWhenUnset() {
-        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertFalse(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInCmuxBrowserValue(defaults: defaults))
+        defaults.set(false, forKey: BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowserKey)
+        XCTAssertFalse(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInBmuxBrowserValue(defaults: defaults))
 
-        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInCmuxBrowserKey)
-        XCTAssertTrue(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInCmuxBrowserValue(defaults: defaults))
+        defaults.set(true, forKey: BrowserLinkOpenSettings.openTerminalLinksInBmuxBrowserKey)
+        XCTAssertTrue(BrowserLinkOpenSettings.initialInterceptTerminalOpenCommandInBmuxBrowserValue(defaults: defaults))
     }
 
     func testExternalOpenPatternsDefaultToEmpty() {

@@ -20,8 +20,11 @@ describe("default managed task skills", () => {
     expect(content).toContain("stop and wait for the user");
   });
 
-  test("managed terminal tasks do not auto-wait after paused payloads", () => {
+  test("managed terminal tasks prefer one-shot task runs and do not auto-wait after paused payloads", () => {
     const content = skillContent("bmux-managed-terminal-tasks");
+    expect(content).toContain("single managed command");
+    expect(content).toContain("without a separate attach or ensure step");
+    expect(content).toContain("Only call `layout` after topology changes");
     expect(content).toContain("paused_for_user: true");
     expect(content).toContain("--pause-for-user false");
     expect(content).toContain("do not auto-wait");

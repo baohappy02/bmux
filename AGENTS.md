@@ -49,6 +49,8 @@ Rules:
 - `reload.sh --install-applications` and `reloadp.sh` prune the temporary Release `bmux.app` from `DerivedData` after copying into `/Applications`.
 - Do not keep multiple tagged dev apps around. Reuse one tag and replace the installed app when you want the stable copy updated.
 - Never `open` an untagged debug app from DerivedData manually.
+- When using bmux MCP or `agent` commands from this repo, default the target to the bmux app, window, workspace, tab, and surface the user is currently using, not the last attached runtime.
+- Treat any reused MCP session whose `cli_path` points into `DerivedData` or a tagged dev app as stale unless the user explicitly asked to target that dev build. Re-attach from the currently focused bmux app before any `task run`, `task wait`, `task result`, `task logs`, `ensure`, `open`, or browser-agent action.
 
 Cleanup commands:
 

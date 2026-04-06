@@ -61,18 +61,20 @@ Stop conditions
     origin: "manual",
     title: "Use bmux managed terminals for noisy commands",
     summary:
-      "Run builds, tests, and dev servers in bmux task or terminal surfaces, prefer pause-for-user when the user should inspect the terminal, and keep logs compact.",
+      "Prefer direct bmux task runs for single commands, open or ensure dedicated surfaces only when reuse matters, and keep logs compact.",
     tags: ["bmux-agent", "terminal", "task", "test", "build", "dev-server", "pause-for-user", "low-token"],
     contentMarkdown: `When to use
 - You need to run tests, builds, installs, migrations, benchmarks, or dev servers from bmux.
 
 Steps
-1. Attach once and read \`bmux agent capabilities --session <sid> --json\`.
-2. Reuse an existing terminal surface when possible. If the user needs a visible terminal, open or ensure one with \`bmux agent open\` or \`bmux agent ensure\`.
-3. For managed execution, prefer \`bmux agent task run\` or \`bmux agent task run-profile\`.
-4. For noisy or user-visible work, let bmux pause by default or pass \`--pause-for-user true\`, then stop if the task payload returns \`paused_for_user: true\`.
-5. Only for intentionally unattended work, pass \`--pause-for-user false\`, then use \`bmux agent task wait\` and \`bmux agent task result\`.
-6. Only fetch \`task logs\` or artifacts if the task failed or the user asked for them.
+1. For a single managed command, prefer \`bmux agent task run\` directly. It can auto-attach to the current focus and choose the task terminal without a separate attach or ensure step.
+2. Use \`bmux agent task run-profile\` when a named verify or dev-server profile already exists.
+3. Only call \`bmux agent capabilities\` when you need environment, profile, or helper discovery. Do not fetch it before every task.
+4. Only open or ensure a dedicated terminal first when the user needs a specific reusable visible surface before the command starts.
+5. Only call \`layout\` after topology changes or when the next step depends on pane or surface structure.
+6. For noisy or user-visible work, let bmux pause by default or pass \`--pause-for-user true\`, then stop if the task payload returns \`paused_for_user: true\`.
+7. Only for intentionally unattended work, pass \`--pause-for-user false\`, then use \`bmux agent task wait\` and \`bmux agent task result\`.
+8. Only fetch \`task logs\` or artifacts if the task failed or the user asked for them.
 
 Verify
 - Keep output compact and prefer task result over raw terminal capture.

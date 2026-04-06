@@ -8,7 +8,11 @@ import Bonsplit
 import UserNotifications
 import Combine
 
-#if canImport(cmux_DEV)
+#if canImport(bmux_DEV)
+@testable import bmux_DEV
+#elseif canImport(bmux)
+@testable import bmux
+#elseif canImport(cmux_DEV)
 @testable import cmux_DEV
 #elseif canImport(cmux)
 @testable import cmux
@@ -307,7 +311,7 @@ final class WorkspaceCreationPlacementTests: XCTestCase {
             title: String,
             workingDirectory: String?,
             portOrdinal: Int,
-            configTemplate: CmuxSurfaceConfigTemplate?,
+            configTemplate: BmuxSurfaceConfigTemplate?,
             initialTerminalCommand: String?,
             initialTerminalEnvironment: [String: String]
         ) -> Workspace {
@@ -544,11 +548,11 @@ final class WorkspaceCreationPlacementTests: XCTestCase {
 @MainActor
 final class WorkspaceCreationConfigSanitizationTests: XCTestCase {
     private final class UnsafeConfigSnapshotTabManager: TabManager {
-        private var injectedConfig: CmuxSurfaceConfigTemplate?
-        var capturedConfigTemplate: CmuxSurfaceConfigTemplate?
+        private var injectedConfig: BmuxSurfaceConfigTemplate?
+        var capturedConfigTemplate: BmuxSurfaceConfigTemplate?
 
         func installInjectedConfig(fontSize: Float) {
-            var config = CmuxSurfaceConfigTemplate()
+            var config = BmuxSurfaceConfigTemplate()
             config.fontSize = fontSize
             config.workingDirectory = "/tmp/cmux-workspace-snapshot"
             config.command = "echo snapshot"
@@ -558,7 +562,7 @@ final class WorkspaceCreationConfigSanitizationTests: XCTestCase {
 
         override func inheritedTerminalConfigForNewWorkspace(
             workspace: Workspace?
-        ) -> CmuxSurfaceConfigTemplate? {
+        ) -> BmuxSurfaceConfigTemplate? {
             injectedConfig ?? super.inheritedTerminalConfigForNewWorkspace(workspace: workspace)
         }
 
@@ -566,7 +570,7 @@ final class WorkspaceCreationConfigSanitizationTests: XCTestCase {
             title: String,
             workingDirectory: String?,
             portOrdinal: Int,
-            configTemplate: CmuxSurfaceConfigTemplate?,
+            configTemplate: BmuxSurfaceConfigTemplate?,
             initialTerminalCommand: String?,
             initialTerminalEnvironment: [String: String]
         ) -> Workspace {

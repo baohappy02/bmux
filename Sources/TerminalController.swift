@@ -3688,6 +3688,9 @@ class TerminalController {
             "runtime_helper_drift_detected": runtimeHelpers.driftDetected,
             "task_execution_guidance": [
                 "Prefer agent.task.run or agent.task.run_profile for build, test, verify, typecheck, install, migration, benchmark, and dev-server commands.",
+                "For a single managed command, call agent.task.run directly; it can auto-attach to the current focus and reuse or create the task terminal without a separate attach or ensure step.",
+                "Only call agent.capabilities when you need environment, profile, or helper discovery; do not fetch it before every managed task.",
+                "Only call agent.layout when the next step depends on topology or a previous action changed panes/surfaces.",
                 "Prefer repo wrappers or bmux-managed tasks over raw xcodebuild when available; local xcodebuild failures often come from sandbox, DerivedData, or cache permissions instead of the real code issue.",
                 "For one-shot work, agent.open, agent.ensure, agent.task.run, agent.task.run_many, and agent.task.run_profile can omit session_id; bmux will auto-attach to the current focus and return session_id in the payload.",
                 "Use agent.task.result as the default success channel. Only read agent.task.logs on failure, timeout, or explicit user request.",
@@ -10821,7 +10824,7 @@ class TerminalController {
 
     private func v2ResolveTabManager(params: [String: Any]) -> TabManager? {
         // Prefer explicit window_id routing. Fall back to global lookup by workspace_id/surface_id/tab_id,
-        // and finally to the active window's TabManager.
+        // and finally to the existing controller TabManager.
         if let windowId = v2UUID(params, "window_id") {
             return v2MainSync { AppDelegate.shared?.tabManagerFor(windowId: windowId) }
         }

@@ -11,15 +11,27 @@ Use `agent.*` first. Use legacy `list-*` and full browser snapshots only for deb
 3. Stop and report if the path requires billing or paid usage.
 4. Keep responses compact: refs, cursors, booleans, and short summaries.
 
-## Core Loop
+## Fast Paths
+
+For a single managed command, skip the full attach/capabilities/layout dance:
+
+1. `bmux agent task run --pause-for-user true --cmd "cargo test" --json`
+2. Stop if the payload returns `paused_for_user: true`
+3. Use `bmux agent task result --job <job-id> --json` only when the user wants you to continue
+
+Only create a dedicated surface first when reuse matters:
+
+1. `bmux agent ensure terminal --split down --focus false --json`
+2. `bmux agent task run --surface <surface> --pause-for-user true --cmd "cargo test" --json`
+
+Use the longer session loop only when the task is multi-step or you need discovery:
 
 1. `bmux agent attach --json`
-2. `bmux agent capabilities --session <sid> --json`
-3. `bmux agent layout --session <sid> --json`
+2. `bmux agent capabilities --session <sid> --json` only if you need environment or profile discovery
+3. `bmux agent layout --session <sid> --json` only when topology matters or just changed
 4. `bmux agent intel search --session <sid> --query "<task>" --json`
-5. `bmux agent ensure ...` or `bmux agent batch ...`
-6. `bmux agent events --session <sid> --since <cursor> --json`
-7. `bmux agent state summary --session <sid> --json`
+5. `bmux agent events --session <sid> --since <cursor> --json`
+6. `bmux agent state summary --session <sid> --json`
 
 For one-shot task dispatch, `attach` is optional:
 

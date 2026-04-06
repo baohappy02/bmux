@@ -2,7 +2,11 @@ import XCTest
 import AppKit
 import WebKit
 
-#if canImport(cmux_DEV)
+#if canImport(bmux_DEV)
+@testable import bmux_DEV
+#elseif canImport(bmux)
+@testable import bmux
+#elseif canImport(cmux_DEV)
 @testable import cmux_DEV
 #elseif canImport(cmux)
 @testable import cmux
@@ -321,7 +325,7 @@ final class GhosttyConfigTests: XCTestCase {
             )
 
             XCTAssertEqual(
-                GhosttyApp.cmuxAppSupportConfigURLs(
+                GhosttyApp.bmuxAppSupportConfigURLs(
                     currentBundleIdentifier: "com.cmuxterm.app.debug",
                     appSupportDirectory: appSupportDirectory
                 ),
@@ -346,7 +350,7 @@ final class GhosttyConfigTests: XCTestCase {
             )
 
             XCTAssertEqual(
-                GhosttyApp.cmuxAppSupportConfigURLs(
+                GhosttyApp.bmuxAppSupportConfigURLs(
                     currentBundleIdentifier: "com.cmuxterm.app.debug.issue-829",
                     appSupportDirectory: appSupportDirectory
                 ),
@@ -365,7 +369,7 @@ final class GhosttyConfigTests: XCTestCase {
             )
 
             XCTAssertTrue(
-                GhosttyApp.cmuxAppSupportConfigURLs(
+                GhosttyApp.bmuxAppSupportConfigURLs(
                     currentBundleIdentifier: "com.example.other-app",
                     appSupportDirectory: appSupportDirectory
                 ).isEmpty
@@ -383,7 +387,7 @@ final class GhosttyConfigTests: XCTestCase {
             )
 
             XCTAssertTrue(
-                GhosttyApp.cmuxAppSupportConfigURLs(
+                GhosttyApp.bmuxAppSupportConfigURLs(
                     currentBundleIdentifier: "com.cmuxterm.app.debug",
                     appSupportDirectory: appSupportDirectory
                 ).isEmpty
@@ -732,36 +736,36 @@ final class WindowTransparencyDecisionTests: XCTestCase {
             defaults.set("withinWindow", forKey: sidebarBlendModeKey)
             defaults.set(false, forKey: bgGlassEnabledKey)
 
-            XCTAssertFalse(cmuxShouldUseTransparentBackgroundWindow())
-            XCTAssertTrue(cmuxShouldUseClearWindowBackground(for: 0.80))
-            XCTAssertFalse(cmuxShouldUseClearWindowBackground(for: 1.0))
+            XCTAssertFalse(bmuxShouldUseTransparentBackgroundWindow())
+            XCTAssertTrue(bmuxShouldUseClearWindowBackground(for: 0.80))
+            XCTAssertFalse(bmuxShouldUseClearWindowBackground(for: 1.0))
         }
     }
 
     func testGlassEnabledDecisionIgnoresGlassImplementationAvailability() {
         XCTAssertTrue(
-            cmuxShouldApplyWindowGlass(
+            bmuxShouldApplyWindowGlass(
                 sidebarBlendMode: "behindWindow",
                 bgGlassEnabled: true,
                 glassEffectAvailable: false
             )
         )
         XCTAssertTrue(
-            cmuxShouldApplyWindowGlass(
+            bmuxShouldApplyWindowGlass(
                 sidebarBlendMode: "behindWindow",
                 bgGlassEnabled: true,
                 glassEffectAvailable: true
             )
         )
         XCTAssertFalse(
-            cmuxShouldApplyWindowGlass(
+            bmuxShouldApplyWindowGlass(
                 sidebarBlendMode: "withinWindow",
                 bgGlassEnabled: true,
                 glassEffectAvailable: true
             )
         )
         XCTAssertFalse(
-            cmuxShouldApplyWindowGlass(
+            bmuxShouldApplyWindowGlass(
                 sidebarBlendMode: "behindWindow",
                 bgGlassEnabled: false,
                 glassEffectAvailable: true
@@ -775,8 +779,8 @@ final class WindowTransparencyDecisionTests: XCTestCase {
             defaults.set("behindWindow", forKey: sidebarBlendModeKey)
             defaults.set(true, forKey: bgGlassEnabledKey)
 
-            XCTAssertTrue(cmuxShouldUseTransparentBackgroundWindow())
-            XCTAssertTrue(cmuxShouldUseClearWindowBackground(for: 1.0))
+            XCTAssertTrue(bmuxShouldUseTransparentBackgroundWindow())
+            XCTAssertTrue(bmuxShouldUseClearWindowBackground(for: 1.0))
         }
     }
 
@@ -1670,7 +1674,7 @@ final class RecentlyClosedBrowserStackTests: XCTestCase {
 final class SocketControlSettingsTests: XCTestCase {
     func testMigrateModeSupportsExpandedSocketModes() {
         XCTAssertEqual(SocketControlSettings.migrateMode("off"), .off)
-        XCTAssertEqual(SocketControlSettings.migrateMode("cmuxOnly"), .cmuxOnly)
+        XCTAssertEqual(SocketControlSettings.migrateMode("cmuxOnly"), .bmuxOnly)
         XCTAssertEqual(SocketControlSettings.migrateMode("automation"), .automation)
         XCTAssertEqual(SocketControlSettings.migrateMode("password"), .password)
         XCTAssertEqual(SocketControlSettings.migrateMode("allow-all"), .allowAll)
@@ -1682,7 +1686,7 @@ final class SocketControlSettingsTests: XCTestCase {
 
     func testSocketModePermissions() {
         XCTAssertEqual(SocketControlMode.off.socketFilePermissions, 0o600)
-        XCTAssertEqual(SocketControlMode.cmuxOnly.socketFilePermissions, 0o600)
+        XCTAssertEqual(SocketControlMode.bmuxOnly.socketFilePermissions, 0o600)
         XCTAssertEqual(SocketControlMode.automation.socketFilePermissions, 0o600)
         XCTAssertEqual(SocketControlMode.password.socketFilePermissions, 0o600)
         XCTAssertEqual(SocketControlMode.allowAll.socketFilePermissions, 0o666)

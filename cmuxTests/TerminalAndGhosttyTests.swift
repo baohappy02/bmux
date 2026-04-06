@@ -7,7 +7,11 @@ import ObjectiveC.runtime
 import Bonsplit
 import UserNotifications
 
-#if canImport(cmux_DEV)
+#if canImport(bmux_DEV)
+@testable import bmux_DEV
+#elseif canImport(bmux)
+@testable import bmux
+#elseif canImport(cmux_DEV)
 @testable import cmux_DEV
 #elseif canImport(cmux)
 @testable import cmux
@@ -31,8 +35,8 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         pasteboard.clearContents()
         pasteboard.setString("<p>Hello <strong>world</strong></p>", forType: .html)
 
-        XCTAssertEqual(cmuxPasteboardStringContentsForTesting(pasteboard), "Hello world")
-        XCTAssertNil(cmuxPasteboardImagePathForTesting(pasteboard))
+        XCTAssertEqual(bmuxPasteboardStringContentsForTesting(pasteboard), "Hello world")
+        XCTAssertNil(bmuxPasteboardImagePathForTesting(pasteboard))
     }
 
     func testAlternatePlainTextUTIExtractsPlainText() {
@@ -44,7 +48,7 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            cmuxPasteboardStringContentsForTesting(pasteboard),
+            bmuxPasteboardStringContentsForTesting(pasteboard),
             "hello from public.plain-text"
         )
     }
@@ -62,7 +66,7 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         pasteboard.setData(rtfData, forType: .rtf)
 
         XCTAssertEqual(
-            cmuxPasteboardStringContentsForTesting(pasteboard),
+            bmuxPasteboardStringContentsForTesting(pasteboard),
             "hello from rtf fallback"
         )
     }
@@ -76,7 +80,7 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         )
         pasteboard.setString("<p>Hello <strong>world</strong></p>", forType: .html)
 
-        XCTAssertEqual(cmuxPasteboardStringContentsForTesting(pasteboard), "Hello world")
+        XCTAssertEqual(bmuxPasteboardStringContentsForTesting(pasteboard), "Hello world")
     }
 
     func testImageClipboardWithPlainTextFallbackStillFallsBackToImagePath() throws {
@@ -97,9 +101,9 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         let pngData = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
         pasteboard.setData(pngData, forType: .png)
 
-        XCTAssertNil(cmuxPasteboardStringContentsForTesting(pasteboard))
+        XCTAssertNil(bmuxPasteboardStringContentsForTesting(pasteboard))
 
-        let imagePath = try XCTUnwrap(cmuxPasteboardImagePathForTesting(pasteboard))
+        let imagePath = try XCTUnwrap(bmuxPasteboardImagePathForTesting(pasteboard))
         defer { try? FileManager.default.removeItem(atPath: imagePath) }
 
         XCTAssertTrue(imagePath.hasSuffix(".png"))
@@ -121,9 +125,9 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         let pngData = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
         pasteboard.setData(pngData, forType: .png)
 
-        XCTAssertNil(cmuxPasteboardStringContentsForTesting(pasteboard))
+        XCTAssertNil(bmuxPasteboardStringContentsForTesting(pasteboard))
 
-        let imagePath = try XCTUnwrap(cmuxPasteboardImagePathForTesting(pasteboard))
+        let imagePath = try XCTUnwrap(bmuxPasteboardImagePathForTesting(pasteboard))
         defer { try? FileManager.default.removeItem(atPath: imagePath) }
 
         XCTAssertTrue(imagePath.hasSuffix(".png"))
@@ -149,9 +153,9 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         let pngData = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
         pasteboard.setData(pngData, forType: .png)
 
-        XCTAssertNil(cmuxPasteboardStringContentsForTesting(pasteboard))
+        XCTAssertNil(bmuxPasteboardStringContentsForTesting(pasteboard))
 
-        let imagePath = try XCTUnwrap(cmuxPasteboardImagePathForTesting(pasteboard))
+        let imagePath = try XCTUnwrap(bmuxPasteboardImagePathForTesting(pasteboard))
         defer { try? FileManager.default.removeItem(atPath: imagePath) }
 
         XCTAssertTrue(imagePath.hasSuffix(".png"))
@@ -173,8 +177,8 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         let pngData = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
         pasteboard.setData(pngData, forType: .png)
 
-        XCTAssertEqual(cmuxPasteboardStringContentsForTesting(pasteboard), "Hello")
-        XCTAssertNil(cmuxPasteboardImagePathForTesting(pasteboard))
+        XCTAssertEqual(bmuxPasteboardStringContentsForTesting(pasteboard), "Hello")
+        XCTAssertNil(bmuxPasteboardImagePathForTesting(pasteboard))
     }
 
     func testJPEGClipboardFallsBackToImagePath() throws {
@@ -200,7 +204,7 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
             forType: NSPasteboard.PasteboardType(UTType.jpeg.identifier)
         )
 
-        let imagePath = try XCTUnwrap(cmuxPasteboardImagePathForTesting(pasteboard))
+        let imagePath = try XCTUnwrap(bmuxPasteboardImagePathForTesting(pasteboard))
         defer { try? FileManager.default.removeItem(atPath: imagePath) }
 
         XCTAssertTrue(imagePath.hasSuffix(".jpeg"))
@@ -226,9 +230,9 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         )
         pasteboard.setData(data, forType: .rtfd)
 
-        XCTAssertNil(cmuxPasteboardStringContentsForTesting(pasteboard))
+        XCTAssertNil(bmuxPasteboardStringContentsForTesting(pasteboard))
 
-        let imagePath = try XCTUnwrap(cmuxPasteboardImagePathForTesting(pasteboard))
+        let imagePath = try XCTUnwrap(bmuxPasteboardImagePathForTesting(pasteboard))
         defer { try? FileManager.default.removeItem(atPath: imagePath) }
 
         XCTAssertTrue(imagePath.hasSuffix(".tiff"))
@@ -250,8 +254,8 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         )
         pasteboard.setData(data, forType: .rtfd)
 
-        XCTAssertNil(cmuxPasteboardStringContentsForTesting(pasteboard))
-        XCTAssertNil(cmuxPasteboardImagePathForTesting(pasteboard))
+        XCTAssertNil(bmuxPasteboardStringContentsForTesting(pasteboard))
+        XCTAssertNil(bmuxPasteboardImagePathForTesting(pasteboard))
     }
 
     func testRTFDClipboardWithVisibleTextPrefersText() throws {
@@ -275,8 +279,8 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         )
         pasteboard.setData(data, forType: .rtfd)
 
-        XCTAssertEqual(cmuxPasteboardStringContentsForTesting(pasteboard), "Hello")
-        XCTAssertNil(cmuxPasteboardImagePathForTesting(pasteboard))
+        XCTAssertEqual(bmuxPasteboardStringContentsForTesting(pasteboard), "Hello")
+        XCTAssertNil(bmuxPasteboardImagePathForTesting(pasteboard))
     }
 
     func testImageOnlyPasteboardProducesTempFileURL() throws {
@@ -284,7 +288,7 @@ final class GhosttyPasteboardHelperTests: XCTestCase {
         pasteboard.clearContents()
         pasteboard.setData(try make1x1PNG(color: .red), forType: .png)
 
-        let fileURL = try XCTUnwrap(cmuxPasteboardImageFileURLForTesting(pasteboard))
+        let fileURL = try XCTUnwrap(bmuxPasteboardImageFileURLForTesting(pasteboard))
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
         XCTAssertEqual(fileURL.pathExtension, "png")
@@ -1281,17 +1285,17 @@ final class GhosttyResponderResolutionTests: XCTestCase {
         let descendant = FocusProbeView(frame: NSRect(x: 0, y: 0, width: 40, height: 40))
         ghosttyView.addSubview(descendant)
 
-        XCTAssertTrue(cmuxOwningGhosttyView(for: descendant) === ghosttyView)
+        XCTAssertTrue(bmuxOwningGhosttyView(for: descendant) === ghosttyView)
     }
 
     func testResolvesGhosttyViewFromGhosttyResponder() {
         let ghosttyView = GhosttyNSView(frame: NSRect(x: 0, y: 0, width: 200, height: 120))
-        XCTAssertTrue(cmuxOwningGhosttyView(for: ghosttyView) === ghosttyView)
+        XCTAssertTrue(bmuxOwningGhosttyView(for: ghosttyView) === ghosttyView)
     }
 
     func testReturnsNilForUnrelatedResponder() {
         let view = FocusProbeView(frame: NSRect(x: 0, y: 0, width: 40, height: 40))
-        XCTAssertNil(cmuxOwningGhosttyView(for: view))
+        XCTAssertNil(bmuxOwningGhosttyView(for: view))
     }
 }
 

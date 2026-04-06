@@ -1,9 +1,13 @@
 import XCTest
 
-#if canImport(cmux)
-@testable import cmux
+#if canImport(bmux_DEV)
+@testable import bmux_DEV
+#elseif canImport(bmux)
+@testable import bmux
 #elseif canImport(cmux_DEV)
 @testable import cmux_DEV
+#elseif canImport(cmux)
+@testable import cmux
 #endif
 
 final class WorkspaceRemoteConnectionTests: XCTestCase {
@@ -2144,6 +2148,258 @@ final class CLINotifyProcessIntegrationTests: XCTestCase {
                     && (params["surface_id"] as? String) == staleSurface
             },
             "Stale env surface should not win inside tmux, saw \(state.commands)"
+        )
+    }
+
+    @MainActor
+    func testAgentAttachPrefersCallerTabAndPanelEnvironment() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("agent-attach-env")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        let state = MockSocketServerState()
+        let workspaceId = "11111111-1111-1111-1111-111111111111"
+        let callerSurface = "22222222-2222-2222-2222-222222222222"
+        let staleWorkspace = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+        let staleSurface = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"
+
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let serverHandled = startMockServer(listenerFD: listenerFD, state: state) { line in
+            guard let data = line.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                  let id = payload["id"] as? String,
+                  let method = payload["method"] as? String else {
+                return self.v2Response(
+                    id: "unknown",
+                    ok: false,
+                    error: ["code": "unexpected", "message": "Unexpected payload"]
+                )
+            }
+
+            switch method {
+            case "agent.attach":
+                let params = payload["params"] as? [String: Any] ?? [:]
+                guard (params["workspace_id"] as? String) == workspaceId,
+                      (params["surface_id"] as? String) == callerSurface else {
+                    return self.v2Response(
+                        id: id,
+                        ok: false,
+                        error: ["code": "unexpected", "message": "agent.attach lost caller context"]
+                    )
+                }
+                return self.v2Response(
+                    id: id,
+                    ok: true,
+                    result: [
+                        "session_id": "ag_1",
+                        "workspace_id": workspaceId,
+                        "surface_id": callerSurface
+                    ]
+                )
+            default:
+                return self.v2Response(
+                    id: id,
+                    ok: false,
+                    error: ["code": "unexpected", "message": "Unexpected method \(method)"]
+                )
+            }
+        }
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["CMUX_SOCKET_PATH"] = socketPath
+        environment["CMUX_TAB_ID"] = workspaceId
+        environment["CMUX_PANEL_ID"] = callerSurface
+        environment["CMUX_WORKSPACE_ID"] = staleWorkspace
+        environment["CMUX_SURFACE_ID"] = staleSurface
+        environment["CMUX_CLI_SENTRY_DISABLED"] = "1"
+        environment["CMUX_CLAUDE_HOOK_SENTRY_DISABLED"] = "1"
+
+        let result = runProcess(
+            executablePath: cliPath,
+            arguments: ["agent", "attach"],
+            environment: environment,
+            timeout: 5
+        )
+
+        wait(for: [serverHandled], timeout: 5)
+        XCTAssertFalse(result.timedOut, result.stderr)
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertTrue(result.stdout.contains("session=ag_1"), result.stdout)
+        XCTAssertTrue(result.stderr.isEmpty, result.stderr)
+        XCTAssertTrue(
+            state.commands.contains { command in
+                guard let data = command.data(using: .utf8),
+                      let payload = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                      let method = payload["method"] as? String,
+                      method == "agent.attach" else {
+                    return false
+                }
+                let params = payload["params"] as? [String: Any] ?? [:]
+                return (params["workspace_id"] as? String) == workspaceId
+                    && (params["surface_id"] as? String) == callerSurface
+            },
+            "Expected agent.attach to prefer caller tab/panel env, saw \(state.commands)"
+        )
+    }
+
+    @MainActor
+    func testAgentAttachFallsBackToCallerTTYWhenCallerPanelEnvIsStale() throws {
+        let cliPath = try bundledCLIPath()
+        let socketPath = makeSocketPath("agent-attach-tty-fallback")
+        let listenerFD = try bindUnixSocket(at: socketPath)
+        let state = MockSocketServerState()
+        let callerTTY = "/dev/ttys777"
+        let workspaceId = "11111111-1111-1111-1111-111111111111"
+        let callerSurface = "22222222-2222-2222-2222-222222222222"
+        let staleSurface = "33333333-3333-3333-3333-333333333333"
+        let staleWorkspace = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+
+        defer {
+            Darwin.close(listenerFD)
+            unlink(socketPath)
+        }
+
+        let serverHandled = startMockServer(listenerFD: listenerFD, state: state) { line in
+            guard let data = line.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                  let id = payload["id"] as? String,
+                  let method = payload["method"] as? String else {
+                return self.v2Response(
+                    id: "unknown",
+                    ok: false,
+                    error: ["code": "unexpected", "message": "Unexpected payload"]
+                )
+            }
+
+            let params = payload["params"] as? [String: Any] ?? [:]
+            switch method {
+            case "surface.list":
+                guard (params["workspace_id"] as? String) == workspaceId else {
+                    return self.v2Response(
+                        id: id,
+                        ok: false,
+                        error: ["code": "unexpected", "message": "surface.list workspace mismatch"]
+                    )
+                }
+                return self.v2Response(
+                    id: id,
+                    ok: true,
+                    result: [
+                        "surfaces": [
+                            [
+                                "id": callerSurface,
+                                "ref": "surface:1",
+                                "index": 0,
+                                "focused": false
+                            ],
+                            [
+                                "id": staleSurface,
+                                "ref": "surface:2",
+                                "index": 1,
+                                "focused": true
+                            ]
+                        ]
+                    ]
+                )
+            case "debug.terminals":
+                return self.v2Response(
+                    id: id,
+                    ok: true,
+                    result: [
+                        "count": 2,
+                        "terminals": [
+                            [
+                                "workspace_id": workspaceId,
+                                "surface_id": callerSurface,
+                                "tty": callerTTY
+                            ],
+                            [
+                                "workspace_id": workspaceId,
+                                "surface_id": staleSurface,
+                                "tty": "/dev/ttys778"
+                            ]
+                        ]
+                    ]
+                )
+            case "agent.attach":
+                guard (params["workspace_id"] as? String) == workspaceId,
+                      (params["surface_id"] as? String) == callerSurface else {
+                    return self.v2Response(
+                        id: id,
+                        ok: false,
+                        error: ["code": "unexpected", "message": "agent.attach did not recover caller tty surface"]
+                    )
+                }
+                return self.v2Response(
+                    id: id,
+                    ok: true,
+                    result: [
+                        "session_id": "ag_2",
+                        "workspace_id": workspaceId,
+                        "surface_id": callerSurface
+                    ]
+                )
+            default:
+                return self.v2Response(
+                    id: id,
+                    ok: false,
+                    error: ["code": "unexpected", "message": "Unexpected method \(method)"]
+                )
+            }
+        }
+
+        var environment = ProcessInfo.processInfo.environment
+        environment["CMUX_SOCKET_PATH"] = socketPath
+        environment["CMUX_TAB_ID"] = workspaceId
+        environment["CMUX_PANEL_ID"] = staleSurface
+        environment["CMUX_WORKSPACE_ID"] = staleWorkspace
+        environment["CMUX_SURFACE_ID"] = staleSurface
+        environment["CMUX_CLI_TTY_NAME"] = callerTTY
+        environment["CMUX_CLI_SENTRY_DISABLED"] = "1"
+        environment["CMUX_CLAUDE_HOOK_SENTRY_DISABLED"] = "1"
+
+        let result = runProcess(
+            executablePath: cliPath,
+            arguments: ["agent", "attach"],
+            environment: environment,
+            timeout: 5
+        )
+
+        wait(for: [serverHandled], timeout: 5)
+        XCTAssertFalse(result.timedOut, result.stderr)
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertTrue(result.stdout.contains("session=ag_2"), result.stdout)
+        XCTAssertTrue(result.stderr.isEmpty, result.stderr)
+        XCTAssertTrue(
+            state.commands.contains { command in
+                guard let data = command.data(using: .utf8),
+                      let payload = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                      let method = payload["method"] as? String,
+                      method == "agent.attach" else {
+                    return false
+                }
+                let params = payload["params"] as? [String: Any] ?? [:]
+                return (params["workspace_id"] as? String) == workspaceId
+                    && (params["surface_id"] as? String) == callerSurface
+            },
+            "Expected agent.attach to recover caller tty surface, saw \(state.commands)"
+        )
+        XCTAssertFalse(
+            state.commands.contains { command in
+                guard let data = command.data(using: .utf8),
+                      let payload = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+                      let method = payload["method"] as? String,
+                      method == "agent.attach" else {
+                    return false
+                }
+                let params = payload["params"] as? [String: Any] ?? [:]
+                return (params["workspace_id"] as? String) == workspaceId
+                    && (params["surface_id"] as? String) == staleSurface
+            },
+            "Stale panel env should not win for agent.attach, saw \(state.commands)"
         )
     }
 }

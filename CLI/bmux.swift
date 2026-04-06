@@ -3195,6 +3195,130 @@ struct CMUXCLI {
         throw CLIError(message: "Surface index not found")
     }
 
+    private func agentCallerWorkspaceArgument(
+        explicitWorkspaceArg: String?,
+        sessionId: String?,
+        windowOverride: String?
+    ) -> (workspaceArg: String?, isExplicit: Bool) {
+        let callerWorkspaceArg = sessionId == nil && windowOverride == nil
+            ? (ProcessInfo.processInfo.environment["CMUX_TAB_ID"]
+                ?? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"])
+            : nil
+        return (explicitWorkspaceArg ?? callerWorkspaceArg, explicitWorkspaceArg != nil)
+    }
+
+    private func agentCallerSurfaceArgument(
+        explicitSurfaceArg: String?,
+        explicitPaneArg: String?,
+        explicitWorkspaceArg: String?,
+        sessionId: String?,
+        windowOverride: String?
+    ) -> (surfaceArg: String?, isExplicit: Bool) {
+        let callerSurfaceArg = sessionId == nil &&
+            explicitSurfaceArg == nil &&
+            explicitPaneArg == nil &&
+            explicitWorkspaceArg == nil &&
+            windowOverride == nil
+            ? (ProcessInfo.processInfo.environment["CMUX_PANEL_ID"]
+                ?? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"])
+            : nil
+        return (explicitSurfaceArg ?? callerSurfaceArg, explicitSurfaceArg != nil)
+    }
+
+    private func resolvedAgentRoutingParams(
+        client: SocketClient,
+        sessionId: String?,
+        workspaceOpt: String?,
+        surfaceOpt: String?,
+        paneOpt: String?,
+        windowOpt: String?
+    ) throws -> [String: Any] {
+        var params: [String: Any] = [:]
+        if let sessionId {
+            params["session_id"] = sessionId
+        }
+
+        let resolvedWindowId = try normalizeWindowHandle(windowOpt, client: client)
+        if let resolvedWindowId {
+            params["window_id"] = resolvedWindowId
+        }
+
+        let windowOverride = resolvedWindowId ?? windowOpt
+        let workspaceSelection = agentCallerWorkspaceArgument(
+            explicitWorkspaceArg: workspaceOpt,
+            sessionId: sessionId,
+            windowOverride: windowOverride
+        )
+        let resolvedWorkspaceId: String? = try {
+            guard let workspaceArg = workspaceSelection.workspaceArg else {
+                return nil
+            }
+            if workspaceSelection.isExplicit {
+                return try normalizeWorkspaceHandle(
+                    workspaceArg,
+                    client: client,
+                    windowHandle: resolvedWindowId
+                )
+            }
+            return try resolveWorkspaceIdAllowingFallback(workspaceArg, client: client)
+        }()
+        if let resolvedWorkspaceId {
+            params["workspace_id"] = resolvedWorkspaceId
+        }
+
+        if let paneOpt,
+           let paneId = try normalizePaneHandle(
+                paneOpt,
+                client: client,
+                workspaceHandle: resolvedWorkspaceId
+           ) {
+            params["pane_id"] = paneId
+        }
+
+        let surfaceSelection = agentCallerSurfaceArgument(
+            explicitSurfaceArg: surfaceOpt,
+            explicitPaneArg: paneOpt,
+            explicitWorkspaceArg: workspaceOpt,
+            sessionId: sessionId,
+            windowOverride: windowOverride
+        )
+        let resolvedSurfaceId: String? = try {
+            guard paneOpt == nil else {
+                if surfaceSelection.isExplicit {
+                    return try normalizeSurfaceHandle(
+                        surfaceSelection.surfaceArg,
+                        client: client,
+                        workspaceHandle: resolvedWorkspaceId
+                    )
+                }
+                return nil
+            }
+            if surfaceSelection.isExplicit {
+                return try normalizeSurfaceHandle(
+                    surfaceSelection.surfaceArg,
+                    client: client,
+                    workspaceHandle: resolvedWorkspaceId
+                )
+            }
+            guard sessionId == nil else {
+                return nil
+            }
+            if let resolvedWorkspaceId {
+                return try resolveSurfaceIdAllowingFallback(
+                    surfaceSelection.surfaceArg,
+                    workspaceId: resolvedWorkspaceId,
+                    client: client
+                )
+            }
+            return try normalizeSurfaceHandle(surfaceSelection.surfaceArg, client: client)
+        }()
+        if let resolvedSurfaceId {
+            params["surface_id"] = resolvedSurfaceId
+        }
+
+        return params
+    }
+
     private func canonicalSurfaceHandleFromTabInput(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let pieces = trimmed.split(separator: ":", omittingEmptySubsequences: false)
@@ -5307,19 +5431,14 @@ struct CMUXCLI {
                 throw CLIError(message: "agent attach: unknown flag '\(unknown)'")
             }
 
-            var params: [String: Any] = [:]
-            if let workspaceOpt,
-               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
-                params["workspace_id"] = workspaceId
-            }
-            if let surfaceOpt,
-               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
-                params["surface_id"] = surfaceId
-            }
-            if let windowOpt,
-               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
-                params["window_id"] = windowId
-            }
+            let params = try resolvedAgentRoutingParams(
+                client: client,
+                sessionId: nil,
+                workspaceOpt: workspaceOpt,
+                surfaceOpt: surfaceOpt,
+                paneOpt: nil,
+                windowOpt: windowOpt
+            )
 
             let payload = try client.sendV2(method: "agent.attach", params: params)
             let sessionId = (payload["session_id"] as? String) ?? "unknown"
@@ -5356,22 +5475,18 @@ struct CMUXCLI {
             output(payload, fallback: "OK session=\(sessionId) workspace=\(workspaceText) layout_rev=\(layoutRev)")
 
         case "capabilities":
-            var params: [String: Any] = [:]
-            if let sessionId = optionValue(subArgs, name: "--session") ?? optionValue(subArgs, name: "--session-id") {
-                params["session_id"] = sessionId
-            }
-            if let workspaceOpt = optionValue(subArgs, name: "--workspace"),
-               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
-                params["workspace_id"] = workspaceId
-            }
-            if let surfaceOpt = optionValue(subArgs, name: "--surface"),
-               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
-                params["surface_id"] = surfaceId
-            }
-            if let windowOpt = optionValue(subArgs, name: "--window"),
-               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
-                params["window_id"] = windowId
-            }
+            let sessionId = optionValue(subArgs, name: "--session") ?? optionValue(subArgs, name: "--session-id")
+            let workspaceOpt = optionValue(subArgs, name: "--workspace")
+            let surfaceOpt = optionValue(subArgs, name: "--surface")
+            let windowOpt = optionValue(subArgs, name: "--window")
+            let params = try resolvedAgentRoutingParams(
+                client: client,
+                sessionId: sessionId,
+                workspaceOpt: workspaceOpt,
+                surfaceOpt: surfaceOpt,
+                paneOpt: nil,
+                windowOpt: windowOpt
+            )
 
             let payload = try client.sendV2(method: "agent.capabilities", params: params)
             let backendKind = (payload["backend_kind"] as? String) ?? "unknown"
@@ -5407,27 +5522,15 @@ struct CMUXCLI {
                 throw CLIError(message: "agent open: unknown flag '\(unknown)'")
             }
             let positionalArgs = remaining.filter { !$0.hasPrefix("--") }
-            var params: [String: Any] = ["kind": kind]
-            if let sessionId {
-                params["session_id"] = sessionId
-            }
-
-            if let workspaceOpt,
-               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
-                params["workspace_id"] = workspaceId
-            }
-            if let surfaceOpt,
-               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
-                params["surface_id"] = surfaceId
-            }
-            if let paneOpt,
-               let paneId = try normalizePaneHandle(paneOpt, client: client) {
-                params["pane_id"] = paneId
-            }
-            if let windowOpt,
-               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
-                params["window_id"] = windowId
-            }
+            var params = try resolvedAgentRoutingParams(
+                client: client,
+                sessionId: sessionId,
+                workspaceOpt: workspaceOpt,
+                surfaceOpt: surfaceOpt,
+                paneOpt: paneOpt,
+                windowOpt: windowOpt
+            )
+            params["kind"] = kind
             if let split = splitOptA ?? splitOptB {
                 params["split"] = split
             }
@@ -5514,26 +5617,15 @@ struct CMUXCLI {
                 throw CLIError(message: "agent ensure: unknown flag '\(unknown)'")
             }
 
-            var params: [String: Any] = ["target": target]
-            if let sessionId {
-                params["session_id"] = sessionId
-            }
-            if let workspaceOpt,
-               let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
-                params["workspace_id"] = workspaceId
-            }
-            if let surfaceOpt,
-               let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
-                params["surface_id"] = surfaceId
-            }
-            if let paneOpt,
-               let paneId = try normalizePaneHandle(paneOpt, client: client) {
-                params["pane_id"] = paneId
-            }
-            if let windowOpt,
-               let windowId = try normalizeWindowHandle(windowOpt, client: client) {
-                params["window_id"] = windowId
-            }
+            var params = try resolvedAgentRoutingParams(
+                client: client,
+                sessionId: sessionId,
+                workspaceOpt: workspaceOpt,
+                surfaceOpt: surfaceOpt,
+                paneOpt: paneOpt,
+                windowOpt: windowOpt
+            )
+            params["target"] = target
             if let split = splitOptA ?? splitOptB {
                 params["split"] = split
             }
@@ -5947,22 +6039,15 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task run requires --cmd <command> or positional command")
                 }
 
-                var params: [String: Any] = ["command": command]
-                if let sessionId {
-                    params["session_id"] = sessionId
-                }
-                if let workspaceOpt,
-                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
-                    params["workspace_id"] = workspaceId
-                }
-                if let surfaceOpt,
-                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
-                    params["surface_id"] = surfaceId
-                }
-                if let windowOpt,
-                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
-                    params["window_id"] = windowId
-                }
+                var params = try resolvedAgentRoutingParams(
+                    client: client,
+                    sessionId: sessionId,
+                    workspaceOpt: workspaceOpt,
+                    surfaceOpt: surfaceOpt,
+                    paneOpt: nil,
+                    windowOpt: windowOpt
+                )
+                params["command"] = command
                 if let labelOpt { params["label"] = labelOpt }
                 if let splitOpt { params["split"] = splitOpt }
                 if let cwdOpt { params["cwd"] = resolvePath(cwdOpt) }
@@ -6015,15 +6100,20 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task run-many requires --jobs <payload>, --jobs-file <path>, or a positional JSON payload")
                 }
 
-                let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client)
-                let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client)
-                let windowId = try normalizeWindowHandle(windowOpt, client: client)
+                let routingParams = try resolvedAgentRoutingParams(
+                    client: client,
+                    sessionId: sessionId,
+                    workspaceOpt: workspaceOpt,
+                    surfaceOpt: surfaceOpt,
+                    paneOpt: nil,
+                    windowOpt: windowOpt
+                )
                 let params = try agentRunManyParams(
                     from: runManyObject,
                     sessionId: sessionId,
-                    workspaceId: workspaceId,
-                    surfaceId: surfaceId,
-                    windowId: windowId
+                    workspaceId: routingParams["workspace_id"] as? String,
+                    surfaceId: routingParams["surface_id"] as? String,
+                    windowId: routingParams["window_id"] as? String
                 )
                 var runManyParams = params
                 if let pauseForUserOpt {
@@ -6062,22 +6152,15 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task run-profile: unknown flag '\(unknown)'")
                 }
 
-                var params: [String: Any] = ["profile": profile]
-                if let sessionId {
-                    params["session_id"] = sessionId
-                }
-                if let workspaceOpt,
-                   let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
-                    params["workspace_id"] = workspaceId
-                }
-                if let surfaceOpt,
-                   let surfaceId = try normalizeSurfaceHandle(surfaceOpt, client: client) {
-                    params["surface_id"] = surfaceId
-                }
-                if let windowOpt,
-                   let windowId = try normalizeWindowHandle(windowOpt, client: client) {
-                    params["window_id"] = windowId
-                }
+                var params = try resolvedAgentRoutingParams(
+                    client: client,
+                    sessionId: sessionId,
+                    workspaceOpt: workspaceOpt,
+                    surfaceOpt: surfaceOpt,
+                    paneOpt: nil,
+                    windowOpt: windowOpt
+                )
+                params["profile"] = profile
                 if let pauseForUserOpt {
                     guard let pauseForUser = parseBoolString(pauseForUserOpt) else {
                         throw CLIError(message: "agent task run-profile: --pause-for-user must be true|false")
@@ -9646,15 +9729,15 @@ struct CMUXCLI {
               code module --session <session-id> [--cwd <path>] [--symbol <name>] [--path <path>] [--line <n>] [--limit <n>] [--timeout-ms <ms>]
 
             Notes:
-              - `attach` creates a lightweight bmux agent session and returns focused context.
+              - `attach` creates a lightweight bmux agent session and returns focused context. When no target flags are passed, it prefers the caller workspace and surface from the current bmux terminal context.
               - `layout` returns a compact split tree for the selected workspace.
-              - `capabilities` returns backend, environment, and preference metadata.
+              - `capabilities` returns backend, environment, and preference metadata. Read it when you need discovery, not before every single task.
               - `open` opens a compact agent-managed terminal/browser/markdown surface. When `--session` is omitted, bmux auto-attaches to the current focus first.
               - `ensure` reuses existing surfaces/services when possible and only creates new ones when needed. When `--session` is omitted, bmux auto-attaches to the current focus first.
               - `batch` runs compact multi-step plans in one round-trip.
               - `surface-read` returns a compact metadata snapshot for the target surface.
               - `terminal` wraps low-token terminal input/capture/wait primitives.
-              - `task` runs managed shell commands or named profiles in bmux terminals and returns compact status. `task run|run-many|run-profile` can omit `--session` to auto-attach current focus, and `task wait|result|logs|cancel` can resolve the session from `--job` when needed.
+              - `task` runs managed shell commands or named profiles in bmux terminals and returns compact status. For a single managed command, prefer `task run` directly instead of `attach -> ensure -> task run`. `task run|run-many|run-profile` can omit `--session` to auto-attach current focus, and `task wait|result|logs|cancel` can resolve the session from `--job` when needed.
               - `task ... --pause-for-user true` starts noisy work but returns a compact wait-for-user contract instead of encouraging immediate log ingestion.
               - `events` streams cursor-based task and service events.
               - `state summary` returns the minimal server-side memory Codex needs to resume work cheaply.
@@ -12051,8 +12134,10 @@ struct CMUXCLI {
         }
         if let focusedContext {
             setenv("CMUX_WORKSPACE_ID", focusedContext.workspaceId, 1)
+            setenv("CMUX_TAB_ID", focusedContext.workspaceId, 1)
             if let surfaceId = focusedContext.surfaceId, !surfaceId.isEmpty {
                 setenv("CMUX_SURFACE_ID", surfaceId, 1)
+                setenv("CMUX_PANEL_ID", surfaceId, 1)
             }
         }
     }

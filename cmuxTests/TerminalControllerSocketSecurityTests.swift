@@ -2,7 +2,11 @@ import XCTest
 import AppKit
 import Darwin
 
-#if canImport(cmux_DEV)
+#if canImport(bmux_DEV)
+@testable import bmux_DEV
+#elseif canImport(bmux)
+@testable import bmux
+#elseif canImport(cmux_DEV)
 @testable import cmux_DEV
 #elseif canImport(cmux)
 @testable import cmux
@@ -45,7 +49,7 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         TerminalController.shared.start(
             tabManager: tabManager,
             socketPath: restrictedPath,
-            accessMode: .cmuxOnly
+            accessMode: .bmuxOnly
         )
         try waitForSocket(at: restrictedPath)
         XCTAssertEqual(try socketMode(at: restrictedPath), 0o600)
@@ -453,6 +457,18 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
             taskExecutionGuidance.contains {
                 $0.localizedCaseInsensitiveContains("xcodebuild")
                     && $0.localizedCaseInsensitiveContains("repo wrappers")
+            }
+        )
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("single managed command")
+                    && $0.localizedCaseInsensitiveContains("agent.task.run directly")
+            }
+        )
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("Only call agent.layout")
+                    && $0.localizedCaseInsensitiveContains("topology")
             }
         )
 

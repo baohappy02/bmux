@@ -1,6 +1,10 @@
 import XCTest
 
-#if canImport(cmux_DEV)
+#if canImport(bmux_DEV)
+@testable import bmux_DEV
+#elseif canImport(bmux)
+@testable import bmux
+#elseif canImport(cmux_DEV)
 @testable import cmux_DEV
 #elseif canImport(cmux)
 @testable import cmux
@@ -241,7 +245,7 @@ final class SocketControlPasswordStoreTests: XCTestCase {
     }
 }
 
-final class CmuxCLIPathInstallerTests: XCTestCase {
+final class BmuxCLIPathInstallerTests: XCTestCase {
     func testInstallAndUninstallRoundTripWithoutAdministratorPrivileges() throws {
         let fileManager = FileManager.default
         let root = fileManager.temporaryDirectory
@@ -261,7 +265,7 @@ final class CmuxCLIPathInstallerTests: XCTestCase {
 
         var privilegedInstallCallCount = 0
         var privilegedUninstallCallCount = 0
-        let installer = CmuxCLIPathInstaller(
+        let installer = BmuxCLIPathInstaller(
             fileManager: fileManager,
             destinationURL: destinationURL,
             bundledCLIURLProvider: { bundledCLIURL },
@@ -311,7 +315,7 @@ final class CmuxCLIPathInstallerTests: XCTestCase {
         }
 
         var privilegedInstallCallCount = 0
-        let installer = CmuxCLIPathInstaller(
+        let installer = BmuxCLIPathInstaller(
             fileManager: fileManager,
             destinationURL: destinationURL,
             bundledCLIURLProvider: { bundledCLIURL },
