@@ -737,6 +737,24 @@ class TerminalController {
             outsideAllowsFocus: Self.socketCommandAllowsInAppFocusMutations()
         )
     }
+
+    static func debugWrappedAgentTaskCommand(taskId: String, command: String) -> String {
+        Self.shared.v2AgentWrappedTaskCommand(taskId: taskId, command: command)
+    }
+
+    static func debugSelectReusableTerminalSurfaceId(
+        explicitSurfaceId: UUID?,
+        candidateSurfaceIds: [UUID],
+        terminalSurfaceIds: Set<UUID>,
+        excludedSurfaceIds: Set<UUID>
+    ) -> UUID? {
+        v2AgentSelectReusableTerminalSurfaceId(
+            explicitSurfaceId: explicitSurfaceId,
+            candidateSurfaceIds: candidateSurfaceIds,
+            terminalSurfaceIds: terminalSurfaceIds,
+            excludedSurfaceIds: excludedSurfaceIds
+        )
+    }
 #endif
 
     nonisolated static func shouldReplaceStatusEntry(
@@ -3557,6 +3575,7 @@ class TerminalController {
         dlog("agent.capabilities.after_environment repo=\((environment["repo_root"] as? String) ?? "nil") cwd=\((environment["cwd"] as? String) ?? "nil")")
 #endif
         let preferences = v2AgentUserPreferences(inferredPackageManager: packageManager)
+        let runtimeHelpers = v2AgentRuntimeHelpersSnapshot()
 
 #if DEBUG
         dlog("agent.capabilities cwd=\(workingDirectory ?? "nil") repo=\((environment["repo_root"] as? String) ?? "nil")")
@@ -3598,8 +3617,33 @@ class TerminalController {
             "environment": environment,
             "event_cursor": v2AgentCurrentEventCursor(),
             "preferences": preferences,
+            "runtime_helpers": runtimeHelpers.payload,
+            "runtime_helper_warnings": runtimeHelpers.warnings,
+            "runtime_helper_drift_detected": runtimeHelpers.driftDetected,
+            "task_execution_guidance": [
+                "Prefer agent.task.run or agent.task.run_profile for build, test, verify, typecheck, install, migration, benchmark, and dev-server commands.",
+                "Use agent.task.result as the default success channel. Only read agent.task.logs on failure, timeout, or explicit user request.",
+                "When a command is noisy and the user may want to inspect the terminal, launch it with pause_for_user=true and stop until the user follows up."
+            ],
             "policy": [
                 "default_execution_class": "local_verify",
+                "managed_task_defaults": [
+                    "prefer_managed_tasks_for": [
+                        "build",
+                        "test",
+                        "verify",
+                        "typecheck",
+                        "install",
+                        "migration",
+                        "benchmark",
+                        "dev_server"
+                    ],
+                    "prefer_profiles_when_available": true,
+                    "success_channel": "agent.task.result",
+                    "logs_on_success": "avoid",
+                    "logs_on_failure": "on_demand",
+                    "pause_for_user_for_noisy_commands": true
+                ],
                 "network_research_requires_pricing_check": true,
                 "block_paid_or_billing_gated_work_without_approval": true,
                 "block_unknown_pricing_before_deeper_research": true,
@@ -3611,6 +3655,10 @@ class TerminalController {
                         "agent.open split",
                         "agent.task.run split"
                     ]
+                ],
+                "user_gated_noisy_commands": [
+                    "next_action": "wait_for_user",
+                    "automatic_log_ingest": false
                 ]
             ]
         ])
@@ -4577,7 +4625,11 @@ class TerminalController {
                 placement = "surface"
                 splitApplied = false
                 visibilityGuardPayload = nil
-            } else if let reusedSurfaceId = v2AgentReusableTerminalSurfaceId(params: params, context: baseContext),
+            } else if let reusedSurfaceId = v2AgentReusableTerminalSurfaceId(
+                params: params,
+                context: baseContext,
+                excludedSurfaceIds: session.surfaceId.map { [$0] } ?? []
+            ),
                       let reusedPanel = baseContext.workspace.terminalPanel(for: reusedSurfaceId) {
                 terminalPanel = reusedPanel
                 terminalContext = AgentWorkspaceContext(
@@ -5570,6 +5622,7 @@ class TerminalController {
         let workingDirectory = v2AgentWorkspaceDirectory(context: context)
         let packageManager = v2AgentInferredPackageManager(startingAt: workingDirectory)
         let preferences = v2AgentUserPreferences(inferredPackageManager: packageManager)
+        let runtimeHelpers = v2AgentRuntimeHelpersSnapshot()
         let mainSnapshot = v2MainSync {
             (
                 activeDevServer: v2AgentActiveDevServer(sessionId: sessionId, workspace: context.workspace),
@@ -5593,6 +5646,9 @@ class TerminalController {
             "last_failed_job": v2OrNull(lastFailedJob),
             "workspace_fingerprint": v2AgentWorkspaceFingerprint(context: context, inferredPackageManager: packageManager),
             "user_preferences": preferences,
+            "runtime_helpers": runtimeHelpers.payload,
+            "runtime_helper_warnings": runtimeHelpers.warnings,
+            "runtime_helper_drift_detected": runtimeHelpers.driftDetected,
             "recovered": effectiveSession.recoveredAt != nil,
             "recovered_at": v2OrNull(v2AgentISO8601String(effectiveSession.recoveredAt)),
             "recovery_count": effectiveSession.recoveryCount,
@@ -6426,35 +6482,40 @@ class TerminalController {
     }
 
     private func v2AgentBmuxIndexExecutablePath() -> String? {
-        let fileManager = FileManager.default
-        if let explicit = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"],
-           !explicit.isEmpty,
-           fileManager.isExecutableFile(atPath: explicit) {
-            return explicit
-        }
+        TabManager.bmuxIndexRuntimeHelperInfo().resolvedPath
+    }
 
-        if let resourcePath = Bundle.main.resourceURL?
-            .appendingPathComponent("bin", isDirectory: true)
-            .appendingPathComponent("bmux-index")
-            .path,
-           fileManager.isExecutableFile(atPath: resourcePath) {
-            return resourcePath
-        }
-
-        let sourceRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let toolsRoot = sourceRoot.deletingLastPathComponent()
-        let candidates = [
-            toolsRoot.appendingPathComponent("bmux-index/.build/debug/bmux-index").path,
-            toolsRoot.appendingPathComponent("bmux-index/.build/release/bmux-index").path,
-            fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/bmux-index").path
+    private func v2AgentRuntimeHelpersSnapshot() -> (payload: [String: Any], warnings: [String], driftDetected: Bool) {
+        let helpers: [(String, TabManager.RuntimeHelperInfo)] = [
+            ("bmux_index", TabManager.bmuxIndexRuntimeHelperInfo()),
+            ("bmux_deps", TabManager.bmuxDepsRuntimeHelperInfo()),
         ]
-        if let existing = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
-            return existing
+        let payload = Dictionary(uniqueKeysWithValues: helpers.map { key, info in
+            (key, v2AgentRuntimeHelperPayload(info))
+        })
+        let warnings = helpers.compactMap { _, info in
+            info.warning.map { "\(info.name): \($0)" }
         }
+        let driftDetected = helpers.contains { _, info in
+            info.pathMismatch || info.newerExternalCandidateAvailable
+        }
+        return (payload, warnings, driftDetected)
+    }
 
-        return v2AgentResolvedCommandPath("bmux-index")
+    private func v2AgentRuntimeHelperPayload(_ info: TabManager.RuntimeHelperInfo) -> [String: Any] {
+        [
+            "name": info.name,
+            "role": info.role,
+            "resolved_path": v2OrNull(info.resolvedPath),
+            "selected_source": info.selectedSource,
+            "bundled_path": v2OrNull(info.bundledPath),
+            "bundled_available": info.bundledAvailable,
+            "path_mismatch": info.pathMismatch,
+            "external_candidate_path": v2OrNull(info.externalCandidatePath),
+            "external_candidate_source": v2OrNull(info.externalCandidateSource),
+            "newer_external_candidate_available": info.newerExternalCandidateAvailable,
+            "warning": v2OrNull(info.warning)
+        ]
     }
 
     private func v2AgentSearchStatusPayloadFromBmuxIndex(
@@ -7234,7 +7295,10 @@ class TerminalController {
             "native_pointer": false,
             "file_upload": false,
             "network_mocking": false,
-            "cross_origin_frames": false
+            "cross_origin_frames": false,
+            "managed_task_execution": true,
+            "compact_task_results": true,
+            "pause_for_user_contract": true
         ]
     }
 
@@ -8481,6 +8545,22 @@ class TerminalController {
         v2String(params, "split") == nil && v2String(params, "direction") == nil
     }
 
+    private static func v2AgentSelectReusableTerminalSurfaceId(
+        explicitSurfaceId: UUID?,
+        candidateSurfaceIds: [UUID],
+        terminalSurfaceIds: Set<UUID>,
+        excludedSurfaceIds: Set<UUID>
+    ) -> UUID? {
+        if let explicitSurfaceId,
+           terminalSurfaceIds.contains(explicitSurfaceId) {
+            return explicitSurfaceId
+        }
+
+        return candidateSurfaceIds.first(where: { panelId in
+            terminalSurfaceIds.contains(panelId) && !excludedSurfaceIds.contains(panelId)
+        })
+    }
+
     private func v2AgentPanePanelIds(
         paneUUID: UUID?,
         workspace: Workspace
@@ -8504,7 +8584,8 @@ class TerminalController {
 
     private func v2AgentReusableTerminalSurfaceId(
         params: [String: Any],
-        context: AgentWorkspaceContext
+        context: AgentWorkspaceContext,
+        excludedSurfaceIds: Set<UUID> = []
     ) -> UUID? {
         guard v2AgentShouldReuseExistingSurface(params: params) else { return nil }
 
@@ -8515,8 +8596,15 @@ class TerminalController {
         }
 
         let candidatePaneUUID = v2UUID(params, "pane_id") ?? context.paneId
-        return v2AgentPanePanelIds(paneUUID: candidatePaneUUID, workspace: workspace)
-            .first(where: { workspace.terminalPanel(for: $0) != nil })
+        let candidateSurfaceIds = v2AgentPanePanelIds(paneUUID: candidatePaneUUID, workspace: workspace)
+        let terminalSurfaceIds = Set(candidateSurfaceIds.filter { workspace.terminalPanel(for: $0) != nil })
+
+        return Self.v2AgentSelectReusableTerminalSurfaceId(
+            explicitSurfaceId: nil,
+            candidateSurfaceIds: candidateSurfaceIds,
+            terminalSurfaceIds: terminalSurfaceIds,
+            excludedSurfaceIds: excludedSurfaceIds
+        )
     }
 
     private func v2AgentBrowserMatchesURL(
@@ -9730,9 +9818,11 @@ class TerminalController {
     }
 
     private func v2AgentWrappedTaskCommand(taskId: String, command: String) -> String {
-        return """
-        \(command); __bmux_exit=$?; if [ -n "$CMUX_SOCKET_PATH" ] && [ -n "$CMUX_TAB_ID" ] && [ -n "$CMUX_PANEL_ID" ]; then __bmux_payload="report_task_result \(taskId) $__bmux_exit --tab=$CMUX_TAB_ID --panel=$CMUX_PANEL_ID"; if command -v _bmux_send_bg >/dev/null 2>&1; then _bmux_send_bg "$__bmux_payload"; elif command -v nc >/dev/null 2>&1; then if printf '%s\\n' "$__bmux_payload" | nc -N -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1; then :; else printf '%s\\n' "$__bmux_payload" | nc -w 1 -U "$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; fi; elif command -v ncat >/dev/null 2>&1; then printf '%s\\n' "$__bmux_payload" | ncat -w 1 -U "$CMUX_SOCKET_PATH" --send-only >/dev/null 2>&1 || true; elif command -v socat >/dev/null 2>&1; then printf '%s\\n' "$__bmux_payload" | socat -T 1 - "UNIX-CONNECT:$CMUX_SOCKET_PATH" >/dev/null 2>&1 || true; fi; fi; ( exit $__bmux_exit )
-        """
+        // The shell integrations already detect this prefix in preexec and report
+        // the foreground command's exit code on the next prompt. Keeping the
+        // injected line to a single prefixed command avoids echoing an internal
+        // wrapper script into visible managed terminals.
+        "BMUX_AGENT_TASK_ID=\(taskId) \(command)"
     }
 
     private func v2AgentEffectiveSearchState(repoRoot: String) -> AgentSearchIndexState {

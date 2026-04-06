@@ -69890,6 +69890,57 @@
         }
       }
     },
+    "sidebar.terminals.activity.detail": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Running: %1$@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "実行中: %1$@"
+          }
+        }
+      }
+    },
+    "sidebar.terminals.activity.single": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Terminal running: %1$@"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "実行中のターミナル: %1$@"
+          }
+        }
+      }
+    },
+    "sidebar.terminals.activity.summary": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld terminals running"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%1$lld 個のターミナルを実行中"
+          }
+        }
+      }
+    },
     "sidebar.pathMenu.macintoshHD": {
       "extractionState": "manual",
       "localizations": {

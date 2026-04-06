@@ -568,6 +568,89 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         )
     }
 
+    func testResolvedBmuxIndexPathPrefersOverrideThenBundledBinary() throws {
+        let fileManager = FileManager.default
+        let tempDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-index-path-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempDir) }
+
+        let overrideURL = tempDir.appendingPathComponent("override-bmux-index")
+        let bundledURL = tempDir.appendingPathComponent("bundled-bmux-index")
+        try "#!/bin/sh\nexit 0\n".write(to: overrideURL, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nexit 0\n".write(to: bundledURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: overrideURL.path)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bundledURL.path)
+
+        XCTAssertEqual(
+            TabManager.resolvedBmuxIndexPathForTesting(
+                override: overrideURL.path,
+                environment: ["PATH": "/usr/bin:/bin"],
+                bundledPath: bundledURL.path,
+                fallbackDirectories: []
+            ),
+            overrideURL.path
+        )
+
+        XCTAssertEqual(
+            TabManager.resolvedBmuxIndexPathForTesting(
+                override: nil,
+                environment: ["PATH": "/usr/bin:/bin"],
+                bundledPath: bundledURL.path,
+                fallbackDirectories: []
+            ),
+            bundledURL.path
+        )
+    }
+
+    func testRuntimeHelperInfoDetectsNewerExternalCandidateThanBundledRuntime() throws {
+        let fileManager = FileManager.default
+        let tempDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-helper-diagnostic-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempDir) }
+
+        let bundledURL = tempDir.appendingPathComponent("bundled-fixture")
+        let localURL = tempDir.appendingPathComponent("local-fixture")
+        try "#!/bin/sh\nexit 0\n".write(to: bundledURL, atomically: true, encoding: .utf8)
+        try "#!/bin/sh\nexit 0\n".write(to: localURL, atomically: true, encoding: .utf8)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bundledURL.path)
+        try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: localURL.path)
+        try fileManager.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)],
+            ofItemAtPath: bundledURL.path
+        )
+        try fileManager.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_800_000_000)],
+            ofItemAtPath: localURL.path
+        )
+
+        let info = TabManager.runtimeHelperInfoForTesting(
+            name: "fixture-helper",
+            role: "diagnostic",
+            executable: "fixture-helper",
+            override: nil,
+            bundledPath: bundledURL.path,
+            preferredCandidates: [
+                TabManager.RuntimeHelperCandidate(path: localURL.path, source: "local_build_debug")
+            ],
+            environment: ["PATH": "/usr/bin:/bin"],
+            fallbackDirectories: []
+        )
+
+        XCTAssertEqual(info.resolvedPath, bundledURL.path)
+        XCTAssertEqual(info.selectedSource, "bundled")
+        XCTAssertEqual(info.externalCandidatePath, localURL.path)
+        XCTAssertEqual(info.externalCandidateSource, "local_build_debug")
+        XCTAssertFalse(info.pathMismatch)
+        XCTAssertTrue(info.newerExternalCandidateAvailable)
+        XCTAssertEqual(info.warning, "newer external candidate available than bundled runtime")
+    }
+
     func testAddWorkspaceWithExplicitWorkingDirectorySchedulesDependencyBootstrap() throws {
         let fileManager = FileManager.default
         let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
@@ -604,6 +687,166 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         _ = manager.addWorkspace(select: false, eagerLoadTerminal: false)
 
         wait(for: [idleExpectation], timeout: 0.3)
+    }
+
+    func testAddWorkspaceWithRepositoryWorkingDirectorySchedulesBmuxIndexWarmForRepoRoot() throws {
+        let fileManager = FileManager.default
+        let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-index-warm-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let nestedURL = repoURL.appendingPathComponent("Sources", isDirectory: true)
+        try fileManager.createDirectory(at: nestedURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(
+            at: repoURL.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? fileManager.removeItem(at: repoURL) }
+
+        let warmExpectation = expectation(description: "bmux-index warm invoked")
+        var capturedRepoRoots: [String] = []
+        let manager = TabManager(
+            dependencyBootstrapRunner: { _ in },
+            bmuxIndexWarmRunner: { repoRoot in
+                capturedRepoRoots.append(repoRoot)
+                warmExpectation.fulfill()
+            }
+        )
+
+        _ = manager.addWorkspace(
+            workingDirectory: nestedURL.path,
+            select: false,
+            eagerLoadTerminal: false
+        )
+
+        wait(for: [warmExpectation], timeout: 1.0)
+        XCTAssertEqual(capturedRepoRoots, [repoURL.standardizedFileURL.path])
+    }
+
+    func testUpdateSurfaceDirectoryOutsideRepositoryDoesNotScheduleBmuxIndexWarm() throws {
+        let fileManager = FileManager.default
+        let directoryURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-index-nonrepo-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directoryURL) }
+
+        let idleExpectation = expectation(description: "bmux-index warm should stay idle")
+        idleExpectation.isInverted = true
+        let manager = TabManager(
+            dependencyBootstrapRunner: { _ in },
+            bmuxIndexWarmRunner: { _ in
+                idleExpectation.fulfill()
+            }
+        )
+
+        guard let workspace = manager.selectedWorkspace,
+              let panelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with focused panel")
+            return
+        }
+
+        manager.updateSurfaceDirectory(
+            tabId: workspace.id,
+            surfaceId: panelId,
+            directory: directoryURL.path
+        )
+
+        wait(for: [idleExpectation], timeout: 0.3)
+    }
+
+    func testRunningChildTerminalsPublishSidebarStatusSummaryAndDetail() {
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace,
+              let leftPanelId = workspace.focusedPanelId,
+              let rightPanel = workspace.newTerminalSplit(
+                  from: leftPanelId,
+                  orientation: .horizontal,
+                  focus: false
+              ) else {
+            XCTFail("Expected selected workspace with two terminal panels")
+            return
+        }
+
+        _ = workspace.updatePanelTitle(panelId: leftPanelId, title: "Build")
+        _ = workspace.updatePanelTitle(panelId: rightPanel.id, title: "Tests")
+
+        manager.updateSurfaceShellActivity(
+            tabId: workspace.id,
+            surfaceId: leftPanelId,
+            state: .commandRunning
+        )
+
+        let singleExpected = String(
+            format: String(
+                localized: "sidebar.terminals.activity.single",
+                defaultValue: "Terminal running: %1$@"
+            ),
+            locale: Locale.current,
+            "Build"
+        )
+        XCTAssertEqual(workspace.statusEntries.values.map(\.value), [singleExpected])
+
+        manager.updateSurfaceShellActivity(
+            tabId: workspace.id,
+            surfaceId: rightPanel.id,
+            state: .commandRunning
+        )
+
+        let summaryExpected = String(
+            format: String(
+                localized: "sidebar.terminals.activity.summary",
+                defaultValue: "%1$lld terminals running"
+            ),
+            locale: Locale.current,
+            Int64(2)
+        )
+        let buildExpected = String(
+            format: String(
+                localized: "sidebar.terminals.activity.detail",
+                defaultValue: "Running: %1$@"
+            ),
+            locale: Locale.current,
+            "Build"
+        )
+        let testsExpected = String(
+            format: String(
+                localized: "sidebar.terminals.activity.detail",
+                defaultValue: "Running: %1$@"
+            ),
+            locale: Locale.current,
+            "Tests"
+        )
+        XCTAssertEqual(workspace.statusEntries.count, 3)
+        XCTAssertEqual(
+            Set(workspace.statusEntries.values.map(\.value)),
+            Set([summaryExpected, buildExpected, testsExpected])
+        )
+
+        manager.updateSurfaceShellActivity(
+            tabId: workspace.id,
+            surfaceId: leftPanelId,
+            state: .promptIdle
+        )
+
+        let testsSingleExpected = String(
+            format: String(
+                localized: "sidebar.terminals.activity.single",
+                defaultValue: "Terminal running: %1$@"
+            ),
+            locale: Locale.current,
+            "Tests"
+        )
+        XCTAssertEqual(workspace.statusEntries.values.map(\.value), [testsSingleExpected])
+
+        manager.updateSurfaceShellActivity(
+            tabId: workspace.id,
+            surfaceId: rightPanel.id,
+            state: .promptIdle
+        )
+
+        XCTAssertTrue(workspace.statusEntries.isEmpty)
     }
 
     func testPeriodicWorkspaceGitMetadataRefreshClearsStalePullRequestAfterBranchReset() throws {

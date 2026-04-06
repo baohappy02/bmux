@@ -50,6 +50,21 @@ SIGN_HASH="A050CC7E193C8221BDBA204E731B046CDCCC1B30"
 ENTITLEMENTS="bmux.entitlements"
 APP_PATH="build/Build/Products/Release/bmux.app"
 
+find_bmux_index_src() {
+  local candidate=""
+  for candidate in \
+    "$PWD/../bmux-index/.build/release/bmux-index" \
+    "$PWD/../bmux-index/.build/debug/bmux-index" \
+    "$HOME/.local/bin/bmux-index" \
+    "$(command -v bmux-index 2>/dev/null || true)"
+  do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    echo "$candidate"
+    return 0
+  done
+  return 1
+}
+
 find_bmux_deps_src() {
   local resolve_script="$PWD/scripts/resolve-bmux-deps.sh"
   if [[ ! -f "$resolve_script" ]]; then
@@ -62,9 +77,18 @@ find_bmux_deps_src() {
 bundle_runtime_binaries() {
   local app_path="$1"
   local bin_dir="${app_path}/Contents/Resources/bin"
+  local bmux_index_src=""
   local bmux_deps_src=""
 
   mkdir -p "$bin_dir"
+
+  bmux_index_src="$(find_bmux_index_src || true)"
+  if [[ -n "$bmux_index_src" ]]; then
+    cp "$bmux_index_src" "$bin_dir/bmux-index"
+    chmod +x "$bin_dir/bmux-index"
+  else
+    echo "warning: bmux-index binary was not found; agent.code will stay unavailable until bmux-index is installed." >&2
+  fi
 
   bmux_deps_src="$(find_bmux_deps_src)"
   cp "$bmux_deps_src" "$bin_dir/bmux-deps"

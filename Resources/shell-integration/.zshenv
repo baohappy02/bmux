@@ -46,7 +46,7 @@ fi
 
         # Load cmux integration (unless disabled)
         if [[ "${CMUX_SHELL_INTEGRATION:-1}" != "0" && -n "${CMUX_SHELL_INTEGRATION_DIR:-}" ]]; then
-            builtin typeset _cmux_integ="$CMUX_SHELL_INTEGRATION_DIR/cmux-zsh-integration.zsh"
+            builtin typeset _cmux_integ="$CMUX_SHELL_INTEGRATION_DIR/bmux-zsh-integration.zsh"
             [[ -r "$_cmux_integ" ]] && builtin source -- "$_cmux_integ"
         fi
     fi

@@ -149,6 +149,56 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
 #endif
     }
 
+    func testManagedTaskCommandUsesShellTaskPrefixInsteadOfInlineSocketWrapper() throws {
+#if DEBUG
+        let command = TerminalController.debugWrappedAgentTaskCommand(
+            taskId: "job:42",
+            command: "cd /tmp && echo hi"
+        )
+
+        XCTAssertEqual(command, "BMUX_AGENT_TASK_ID=job:42 cd /tmp && echo hi")
+        XCTAssertFalse(command.contains("report_task_result"))
+        XCTAssertFalse(command.contains("CMUX_SOCKET_PATH"))
+        XCTAssertFalse(command.contains("_bmux_send_bg"))
+#else
+        throw XCTSkip("Managed task command helper is debug-only.")
+#endif
+    }
+
+    func testReusableTerminalSurfaceSelectionSkipsExcludedAttachedSurface() throws {
+#if DEBUG
+        let attachedSurface = UUID()
+        let reusableSurface = UUID()
+        let browserSurface = UUID()
+
+        let selected = TerminalController.debugSelectReusableTerminalSurfaceId(
+            explicitSurfaceId: nil,
+            candidateSurfaceIds: [attachedSurface, browserSurface, reusableSurface],
+            terminalSurfaceIds: [attachedSurface, reusableSurface],
+            excludedSurfaceIds: [attachedSurface]
+        )
+        XCTAssertEqual(selected, reusableSurface)
+
+        let createdInsteadOfReusingAttached = TerminalController.debugSelectReusableTerminalSurfaceId(
+            explicitSurfaceId: nil,
+            candidateSurfaceIds: [attachedSurface],
+            terminalSurfaceIds: [attachedSurface],
+            excludedSurfaceIds: [attachedSurface]
+        )
+        XCTAssertNil(createdInsteadOfReusingAttached)
+
+        let explicitSurfaceStillWins = TerminalController.debugSelectReusableTerminalSurfaceId(
+            explicitSurfaceId: attachedSurface,
+            candidateSurfaceIds: [attachedSurface, reusableSurface],
+            terminalSurfaceIds: [attachedSurface, reusableSurface],
+            excludedSurfaceIds: [attachedSurface]
+        )
+        XCTAssertEqual(explicitSurfaceStillWins, attachedSurface)
+#else
+        throw XCTSkip("Reusable terminal surface selection helper is debug-only.")
+#endif
+    }
+
     func testRemoteStatusPayloadOmitsSensitiveSSHConfiguration() {
         let tabManager = TabManager()
         let workspace = tabManager.addWorkspace(select: false, eagerLoadTerminal: false)
@@ -330,6 +380,82 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertEqual(result["backend"] as? String, "bmux-index")
         XCTAssertEqual(result["status"] as? String, "warm")
         XCTAssertEqual(result["repo_root"] as? String, repoURL.path)
+    }
+
+    func testAgentCapabilitiesAdvertiseManagedTaskExecutionGuidance() throws {
+        let socketPath = makeSocketPath("agent-capabilities")
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace else {
+            XCTFail("Expected selected workspace")
+            return
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let attachResponse = try sendV2Request(
+            method: "agent.attach",
+            params: ["workspace_id": workspace.id.uuidString],
+            to: socketPath
+        )
+        XCTAssertEqual(attachResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(attachResponse)")
+        let attachResult = try XCTUnwrap(attachResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(attachResponse)")
+        let sessionId = try XCTUnwrap(attachResult["session_id"] as? String)
+
+        let capabilitiesResponse = try sendV2Request(
+            method: "agent.capabilities",
+            params: ["session_id": sessionId],
+            to: socketPath
+        )
+        XCTAssertEqual(capabilitiesResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(capabilitiesResponse)")
+        let result = try XCTUnwrap(capabilitiesResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(capabilitiesResponse)")
+        let capabilityFlags = try XCTUnwrap(result["capabilities"] as? [String: Any])
+        XCTAssertEqual(capabilityFlags["managed_task_execution"] as? Bool, true)
+        XCTAssertEqual(capabilityFlags["compact_task_results"] as? Bool, true)
+        XCTAssertEqual(capabilityFlags["pause_for_user_contract"] as? Bool, true)
+
+        let guidance = try XCTUnwrap(result["task_execution_guidance"] as? [String])
+        XCTAssertTrue(guidance.contains { $0.contains("agent.task.run") })
+        XCTAssertTrue(guidance.contains { $0.contains("agent.task.result") })
+        XCTAssertTrue(guidance.contains { $0.contains("pause_for_user=true") })
+
+        let runtimeHelpers = try XCTUnwrap(result["runtime_helpers"] as? [String: Any])
+        let bmuxIndexHelper = try XCTUnwrap(runtimeHelpers["bmux_index"] as? [String: Any])
+        XCTAssertEqual(bmuxIndexHelper["name"] as? String, "bmux-index")
+        XCTAssertEqual(bmuxIndexHelper["role"] as? String, "code_intelligence")
+        XCTAssertNotNil(bmuxIndexHelper["selected_source"])
+        XCTAssertNotNil(bmuxIndexHelper["bundled_available"])
+        let bmuxDepsHelper = try XCTUnwrap(runtimeHelpers["bmux_deps"] as? [String: Any])
+        XCTAssertEqual(bmuxDepsHelper["name"] as? String, "bmux-deps")
+        XCTAssertEqual(bmuxDepsHelper["role"] as? String, "dependency_bootstrap")
+        XCTAssertNotNil(bmuxDepsHelper["selected_source"])
+        XCTAssertNotNil(result["runtime_helper_warnings"] as? [String])
+        XCTAssertNotNil(result["runtime_helper_drift_detected"] as? Bool)
+
+        let policy = try XCTUnwrap(result["policy"] as? [String: Any])
+        XCTAssertEqual(policy["default_execution_class"] as? String, "local_verify")
+        let managedTaskDefaults = try XCTUnwrap(policy["managed_task_defaults"] as? [String: Any])
+        XCTAssertEqual(managedTaskDefaults["success_channel"] as? String, "agent.task.result")
+        XCTAssertEqual(managedTaskDefaults["logs_on_success"] as? String, "avoid")
+        XCTAssertEqual(managedTaskDefaults["logs_on_failure"] as? String, "on_demand")
+        XCTAssertEqual(managedTaskDefaults["pause_for_user_for_noisy_commands"] as? Bool, true)
+
+        let summaryResponse = try sendV2Request(
+            method: "agent.state.summary",
+            params: ["session_id": sessionId],
+            to: socketPath
+        )
+        XCTAssertEqual(summaryResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(summaryResponse)")
+        let summary = try XCTUnwrap(summaryResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(summaryResponse)")
+        let summaryRuntimeHelpers = try XCTUnwrap(summary["runtime_helpers"] as? [String: Any])
+        XCTAssertNotNil(summaryRuntimeHelpers["bmux_index"])
+        XCTAssertNotNil(summaryRuntimeHelpers["bmux_deps"])
+        XCTAssertNotNil(summary["runtime_helper_warnings"] as? [String])
+        XCTAssertNotNil(summary["runtime_helper_drift_detected"] as? Bool)
     }
 
     func testAgentSearchMapsBmuxIndexResultsIntoHits() async throws {

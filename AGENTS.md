@@ -14,9 +14,10 @@ Run the setup script to initialize submodules and build GhosttyKit:
 
 ## bmux-index lifecycle
 
-- When bmux opens a project repo, it should run `bmux-index status` for that repo and immediately start `bmux-index index` in the background when the index is `missing` or `stale`.
-- Treat indexed `bmux-index` search/context/impact/trace output as unavailable until that warm finishes successfully. Do not present source-only fallback reads as indexed analysis.
-- Re-warm the index when repo freshness inputs drift enough to stale it, such as branch switches, large checkouts, or source fingerprint changes.
+- When bmux opens or switches to a project repo, it should keep one long-lived `bmux-index serve` session and call `bmux-index prepare` as a non-blocking warmup step.
+- Do not treat `bmux-index status` as a required gate for repo-scoped reads. For `route`, `search`, `search_many`, `symbols`, `context`, `impact`, `trace`, `refs`, `rename`, `changes`, and `module`, call the read path directly and let `bmux-index` auto-index if the local index is `missing` or `stale`.
+- Use `status` as telemetry or diagnostics only.
+- Re-warm on repo switch or when freshness inputs drift enough to stale the index, such as branch switches, large checkouts, or source fingerprint changes, but keep normal indexed reads on the direct read path.
 
 ## Local dev
 

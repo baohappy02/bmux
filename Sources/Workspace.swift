@@ -5586,6 +5586,11 @@ final class Workspace: Identifiable, ObservableObject {
 
     private static let remoteErrorStatusKey = "remote.error"
     private static let remotePortConflictStatusKey = "remote.port_conflicts"
+    private static let terminalActivitySummaryStatusKey = "terminal.activity.summary"
+    private static let terminalActivityDetailStatusKeyPrefix = "terminal.activity.panel."
+    private static let terminalActivityStatusColor = "#d97706"
+    private static let terminalActivitySummaryPriority = 880
+    private static let terminalActivityDetailPriority = 870
     private static let remoteNotificationCooldown: TimeInterval = 5 * 60
     private static let sshControlMasterCleanupQueue = DispatchQueue(
         label: "com.bmux.remote-ssh.control-master-cleanup",
@@ -6320,6 +6325,7 @@ final class Workspace: Identifiable, ObservableObject {
             title: resolvedPanelTitle(panelId: panelId, fallback: baseTitle),
             hasCustomTitle: panelCustomTitles[panelId] != nil
         )
+        refreshTerminalActivityStatusEntries()
     }
 
     func isPanelPinned(_ panelId: UUID) -> Bool {
@@ -6538,6 +6544,7 @@ final class Workspace: Identifiable, ObservableObject {
             "panel=\(panelId.uuidString.prefix(5)) from=\(previousState.rawValue) to=\(state.rawValue)"
         )
 #endif
+        refreshTerminalActivityStatusEntries()
     }
 
     func panelNeedsConfirmClose(panelId: UUID, fallbackNeedsConfirmClose: Bool) -> Bool {
@@ -6728,6 +6735,7 @@ final class Workspace: Identifiable, ObservableObject {
                 title: resolvedTitle,
                 hasCustomTitle: panelCustomTitles[panelId] != nil
             )
+            refreshTerminalActivityStatusEntries()
         }
 
         // If this is the only panel and no custom title, update workspace title
@@ -6756,7 +6764,131 @@ final class Workspace: Identifiable, ObservableObject {
         surfaceTTYNames = surfaceTTYNames.filter { validSurfaceIds.contains($0.key) }
         panelShellActivityStates = panelShellActivityStates.filter { validSurfaceIds.contains($0.key) }
         panelPullRequests = panelPullRequests.filter { validSurfaceIds.contains($0.key) }
+        refreshTerminalActivityStatusEntries()
         recomputeListeningPorts()
+    }
+
+    private func upsertStatusEntry(
+        key: String,
+        value: String,
+        icon: String?,
+        color: String?,
+        priority: Int
+    ) {
+        if let current = statusEntries[key],
+           current.value == value,
+           current.icon == icon,
+           current.color == color,
+           current.priority == priority,
+           current.url == nil,
+           current.format == .plain {
+            return
+        }
+        statusEntries[key] = SidebarStatusEntry(
+            key: key,
+            value: value,
+            icon: icon,
+            color: color,
+            priority: priority,
+            format: .plain,
+            timestamp: Date()
+        )
+    }
+
+    private func removeTerminalActivityStatusEntries(excluding retainedKeys: Set<String> = []) {
+        let keys = statusEntries.keys.filter { key in
+            key == Self.terminalActivitySummaryStatusKey
+                || key.hasPrefix(Self.terminalActivityDetailStatusKeyPrefix)
+        }
+        for key in keys where !retainedKeys.contains(key) {
+            statusEntries.removeValue(forKey: key)
+        }
+    }
+
+    private func terminalActivityLabel(panelId: UUID) -> String {
+        if let title = panelTitle(panelId: panelId)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            return title
+        }
+        if let directory = sidebarResolvedDirectory(for: panelId) {
+            let basename = URL(fileURLWithPath: directory).lastPathComponent
+            if !basename.isEmpty {
+                return basename
+            }
+            return directory
+        }
+        return panels[panelId]?.displayTitle ?? panelId.uuidString
+    }
+
+    private func refreshTerminalActivityStatusEntries() {
+        let runningPanelIds = sidebarOrderedPanelIds().filter { panelId in
+            (panels[panelId] as? TerminalPanel) != nil
+                && panelShellActivityStates[panelId] == .commandRunning
+        }
+        guard !runningPanelIds.isEmpty else {
+            removeTerminalActivityStatusEntries()
+            return
+        }
+
+        var retainedKeys: Set<String> = [Self.terminalActivitySummaryStatusKey]
+        if runningPanelIds.count == 1, let panelId = runningPanelIds.first {
+            let value = String(
+                format: String(
+                    localized: "sidebar.terminals.activity.single",
+                    defaultValue: "Terminal running: %1$@"
+                ),
+                locale: Locale.current,
+                terminalActivityLabel(panelId: panelId)
+            )
+            upsertStatusEntry(
+                key: Self.terminalActivitySummaryStatusKey,
+                value: value,
+                icon: "terminal.fill",
+                color: Self.terminalActivityStatusColor,
+                priority: Self.terminalActivitySummaryPriority
+            )
+            removeTerminalActivityStatusEntries(excluding: retainedKeys)
+            return
+        }
+
+        let summaryValue = String(
+            format: String(
+                localized: "sidebar.terminals.activity.summary",
+                defaultValue: "%1$lld terminals running"
+            ),
+            locale: Locale.current,
+            Int64(runningPanelIds.count)
+        )
+        upsertStatusEntry(
+            key: Self.terminalActivitySummaryStatusKey,
+            value: summaryValue,
+            icon: "terminal.fill",
+            color: Self.terminalActivityStatusColor,
+            priority: Self.terminalActivitySummaryPriority
+        )
+
+        for (index, panelId) in runningPanelIds.enumerated() {
+            let key = Self.terminalActivityDetailStatusKeyPrefix + panelId.uuidString
+            let value = String(
+                format: String(
+                    localized: "sidebar.terminals.activity.detail",
+                    defaultValue: "Running: %1$@"
+                ),
+                locale: Locale.current,
+                terminalActivityLabel(panelId: panelId)
+            )
+            retainedKeys.insert(key)
+            upsertStatusEntry(
+                key: key,
+                value: value,
+                icon: "play.circle.fill",
+                color: Self.terminalActivityStatusColor,
+                priority: Self.terminalActivityDetailPriority - index
+            )
+        }
+
+        removeTerminalActivityStatusEntries(excluding: retainedKeys)
     }
 
     func recomputeListeningPorts() {
@@ -10526,6 +10658,7 @@ extension Workspace: BonsplitDelegate {
         if lastTerminalConfigInheritancePanelId == panelId {
             lastTerminalConfigInheritancePanelId = nil
         }
+        refreshTerminalActivityStatusEntries()
         clearRemoteConfigurationIfWorkspaceBecameLocal()
         if !isDetaching, let transferredRemoteCleanupConfiguration {
             Self.requestSSHControlMasterCleanupIfNeeded(configuration: transferredRemoteCleanupConfiguration)
@@ -10679,6 +10812,7 @@ extension Workspace: BonsplitDelegate {
 
             let closedSet = Set(closedPanelIds)
             surfaceIdToPanelId = surfaceIdToPanelId.filter { !closedSet.contains($0.value) }
+            refreshTerminalActivityStatusEntries()
             recomputeListeningPorts()
             clearRemoteConfigurationIfWorkspaceBecameLocal()
 

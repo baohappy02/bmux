@@ -712,11 +712,18 @@ class TabManager: ObservableObject {
     private static let selectedWorkspaceGitMetadataPollInterval: TimeInterval = 5
     private nonisolated static let workspacePullRequestProbeTimeout: TimeInterval = 5.0
     private nonisolated static let dependencyBootstrapTimeout: TimeInterval = 120.0
+    private nonisolated static let bmuxIndexStatusTimeout: TimeInterval = 15.0
+    private nonisolated static let bmuxIndexWarmTimeout: TimeInterval = 120.0
     private nonisolated static let dependencyBootstrapQueue = DispatchQueue(
         label: "com.bmux.workspace-dependency-bootstrap",
         qos: .utility
     )
+    private nonisolated static let bmuxIndexWarmQueue = DispatchQueue(
+        label: "com.bmux.workspace-bmux-index-warm",
+        qos: .utility
+    )
     private static var dependencyBootstrapInFlightDirectories: Set<String> = []
+    private static var bmuxIndexWarmInFlightRepoRoots: Set<String> = []
     @Published var selectedTabId: UUID? {
         willSet {
 #if DEBUG
@@ -800,6 +807,7 @@ class TabManager: ObservableObject {
     private let panelTitleUpdateCoalescer = NotificationBurstCoalescer(delay: 1.0 / 30.0)
     private var recentlyClosedBrowsers = RecentlyClosedBrowserStack(capacity: 20)
     private let dependencyBootstrapRunner: (String) -> Void
+    private let bmuxIndexWarmRunner: (String) -> Void
     private let initialWorkspaceGitProbeQueue = DispatchQueue(
         label: "com.bmux.initial-workspace-git-probe",
         qos: .utility
@@ -858,9 +866,11 @@ class TabManager: ObservableObject {
 
     init(
         initialWorkingDirectory: String? = nil,
-        dependencyBootstrapRunner: @escaping (String) -> Void = TabManager.runDependencyBootstrapIfAvailable
+        dependencyBootstrapRunner: @escaping (String) -> Void = TabManager.runDependencyBootstrapIfAvailable,
+        bmuxIndexWarmRunner: @escaping (String) -> Void = TabManager.ensureBmuxIndexWarmIfNeeded
     ) {
         self.dependencyBootstrapRunner = dependencyBootstrapRunner
+        self.bmuxIndexWarmRunner = bmuxIndexWarmRunner
         addWorkspace(workingDirectory: initialWorkingDirectory)
         observers.append(NotificationCenter.default.addObserver(
             forName: .ghosttyDidSetTitle,
@@ -1323,6 +1333,10 @@ class TabManager: ObservableObject {
             }
             if let explicitWorkingDirectory {
                 scheduleDependencyBootstrapIfNeeded(directory: explicitWorkingDirectory)
+                scheduleBmuxIndexWarmIfPossible(
+                    directory: explicitWorkingDirectory,
+                    reason: "workspaceCreate"
+                )
             }
             if eagerLoadTerminal {
                 if select {
@@ -1933,6 +1947,25 @@ class TabManager: ObservableObject {
         "/opt/local/bin",
     ]
 
+    struct RuntimeHelperCandidate: Equatable {
+        let path: String
+        let source: String
+    }
+
+    struct RuntimeHelperInfo: Equatable {
+        let name: String
+        let role: String
+        let resolvedPath: String?
+        let selectedSource: String
+        let bundledPath: String?
+        let bundledAvailable: Bool
+        let externalCandidatePath: String?
+        let externalCandidateSource: String?
+        let pathMismatch: Bool
+        let newerExternalCandidateAvailable: Bool
+        let warning: String?
+    }
+
     nonisolated static func resolvedCommandPathForTesting(
         executable: String,
         environment: [String: String],
@@ -1955,7 +1988,73 @@ class TabManager: ObservableObject {
             override: override,
             environment: environment,
             bundledPath: bundledPath,
+            fallbackDirectories: fallbackDirectories,
+            preferredCandidates: []
+        )
+    }
+
+    nonisolated static func resolvedBmuxIndexPathForTesting(
+        override: String?,
+        environment: [String: String],
+        bundledPath: String?,
+        fallbackDirectories: [String]
+    ) -> String? {
+        resolvedBmuxIndexPath(
+            override: override,
+            environment: environment,
+            bundledPath: bundledPath,
+            fallbackDirectories: fallbackDirectories,
+            preferredCandidates: []
+        )
+    }
+
+    nonisolated static func runtimeHelperInfoForTesting(
+        name: String,
+        role: String,
+        executable: String,
+        override: String?,
+        bundledPath: String?,
+        preferredCandidates: [RuntimeHelperCandidate],
+        environment: [String: String],
+        fallbackDirectories: [String]
+    ) -> RuntimeHelperInfo {
+        runtimeHelperInfo(
+            name: name,
+            role: role,
+            executable: executable,
+            override: override,
+            bundledPath: bundledPath,
+            preferredCandidates: preferredCandidates,
+            environment: environment,
             fallbackDirectories: fallbackDirectories
+        )
+    }
+
+    nonisolated static func bmuxIndexRuntimeHelperInfo() -> RuntimeHelperInfo {
+        runtimeHelperInfo(
+            name: "bmux-index",
+            role: "code_intelligence",
+            executable: "bmux-index",
+            override: ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"],
+            bundledPath: Bundle.main.resourceURL?.appendingPathComponent("bin/bmux-index").path,
+            preferredCandidates: localRuntimeHelperCandidates(
+                repoName: "bmux-index",
+                executable: "bmux-index"
+            )
+        )
+    }
+
+    nonisolated static func bmuxDepsRuntimeHelperInfo() -> RuntimeHelperInfo {
+        runtimeHelperInfo(
+            name: "bmux-deps",
+            role: "dependency_bootstrap",
+            executable: "bmux-deps",
+            override: ProcessInfo.processInfo.environment["BMUX_DEPS_CLI"],
+            bundledPath: Bundle.main.resourceURL?.appendingPathComponent("bin/bmux-deps").path,
+            preferredCandidates: localRuntimeHelperCandidates(
+                repoName: "bmux-deps",
+                executable: "bmux-deps"
+            )
         )
     }
 
@@ -2004,31 +2103,251 @@ class TabManager: ObservableObject {
         return nil
     }
 
+    private nonisolated static func runtimeHelperCandidate(
+        path: String?,
+        source: String
+    ) -> RuntimeHelperCandidate? {
+        guard let path else { return nil }
+        let normalized = NSString(string: path).expandingTildeInPath
+        guard FileManager.default.isExecutableFile(atPath: normalized) else {
+            return nil
+        }
+        return RuntimeHelperCandidate(path: normalized, source: source)
+    }
+
+    private nonisolated static func localRuntimeHelperCandidates(
+        repoName: String,
+        executable: String,
+        sourceFile: String = #filePath
+    ) -> [RuntimeHelperCandidate] {
+        let toolsRoot = URL(fileURLWithPath: sourceFile)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let homeLocalPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/\(executable)")
+            .path
+        let rawCandidates: [(String, String)] = [
+            (toolsRoot.appendingPathComponent("\(repoName)/.build/debug/\(executable)").path, "local_build_debug"),
+            (toolsRoot.appendingPathComponent("\(repoName)/.build/release/\(executable)").path, "local_build_release"),
+            (homeLocalPath, "home_local_bin"),
+        ]
+        return rawCandidates.compactMap { candidate in
+            runtimeHelperCandidate(path: candidate.0, source: candidate.1)
+        }
+    }
+
+    private nonisolated static func runtimeHelperCandidates(
+        executable: String,
+        override: String?,
+        bundledPath: String?,
+        preferredCandidates: [RuntimeHelperCandidate],
+        environment: [String: String],
+        fallbackDirectories: [String]
+    ) -> [RuntimeHelperCandidate] {
+        var candidates: [RuntimeHelperCandidate] = []
+        var seenPaths: Set<String> = []
+
+        func append(_ candidate: RuntimeHelperCandidate?) {
+            guard let candidate,
+                  seenPaths.insert(candidate.path).inserted else {
+                return
+            }
+            candidates.append(candidate)
+        }
+
+        append(runtimeHelperCandidate(path: override, source: "env_override"))
+        append(runtimeHelperCandidate(path: bundledPath, source: "bundled"))
+        preferredCandidates.forEach { append(runtimeHelperCandidate(path: $0.path, source: $0.source)) }
+        append(
+            resolvedCommandPath(
+                executable: executable,
+                environment: environment,
+                fallbackDirectories: fallbackDirectories
+            ).map { RuntimeHelperCandidate(path: NSString(string: $0).expandingTildeInPath, source: "path") }
+        )
+
+        return candidates
+    }
+
+    private nonisolated static func runtimeHelperInfo(
+        name: String,
+        role: String,
+        executable: String,
+        override: String?,
+        bundledPath: String?,
+        preferredCandidates: [RuntimeHelperCandidate],
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        fallbackDirectories: [String] = fallbackCommandSearchDirectories
+    ) -> RuntimeHelperInfo {
+        let normalizedBundledPath = bundledPath.map { NSString(string: $0).expandingTildeInPath }
+        let bundledAvailable = normalizedBundledPath.flatMap {
+            runtimeHelperCandidate(path: $0, source: "bundled")
+        } != nil
+        let candidates = runtimeHelperCandidates(
+            executable: executable,
+            override: override,
+            bundledPath: bundledPath,
+            preferredCandidates: preferredCandidates,
+            environment: environment,
+            fallbackDirectories: fallbackDirectories
+        )
+        let selected = candidates.first
+        let externalCandidate = candidates.first { candidate in
+            guard let normalizedBundledPath else { return true }
+            return candidate.path != normalizedBundledPath
+        }
+        let newerExternalCandidateAvailable = bundledAvailable
+            && isFileNewer(
+                atPath: externalCandidate?.path,
+                thanPath: normalizedBundledPath
+            )
+        let pathMismatch = bundledAvailable && selected?.path != normalizedBundledPath
+
+        let warning: String? = {
+            guard let selected else {
+                return "helper unavailable"
+            }
+            if selected.source == "env_override" {
+                return "using environment override"
+            }
+            if bundledAvailable && pathMismatch {
+                return "using external helper instead of bundled runtime"
+            }
+            if bundledAvailable && newerExternalCandidateAvailable {
+                return "newer external candidate available than bundled runtime"
+            }
+            return nil
+        }()
+
+        return RuntimeHelperInfo(
+            name: name,
+            role: role,
+            resolvedPath: selected?.path,
+            selectedSource: selected?.source ?? "unavailable",
+            bundledPath: normalizedBundledPath,
+            bundledAvailable: bundledAvailable,
+            externalCandidatePath: externalCandidate?.path,
+            externalCandidateSource: externalCandidate?.source,
+            pathMismatch: pathMismatch,
+            newerExternalCandidateAvailable: newerExternalCandidateAvailable,
+            warning: warning
+        )
+    }
+
+    private nonisolated static func isFileNewer(
+        atPath candidatePath: String?,
+        thanPath referencePath: String?
+    ) -> Bool {
+        guard let candidateDate = fileModificationDate(atPath: candidatePath),
+              let referenceDate = fileModificationDate(atPath: referencePath) else {
+            return false
+        }
+        return candidateDate > referenceDate
+    }
+
+    private nonisolated static func fileModificationDate(atPath path: String?) -> Date? {
+        guard let path else { return nil }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return attributes?[.modificationDate] as? Date
+    }
+
     private nonisolated static func resolvedDependencyBootstrapPath(
         override: String? = ProcessInfo.processInfo.environment["BMUX_DEPS_CLI"],
         environment: [String: String] = ProcessInfo.processInfo.environment,
         bundledPath: String? = Bundle.main.resourceURL?.appendingPathComponent("bin/bmux-deps").path,
-        fallbackDirectories: [String] = fallbackCommandSearchDirectories
+        fallbackDirectories: [String] = fallbackCommandSearchDirectories,
+        preferredCandidates: [RuntimeHelperCandidate]? = nil
     ) -> String? {
-        let fileManager = FileManager.default
-
-        if let override {
-            let expanded = NSString(string: override).expandingTildeInPath
-            if fileManager.isExecutableFile(atPath: expanded) {
-                return expanded
-            }
-        }
-
-        if let bundledPath,
-           fileManager.isExecutableFile(atPath: bundledPath) {
-            return bundledPath
-        }
-
-        return resolvedCommandPath(
+        runtimeHelperCandidates(
             executable: "bmux-deps",
+            override: override,
+            bundledPath: bundledPath,
+            preferredCandidates: preferredCandidates ?? localRuntimeHelperCandidates(
+                repoName: "bmux-deps",
+                executable: "bmux-deps"
+            ),
             environment: environment,
             fallbackDirectories: fallbackDirectories
         )
+        .first?
+        .path
+    }
+
+    private nonisolated static func resolvedBmuxIndexPath(
+        override: String? = ProcessInfo.processInfo.environment["BMUX_INDEX_PATH"],
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundledPath: String? = Bundle.main.resourceURL?.appendingPathComponent("bin/bmux-index").path,
+        fallbackDirectories: [String] = fallbackCommandSearchDirectories,
+        preferredCandidates: [RuntimeHelperCandidate]? = nil
+    ) -> String? {
+        runtimeHelperCandidates(
+            executable: "bmux-index",
+            override: override,
+            bundledPath: bundledPath,
+            preferredCandidates: preferredCandidates ?? localRuntimeHelperCandidates(
+                repoName: "bmux-index",
+                executable: "bmux-index"
+            ),
+            environment: environment,
+            fallbackDirectories: fallbackDirectories
+        )
+        .first?
+        .path
+    }
+
+    private nonisolated static func repositoryRoot(startingAt directory: String?) -> String? {
+        guard let directory else { return nil }
+        let trimmed = directory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let expanded = NSString(string: trimmed).expandingTildeInPath
+        var currentPath = NSString(string: expanded).standardizingPath
+        guard !currentPath.isEmpty else { return nil }
+
+        let fileManager = FileManager.default
+        while true {
+            let gitPath = (currentPath as NSString).appendingPathComponent(".git")
+            if fileManager.fileExists(atPath: gitPath) {
+                return currentPath
+            }
+
+            let parentPath = (currentPath as NSString).deletingLastPathComponent
+            if parentPath.isEmpty || parentPath == currentPath {
+                break
+            }
+            currentPath = parentPath
+        }
+
+        return nil
+    }
+
+    private nonisolated static func bmuxIndexState(from output: String?) -> String? {
+        guard let output else { return nil }
+
+        if let data = output.data(using: .utf8),
+           let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let state = ((payload["state"] as? String) ?? (payload["index_state"] as? String))?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !state.isEmpty {
+            return state.lowercased()
+        }
+
+        for line in output.split(whereSeparator: \.isNewline) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("state:") {
+                return trimmed.replacingOccurrences(of: "state:", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+            }
+            if trimmed.hasPrefix("index_state:") {
+                return trimmed.replacingOccurrences(of: "index_state:", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+            }
+        }
+
+        return nil
     }
 
     private nonisolated static func runCommand(
@@ -2148,6 +2467,62 @@ class TabManager: ObservableObject {
             executable: executablePath,
             arguments: ["ensure", "--repo", directory, "--json"],
             timeout: dependencyBootstrapTimeout
+        )
+    }
+
+    private func scheduleBmuxIndexWarmIfPossible(directory: String, reason: String) {
+        let normalizedDirectory = normalizeDirectory(directory)
+        guard let repoRoot = Self.repositoryRoot(startingAt: normalizedDirectory) else {
+            return
+        }
+        scheduleBmuxIndexWarmIfNeeded(repoRoot: repoRoot, reason: reason)
+    }
+
+    private func scheduleBmuxIndexWarmIfNeeded(repoRoot: String, reason: String) {
+        let normalizedRepoRoot = normalizeDirectory(repoRoot)
+        guard Self.bmuxIndexWarmInFlightRepoRoots.insert(normalizedRepoRoot).inserted else {
+            return
+        }
+
+        let runner = bmuxIndexWarmRunner
+#if DEBUG
+        dlog("workspace.index.ensure.schedule repo=\(normalizedRepoRoot) reason=\(reason)")
+#endif
+        Self.bmuxIndexWarmQueue.async {
+            runner(normalizedRepoRoot)
+            Task { @MainActor in
+                Self.bmuxIndexWarmInFlightRepoRoots.remove(normalizedRepoRoot)
+#if DEBUG
+                dlog("workspace.index.ensure.finish repo=\(normalizedRepoRoot)")
+#endif
+            }
+        }
+    }
+
+    private nonisolated static func ensureBmuxIndexWarmIfNeeded(repoRoot: String) {
+        guard let executablePath = resolvedBmuxIndexPath() else {
+            return
+        }
+
+        let statusResult = runCommandResult(
+            directory: repoRoot,
+            executable: executablePath,
+            arguments: ["status", "--repo", repoRoot, "--json"],
+            timeout: bmuxIndexStatusTimeout
+        )
+        guard let statusResult,
+              statusResult.exitStatus == 0,
+              !statusResult.timedOut,
+              let state = bmuxIndexState(from: statusResult.stdout),
+              state == "missing" || state == "stale" else {
+            return
+        }
+
+        _ = runCommandResult(
+            directory: repoRoot,
+            executable: executablePath,
+            arguments: ["index", "--repo", repoRoot, "--json"],
+            timeout: bmuxIndexWarmTimeout
         )
     }
 
@@ -2881,6 +3256,12 @@ class TabManager: ObservableObject {
                 panelId: surfaceId,
                 reason: "directoryChange"
             )
+            if let nextDirectory {
+                scheduleBmuxIndexWarmIfPossible(
+                    directory: nextDirectory,
+                    reason: "directoryChange"
+                )
+            }
         }
     }
 
@@ -2900,6 +3281,9 @@ class TabManager: ObservableObject {
             panelId: surfaceId,
             reason: "branchChange"
         )
+        if let directory = gitProbeDirectory(for: tab, panelId: surfaceId) {
+            scheduleBmuxIndexWarmIfPossible(directory: directory, reason: "branchChange")
+        }
     }
 
     func clearSurfaceGitBranch(tabId: UUID, surfaceId: UUID) {
@@ -2914,6 +3298,9 @@ class TabManager: ObservableObject {
             panelId: surfaceId,
             reason: "branchCleared"
         )
+        if let directory = gitProbeDirectory(for: tab, panelId: surfaceId) {
+            scheduleBmuxIndexWarmIfPossible(directory: directory, reason: "branchCleared")
+        }
     }
 
     func updateSurfaceShellActivity(
