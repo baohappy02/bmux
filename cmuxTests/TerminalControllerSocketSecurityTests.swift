@@ -458,6 +458,238 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertNotNil(summary["runtime_helper_drift_detected"] as? Bool)
     }
 
+    func testAgentTaskRunWithoutSplitReusesAttachedVisibleTerminal() async throws {
+        let socketPath = makeSocketPath("task-visible")
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace,
+              let focusedPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with a focused panel")
+            return
+        }
+        let initialPanelCount = workspace.panels.count
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let attachResponse: [String: Any] = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[String: Any], Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try self.sendV2Request(
+                        method: "agent.attach",
+                        params: ["workspace_id": workspace.id.uuidString],
+                        to: socketPath
+                    )
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        XCTAssertEqual(attachResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(attachResponse)")
+        let attachResult = try XCTUnwrap(attachResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(attachResponse)")
+        let sessionId = try XCTUnwrap(attachResult["session_id"] as? String)
+
+        let taskResponse: [String: Any] = try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<[String: Any], Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let response = try self.sendV2Request(
+                        method: "agent.task.run",
+                        params: [
+                            "session_id": sessionId,
+                            "command": "printf agent-visible-check"
+                        ],
+                        to: socketPath
+                    )
+                    continuation.resume(returning: response)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+
+        XCTAssertEqual(taskResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(taskResponse)")
+        let result = try XCTUnwrap(taskResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(taskResponse)")
+        XCTAssertEqual(result["surface_id"] as? String, focusedPanelId.uuidString)
+        XCTAssertEqual(result["placement"] as? String, "surface")
+        XCTAssertEqual(result["split_applied"] as? Bool, false)
+        XCTAssertEqual(workspace.panels.count, initialPanelCount)
+    }
+
+    func testAgentEnsureWithoutSessionAutoAttachesCurrentFocus() throws {
+        let socketPath = makeSocketPath("ensure-auto")
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace,
+              let focusedPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with a focused panel")
+            return
+        }
+        let initialPanelCount = workspace.panels.count
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let response = try sendV2Request(
+            method: "agent.ensure",
+            params: [
+                "target": "terminal",
+                "workspace_id": workspace.id.uuidString
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(response["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(response)")
+        let result = try XCTUnwrap(response["result"] as? [String: Any], "Unexpected JSON-RPC response: \(response)")
+        XCTAssertTrue(result["session_auto_attached"] as? Bool ?? false)
+        XCTAssertNotNil(result["session_id"] as? String)
+        XCTAssertEqual(result["surface_id"] as? String, focusedPanelId.uuidString)
+        XCTAssertEqual(result["created"] as? Bool, false)
+        XCTAssertEqual(workspace.panels.count, initialPanelCount)
+    }
+
+    func testAgentTaskRunWithoutSessionAutoAttachesAndAllowsJobOnlyReads() throws {
+        let socketPath = makeSocketPath("task-auto")
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace,
+              let focusedPanelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with a focused panel")
+            return
+        }
+        let initialPanelCount = workspace.panels.count
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let taskResponse = try sendV2Request(
+            method: "agent.task.run",
+            params: [
+                "workspace_id": workspace.id.uuidString,
+                "command": "printf sessionless-fast-path"
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(taskResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskResult = try XCTUnwrap(taskResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(taskResponse)")
+        let sessionId = try XCTUnwrap(taskResult["session_id"] as? String)
+        let taskPayload = try XCTUnwrap(taskResult["task"] as? [String: Any])
+        let jobId = try XCTUnwrap(taskPayload["job_id"] as? String)
+        XCTAssertTrue(taskResult["session_auto_attached"] as? Bool ?? false)
+        XCTAssertEqual(taskResult["surface_id"] as? String, focusedPanelId.uuidString)
+        XCTAssertEqual(taskResult["placement"] as? String, "surface")
+        XCTAssertEqual(taskResult["split_applied"] as? Bool, false)
+        XCTAssertEqual(workspace.panels.count, initialPanelCount)
+
+        let waitResponse = try sendV2Request(
+            method: "agent.task.wait",
+            params: [
+                "job_id": jobId,
+                "timeout_ms": 10_000
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(waitResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(waitResponse)")
+        let waitResult = try XCTUnwrap(waitResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(waitResponse)")
+        XCTAssertEqual(waitResult["session_id"] as? String, sessionId)
+        XCTAssertEqual(waitResult["job_id"] as? String, jobId)
+        XCTAssertEqual(waitResult["status"] as? String, "succeeded")
+        XCTAssertEqual(waitResult["session_inferred_from_job"] as? Bool, true)
+
+        let resultResponse = try sendV2Request(
+            method: "agent.task.result",
+            params: ["job_id": jobId],
+            to: socketPath
+        )
+
+        XCTAssertEqual(resultResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(resultResponse)")
+        let result = try XCTUnwrap(resultResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(resultResponse)")
+        XCTAssertEqual(result["session_id"] as? String, sessionId)
+        XCTAssertEqual(result["job_id"] as? String, jobId)
+        XCTAssertEqual(result["status"] as? String, "succeeded")
+        XCTAssertEqual(result["ok"] as? Bool, true)
+        XCTAssertEqual(result["session_inferred_from_job"] as? Bool, true)
+    }
+
+    func testAgentTaskRunDefaultsPauseForUserForNoisyCommands() throws {
+        let socketPath = makeSocketPath("task-pause-default")
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace else {
+            XCTFail("Expected selected workspace")
+            return
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let taskResponse = try sendV2Request(
+            method: "agent.task.run",
+            params: [
+                "workspace_id": workspace.id.uuidString,
+                "command": "swift build -h >/dev/null"
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(taskResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskResult = try XCTUnwrap(taskResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskPayload = try XCTUnwrap(taskResult["task"] as? [String: Any])
+        XCTAssertTrue(taskResult["paused_for_user"] as? Bool ?? false)
+        XCTAssertEqual(taskResult["next_action"] as? String, "wait_for_user")
+        XCTAssertEqual(taskResult["automatic_log_ingest"] as? Bool, false)
+        XCTAssertEqual(taskPayload["pause_for_user"] as? Bool, true)
+    }
+
+    func testAgentTaskRunHonorsPauseForUserFalseOverride() throws {
+        let socketPath = makeSocketPath("task-pause-explicit-false")
+        let manager = TabManager()
+        guard let workspace = manager.selectedWorkspace else {
+            XCTFail("Expected selected workspace")
+            return
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let taskResponse = try sendV2Request(
+            method: "agent.task.run",
+            params: [
+                "workspace_id": workspace.id.uuidString,
+                "command": "swift build -h >/dev/null",
+                "pause_for_user": false
+            ],
+            to: socketPath
+        )
+
+        XCTAssertEqual(taskResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskResult = try XCTUnwrap(taskResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(taskResponse)")
+        let taskPayload = try XCTUnwrap(taskResult["task"] as? [String: Any])
+        XCTAssertNil(taskResult["paused_for_user"])
+        XCTAssertNil(taskResult["next_action"])
+        XCTAssertEqual(taskPayload["pause_for_user"] as? Bool, false)
+    }
+
     func testAgentSearchMapsBmuxIndexResultsIntoHits() async throws {
         let socketPath = makeSocketPath("code-search")
         let manager = TabManager()

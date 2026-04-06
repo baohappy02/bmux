@@ -7,22 +7,25 @@ export const DEFAULT_SKILLS: SkillInput[] = [
     status: "active",
     origin: "manual",
     title: "Verify loop before log dives",
-    summary: "Use bmux managed verify jobs, then read compact task results before opening logs.",
+    summary:
+      "Use bmux managed verify jobs with explicit pause control: stop on paused jobs, otherwise read compact task results before opening logs.",
     tags: ["verify", "task", "result", "diagnostics", "low-token"],
     contentMarkdown: `When to use
 - You need to validate a code change or reproduce a build or test failure.
 
 Steps
 1. Run \`bmux agent task run-profile --session <sid> --profile verify.ts --json\`.
-2. Wait with \`bmux agent task wait --session <sid> --job <job-id> --json\`.
-3. Read \`bmux agent task result --session <sid> --job <job-id> --json\` before asking for logs.
-4. Only fetch \`task logs\` or \`artifact list\` if the result payload is not enough.
+2. If the payload returns \`paused_for_user: true\`, stop and wait for the user instead of calling \`task wait\`, \`task result\`, or \`task logs\`.
+3. Only when the task is intentionally unattended, run \`bmux agent task run-profile --session <sid> --pause-for-user false --profile verify.ts --json\`, then use \`bmux agent task wait --session <sid> --job <job-id> --json\`.
+4. Read \`bmux agent task result --session <sid> --job <job-id> --json\` before asking for logs.
+5. Only fetch \`task logs\` or \`artifact list\` if the result payload is not enough.
 
 Verify
 - Prefer parsed diagnostics, summary, and short tail from \`task result\`.
 - Keep follow-up reads scoped to the failing job only.
 
 Stop conditions
+- For noisy verify work, assume bmux may pause by default and do not auto-wait past a paused payload.
 - If \`verify.ts\` is unavailable, inspect \`bmux agent capabilities\` for profiles and package manager first.`,
   },
   {
@@ -67,8 +70,8 @@ Steps
 1. Attach once and read \`bmux agent capabilities --session <sid> --json\`.
 2. Reuse an existing terminal surface when possible. If the user needs a visible terminal, open or ensure one with \`bmux agent open\` or \`bmux agent ensure\`.
 3. For managed execution, prefer \`bmux agent task run\` or \`bmux agent task run-profile\`.
-4. If the user wants to inspect the terminal before the agent continues, pass \`--pause-for-user true\` and stop after the compact task payload.
-5. Wait with \`bmux agent task wait\`, then read \`bmux agent task result\`.
+4. For noisy or user-visible work, let bmux pause by default or pass \`--pause-for-user true\`, then stop if the task payload returns \`paused_for_user: true\`.
+5. Only for intentionally unattended work, pass \`--pause-for-user false\`, then use \`bmux agent task wait\` and \`bmux agent task result\`.
 6. Only fetch \`task logs\` or artifacts if the task failed or the user asked for them.
 
 Verify
@@ -76,6 +79,7 @@ Verify
 - If a split is refused by the visibility guard, accept the fallback tab or surface instead of forcing more panes.
 
 Stop conditions
+- If the payload is paused for user, do not auto-wait or auto-tail logs.
 - If there is no live session, attach first.
 - If no visible surface can be ensured, keep the command attached instead of launching an unobserved detached job.`,
   },
@@ -182,6 +186,7 @@ Stop conditions
 ];
 
 const REQUIRED_DEFAULT_SKILL_SLUGS = ["coding-principles", "bmux-managed-terminal-tasks"] as const;
+const PAUSE_AWARE_DEFAULT_SKILL_SLUGS = ["verify-loop", "bmux-managed-terminal-tasks"] as const;
 
 function stableDefaultRepoRoot(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
@@ -227,5 +232,33 @@ export function validateDefaultSkills(skills: SkillInput[] = DEFAULT_SKILLS): vo
     if (!availableSlugs.has(slug)) {
       throw new Error(`Default skill catalog is missing required slug '${slug}'`);
     }
+  }
+
+  for (const slug of PAUSE_AWARE_DEFAULT_SKILL_SLUGS) {
+    let matchingSkill: SkillInput | undefined;
+    for (const skill of skills) {
+      if (skill.slug.trim() == slug) {
+        matchingSkill = skill;
+        break;
+      }
+    }
+    guardPauseAwareDefaultSkill(matchingSkill);
+  }
+}
+
+function guardPauseAwareDefaultSkill(skill: SkillInput | undefined): void {
+  if (!skill) {
+    return;
+  }
+
+  const content = skill.contentMarkdown;
+  if (!content.includes("paused_for_user: true")) {
+    throw new Error(`Default skill '${skill.slug}' must mention the paused_for_user contract`);
+  }
+  if (!content.includes("--pause-for-user false")) {
+    throw new Error(`Default skill '${skill.slug}' must document the unattended override`);
+  }
+  if (!content.includes("do not auto-wait") && !content.includes("stop and wait for the user")) {
+    throw new Error(`Default skill '${skill.slug}' must stop automatic waiting after a paused task`);
   }
 }

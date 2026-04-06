@@ -9798,11 +9798,12 @@ final class Workspace: Identifiable, ObservableObject {
         return false
     }
 
-    private func scheduleMovedTerminalRefresh(panelId: UUID) {
+    private func scheduleTerminalRefreshAfterTopologyChange(panelId: UUID) {
         guard terminalPanel(for: panelId) != nil else { return }
 
-        // Force an NSViewRepresentable update after drag/move reparenting. This keeps
-        // portal host binding current when a pane auto-closes during tab moves.
+        // Force an NSViewRepresentable update after split topology churn. This keeps
+        // portal host binding current when a surviving terminal is resized/reparented
+        // by tab moves or pane-close collapse.
         terminalPanel(for: panelId)?.requestViewReattach()
 
         let runRefreshPass: (TimeInterval) -> Void = { [weak self] delay in
@@ -9822,6 +9823,12 @@ final class Workspace: Identifiable, ObservableObject {
         // sequences still get a post-layout redraw.
         runRefreshPass(0)
         runRefreshPass(0.03)
+    }
+
+    private func scheduleVisibleTerminalRefreshForRenderedLayout() {
+        for panelId in renderedVisiblePanelIdsForCurrentLayout() {
+            scheduleTerminalRefreshAfterTopologyChange(panelId: panelId)
+        }
     }
 
     private func closeTabs(_ tabIds: [TabID], skipPinned: Bool = true) {
@@ -10682,6 +10689,7 @@ extension Workspace: BonsplitDelegate {
                 applyTabSelection(tabId: replacementTabId, inPane: replacementPane)
             }
             scheduleTerminalGeometryReconcile()
+            scheduleVisibleTerminalRefreshForRenderedLayout()
             scheduleFocusReconcile()
             return
         }
@@ -10705,6 +10713,7 @@ extension Workspace: BonsplitDelegate {
             normalizePinnedTabs(in: pane)
         }
         scheduleTerminalGeometryReconcile()
+        scheduleVisibleTerminalRefreshForRenderedLayout()
         if !isDetaching {
             scheduleFocusReconcile()
         }
@@ -10746,7 +10755,7 @@ extension Workspace: BonsplitDelegate {
         let movedPanelIdAfter = panelIdFromSurfaceId(tab.id)
 #endif
         if let movedPanelId = panelIdFromSurfaceId(tab.id) {
-            scheduleMovedTerminalRefresh(panelId: movedPanelId)
+            scheduleTerminalRefreshAfterTopologyChange(panelId: movedPanelId)
         }
 #if DEBUG
         let selectedAfter = controller.selectedTab(inPane: destination)
@@ -10825,6 +10834,7 @@ extension Workspace: BonsplitDelegate {
         }
 
         scheduleTerminalGeometryReconcile()
+        scheduleVisibleTerminalRefreshForRenderedLayout()
         if shouldScheduleFocusReconcile {
             scheduleFocusReconcile()
         }

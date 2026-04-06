@@ -435,6 +435,7 @@ class TerminalController {
         var attempt: Int
         var workspaceFingerprint: String?
         var cacheEligible: Bool
+        var pauseForUser: Bool
         var windowId: UUID?
         var workspaceId: UUID?
         var paneId: UUID?
@@ -567,6 +568,11 @@ class TerminalController {
         let path: String
         let url: String?
         let createdAt: Date
+    }
+
+    private enum AgentResolution<Value> {
+        case success(Value)
+        case failure(V2CallResult)
     }
 
     private var v2BrowserNextElementOrdinal: Int = 1
@@ -3492,6 +3498,12 @@ class TerminalController {
             return .err(code: "not_found", message: "Workspace not found", data: nil)
         }
 
+        let session = v2AgentCreateSession(context: context)
+
+        return .ok(v2AgentAttachPayload(session: session, context: context))
+    }
+
+    private func v2AgentCreateSession(context: AgentWorkspaceContext) -> AgentSession {
         let sessionId = withV2AgentState { () -> String in
             let next = "ag_\(v2AgentNextSessionOrdinal)"
             v2AgentNextSessionOrdinal += 1
@@ -3514,8 +3526,60 @@ class TerminalController {
         withV2AgentState {
             v2AgentSessions[sessionId] = session
         }
+        return session
+    }
 
-        return .ok(v2AgentAttachPayload(session: session, context: context))
+    private func v2AgentResolvedSession(
+        params: [String: Any],
+        autoAttachIfMissing: Bool = false
+    ) -> AgentResolution<(session: AgentSession, autoAttached: Bool)> {
+        if let sessionId = v2String(params, "session_id") {
+            guard let session = withV2AgentState({ v2AgentSessions[sessionId] }) else {
+                return .failure(.err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId]))
+            }
+            return .success((session: session, autoAttached: false))
+        }
+
+        guard autoAttachIfMissing else {
+            return .failure(.err(code: "invalid_params", message: "Missing session_id", data: nil))
+        }
+        guard let context = v2AgentResolveContext(params: params, session: nil) else {
+            return .failure(.err(code: "not_found", message: "Workspace not found", data: nil))
+        }
+        let session = v2AgentCreateSession(context: context)
+        return .success((session: session, autoAttached: true))
+    }
+
+    private func v2AgentResolvedTaskBinding(
+        params: [String: Any]
+    ) -> AgentResolution<(taskId: String, task: AgentTask, session: AgentSession, sessionResolvedFromTask: Bool)> {
+        guard let taskId = v2String(params, "job_id") ?? v2String(params, "task_id") else {
+            return .failure(.err(code: "invalid_params", message: "Missing job_id", data: nil))
+        }
+        guard let task = withV2AgentState({ v2AgentTasks[taskId] }) else {
+            return .failure(.err(code: "not_found", message: "Task not found", data: ["job_id": taskId]))
+        }
+
+        if let sessionId = v2String(params, "session_id") {
+            guard let session = withV2AgentState({ v2AgentSessions[sessionId] }) else {
+                return .failure(.err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId]))
+            }
+            guard task.sessionId == sessionId else {
+                return .failure(.err(code: "not_found", message: "Task not found", data: [
+                    "session_id": sessionId,
+                    "job_id": taskId
+                ]))
+            }
+            return .success((taskId: taskId, task: task, session: session, sessionResolvedFromTask: false))
+        }
+
+        guard let session = withV2AgentState({ v2AgentSessions[task.sessionId] }) else {
+            return .failure(.err(code: "not_found", message: "Agent session not found for task", data: [
+                "session_id": task.sessionId,
+                "job_id": taskId
+            ]))
+        }
+        return .success((taskId: taskId, task: task, session: session, sessionResolvedFromTask: true))
     }
 
     private func v2AgentLayout(params: [String: Any]) -> V2CallResult {
@@ -3622,8 +3686,9 @@ class TerminalController {
             "runtime_helper_drift_detected": runtimeHelpers.driftDetected,
             "task_execution_guidance": [
                 "Prefer agent.task.run or agent.task.run_profile for build, test, verify, typecheck, install, migration, benchmark, and dev-server commands.",
+                "For one-shot work, agent.open, agent.ensure, agent.task.run, agent.task.run_many, and agent.task.run_profile can omit session_id; bmux will auto-attach to the current focus and return session_id in the payload.",
                 "Use agent.task.result as the default success channel. Only read agent.task.logs on failure, timeout, or explicit user request.",
-                "When a command is noisy and the user may want to inspect the terminal, launch it with pause_for_user=true and stop until the user follows up."
+                "When a command is noisy and the user may want to inspect the terminal, bmux defaults pause_for_user=true unless the caller explicitly overrides it; stop until the user follows up."
             ],
             "policy": [
                 "default_execution_class": "local_verify",
@@ -3665,12 +3730,17 @@ class TerminalController {
     }
 
     private func v2AgentOpen(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let sessionResolution = v2AgentResolvedSession(params: params, autoAttachIfMissing: true)
+        let session: AgentSession
+        let sessionAutoAttached: Bool
+        switch sessionResolution {
+        case .success(let resolved):
+            session = resolved.session
+            sessionAutoAttached = resolved.autoAttached
+        case .failure(let error):
+            return error
         }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
 
         let kind = (v2String(params, "kind") ?? "terminal").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let splitRaw = v2String(params, "split") ?? v2String(params, "direction")
@@ -3911,6 +3981,9 @@ class TerminalController {
             var payload = v2AgentSurfaceSummary(context: sessionContext)
             payload["session_id"] = sessionId
             payload["layout_rev"] = updatedSession.layoutRev
+            if sessionAutoAttached {
+                payload["session_auto_attached"] = true
+            }
             payload["opened"] = [
                 "surface_id": openedPanelId.uuidString,
                 "surface_ref": v2Ref(kind: .surface, uuid: openedPanelId),
@@ -3935,12 +4008,17 @@ class TerminalController {
     }
 
     private func v2AgentEnsure(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let sessionResolution = v2AgentResolvedSession(params: params, autoAttachIfMissing: true)
+        let session: AgentSession
+        let sessionAutoAttached: Bool
+        switch sessionResolution {
+        case .success(let resolved):
+            session = resolved.session
+            sessionAutoAttached = resolved.autoAttached
+        case .failure(let error):
+            return error
         }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
         guard let target = (v2String(params, "target") ?? v2String(params, "kind"))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased(),
@@ -3972,6 +4050,9 @@ class TerminalController {
                 payload["target"] = "terminal"
                 payload["created"] = false
                 payload["layout_rev"] = updatedSession.layoutRev
+                if sessionAutoAttached {
+                    payload["session_auto_attached"] = true
+                }
                 return .ok(payload)
             }
 
@@ -3984,6 +4065,9 @@ class TerminalController {
                 var payload = (value as? [String: Any]) ?? [:]
                 payload["target"] = "terminal"
                 payload["created"] = true
+                if sessionAutoAttached {
+                    payload["session_auto_attached"] = true
+                }
                 return .ok(payload)
             case .err(let code, let message, let data):
                 return .err(code: code, message: message, data: data)
@@ -4014,6 +4098,9 @@ class TerminalController {
                 payload["target"] = "browser"
                 payload["created"] = false
                 payload["layout_rev"] = updatedSession.layoutRev
+                if sessionAutoAttached {
+                    payload["session_auto_attached"] = true
+                }
                 return .ok(payload)
             }
 
@@ -4026,6 +4113,9 @@ class TerminalController {
                 var payload = (value as? [String: Any]) ?? [:]
                 payload["target"] = "browser"
                 payload["created"] = true
+                if sessionAutoAttached {
+                    payload["session_auto_attached"] = true
+                }
                 return .ok(payload)
             case .err(let code, let message, let data):
                 return .err(code: code, message: message, data: data)
@@ -4041,6 +4131,9 @@ class TerminalController {
                 payload["target"] = "service"
                 payload["created"] = false
                 payload["event_cursor"] = v2AgentCurrentEventCursor()
+                if sessionAutoAttached {
+                    payload["session_auto_attached"] = true
+                }
                 return .ok(payload)
             }
 
@@ -4085,6 +4178,9 @@ class TerminalController {
                 payload["created"] = true
                 payload["service_id"] = "service:\(port)"
                 payload["port"] = port
+                if sessionAutoAttached {
+                    payload["session_auto_attached"] = true
+                }
                 return .ok(payload)
             case .err(let code, let message, let data):
                 return .err(code: code, message: message, data: data)
@@ -4096,6 +4192,9 @@ class TerminalController {
                 var payload = (value as? [String: Any]) ?? [:]
                 payload["target"] = "profile"
                 payload["created"] = true
+                if sessionAutoAttached {
+                    payload["session_auto_attached"] = true
+                }
                 return .ok(payload)
             case .err(let code, let message, let data):
                 return .err(code: code, message: message, data: data)
@@ -4550,12 +4649,17 @@ class TerminalController {
     }
 
     private func v2AgentTaskRun(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let sessionResolution = v2AgentResolvedSession(params: params, autoAttachIfMissing: true)
+        let session: AgentSession
+        let sessionAutoAttached: Bool
+        switch sessionResolution {
+        case .success(let resolved):
+            session = resolved.session
+            sessionAutoAttached = resolved.autoAttached
+        case .failure(let error):
+            return error
         }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
         guard let command = v2String(params, "command")?.trimmingCharacters(in: .whitespacesAndNewlines),
               !command.isEmpty else {
             return .err(code: "invalid_params", message: "Missing command", data: nil)
@@ -4576,7 +4680,6 @@ class TerminalController {
         let approvalState = v2String(params, "approval_state")
         let workspaceFingerprint = v2String(params, "workspace_fingerprint")
         let cacheEligible = v2Bool(params, "cache_eligible") ?? false
-        let pauseForUser = v2Bool(params, "pause_for_user") ?? false
         let expectedPorts = v2StrictIntArray(params, "expected_ports") ?? []
         if let splitRaw, parseSplitDirection(splitRaw) == nil {
             return .err(code: "invalid_params", message: "Missing or invalid split (left|right|up|down)", data: [
@@ -4599,6 +4702,13 @@ class TerminalController {
                 startupWindowMs: startupWindowMs
             )
         }()
+        let pauseForUser = v2AgentResolvedPauseForUser(
+            params: params,
+            command: command,
+            profileName: profileName,
+            executionClass: executionClass,
+            expectedPorts: expectedPorts
+        )
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to run task", data: nil)
         v2MainSync {
             guard let baseContext = v2AgentResolveContext(params: params, session: session) else {
@@ -4625,10 +4735,11 @@ class TerminalController {
                 placement = "surface"
                 splitApplied = false
                 visibilityGuardPayload = nil
+            // Keep no-split task runs on the currently visible terminal when possible so
+            // user-gated noisy commands do not disappear into a background pane tab.
             } else if let reusedSurfaceId = v2AgentReusableTerminalSurfaceId(
                 params: params,
-                context: baseContext,
-                excludedSurfaceIds: session.surfaceId.map { [$0] } ?? []
+                context: baseContext
             ),
                       let reusedPanel = baseContext.workspace.terminalPanel(for: reusedSurfaceId) {
                 terminalPanel = reusedPanel
@@ -4757,6 +4868,7 @@ class TerminalController {
                 attempt: 1,
                 workspaceFingerprint: workspaceFingerprint,
                 cacheEligible: cacheEligible,
+                pauseForUser: pauseForUser,
                 windowId: terminalContext.windowId,
                 workspaceId: terminalContext.workspace.id,
                 paneId: terminalContext.paneId,
@@ -4813,6 +4925,9 @@ class TerminalController {
             var payload = v2AgentSurfaceSummary(context: terminalContext)
             payload["session_id"] = sessionId
             payload["layout_rev"] = updatedSession.layoutRev
+            if sessionAutoAttached {
+                payload["session_auto_attached"] = true
+            }
             payload["task"] = v2AgentTaskPayload(task)
             payload["queued"] = queued
             payload["placement"] = placement
@@ -4833,12 +4948,17 @@ class TerminalController {
     }
 
     private func v2AgentTaskRunProfile(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let sessionResolution = v2AgentResolvedSession(params: params, autoAttachIfMissing: true)
+        let session: AgentSession
+        let sessionAutoAttached: Bool
+        switch sessionResolution {
+        case .success(let resolved):
+            session = resolved.session
+            sessionAutoAttached = resolved.autoAttached
+        case .failure(let error):
+            return error
         }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
         guard let profileName = v2String(params, "profile")?.trimmingCharacters(in: .whitespacesAndNewlines),
               !profileName.isEmpty else {
             return .err(code: "invalid_params", message: "Missing profile", data: nil)
@@ -4858,8 +4978,6 @@ class TerminalController {
                 "profile": profileName
             ])
         }
-        let pauseForUser = v2Bool(params, "pause_for_user") ?? false
-
         let workspaceFingerprint = v2AgentWorkspaceFingerprint(
             context: context,
             inferredPackageManager: profile.packageManager
@@ -4892,6 +5010,7 @@ class TerminalController {
                 "expected_ports": profile.expectedPorts,
                 "cached_at": v2AgentISO8601String(cached.cachedAt),
                 "summary": "\(cached.summary) (cached)",
+                "session_auto_attached": sessionAutoAttached,
                 "event_cursor": v2AgentCurrentEventCursor()
             ])
         }
@@ -4900,6 +5019,7 @@ class TerminalController {
         v2AgentNextGroupOrdinal += 1
 
         var jobPayloads: [[String: Any]] = []
+        var groupPauseForUser = false
         for (index, job) in profile.jobs.enumerated() {
             var jobParams = params
             jobParams["session_id"] = sessionId
@@ -4935,6 +5055,9 @@ class TerminalController {
                         "group_id": groupId
                     ])
                 }
+                groupPauseForUser = groupPauseForUser
+                    || (dict["paused_for_user"] as? Bool == true)
+                    || (taskPayload["pause_for_user"] as? Bool == true)
                 jobPayloads.append(taskPayload)
             case .err(let code, let message, let data):
                 return .err(code: code, message: message, data: data)
@@ -4977,7 +5100,10 @@ class TerminalController {
             "jobs": jobPayloads,
             "event_cursor": v2AgentCurrentEventCursor()
         ]
-        if pauseForUser {
+        if sessionAutoAttached {
+            payload["session_auto_attached"] = true
+        }
+        if groupPauseForUser {
             v2AgentApplyPauseForUserContract(
                 &payload,
                 summary: "profile started; waiting for user follow-up"
@@ -4987,12 +5113,17 @@ class TerminalController {
     }
 
     private func v2AgentTaskRunMany(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let sessionResolution = v2AgentResolvedSession(params: params, autoAttachIfMissing: true)
+        let session: AgentSession
+        let sessionAutoAttached: Bool
+        switch sessionResolution {
+        case .success(let resolved):
+            session = resolved.session
+            sessionAutoAttached = resolved.autoAttached
+        case .failure(let error):
+            return error
         }
-        guard v2AgentSessions[sessionId] != nil else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
 
         guard let jobs = v2AgentJobsArray(from: params["jobs"]) else {
             return .err(code: "invalid_params", message: "Missing or invalid jobs payload", data: [
@@ -5002,12 +5133,11 @@ class TerminalController {
         guard !jobs.isEmpty else {
             return .err(code: "invalid_state", message: "jobs must not be empty", data: ["session_id": sessionId])
         }
-        let pauseForUser = v2Bool(params, "pause_for_user") ?? false
-
         let groupId = "group:\(v2AgentNextGroupOrdinal)"
         v2AgentNextGroupOrdinal += 1
 
         var jobPayloads: [[String: Any]] = []
+        var groupPauseForUser = false
         for (index, job) in jobs.enumerated() {
             guard let command = v2AgentString(job["command"]) else {
                 return .err(code: "invalid_params", message: "Job command is required", data: [
@@ -5063,6 +5193,9 @@ class TerminalController {
                         "job_index": index
                     ])
                 }
+                groupPauseForUser = groupPauseForUser
+                    || (dict["paused_for_user"] as? Bool == true)
+                    || (taskPayload["pause_for_user"] as? Bool == true)
                 jobPayloads.append(taskPayload)
             case .err(let code, let message, let data):
                 return .err(code: code, message: message, data: data)
@@ -5077,7 +5210,10 @@ class TerminalController {
             "job_count": jobPayloads.count,
             "event_cursor": v2AgentCurrentEventCursor()
         ]
-        if pauseForUser {
+        if sessionAutoAttached {
+            payload["session_auto_attached"] = true
+        }
+        if groupPauseForUser {
             v2AgentApplyPauseForUserContract(
                 &payload,
                 summary: "tasks started; waiting for user follow-up"
@@ -5099,15 +5235,19 @@ class TerminalController {
     }
 
     private func v2AgentTaskLogs(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let bindingResolution = v2AgentResolvedTaskBinding(params: params)
+        let taskId: String
+        let session: AgentSession
+        let sessionResolvedFromTask: Bool
+        switch bindingResolution {
+        case .success(let resolved):
+            taskId = resolved.taskId
+            session = resolved.session
+            sessionResolvedFromTask = resolved.sessionResolvedFromTask
+        case .failure(let error):
+            return error
         }
-        guard let taskId = v2String(params, "job_id") ?? v2String(params, "task_id") else {
-            return .err(code: "invalid_params", message: "Missing job_id", data: nil)
-        }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
 
         let mode = (v2String(params, "mode") ?? "tail").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !["tail", "delta", "path-only"].contains(mode) {
@@ -5152,7 +5292,7 @@ class TerminalController {
                 logPath = savedLogPath
                 capturedText = savedLogText
             } else if mode == "path-only" {
-                result = .ok([
+                var payload: [String: Any] = [
                     "session_id": sessionId,
                     "job_id": taskId,
                     "mode": mode,
@@ -5161,7 +5301,11 @@ class TerminalController {
                     "bytes": 0,
                     "cursor": 0,
                     "event_cursor": self.v2AgentCurrentEventCursor()
-                ])
+                ]
+                if sessionResolvedFromTask {
+                    payload["session_inferred_from_job"] = true
+                }
+                result = .ok(payload)
                 return
             } else {
                 result = .err(code: "invalid_state", message: "Task has no terminal target", data: [
@@ -5188,11 +5332,17 @@ class TerminalController {
                     "event_cursor": self.v2AgentCurrentEventCursor()
                 ]
                 if requestedBytes == nil {
+                    if sessionResolvedFromTask {
+                        payload["session_inferred_from_job"] = true
+                    }
                     result = .ok(payload)
                     return
                 }
                 payload["bytes"] = requestedBytes.flatMap { min($0, availableBytes) }
                 payload["bytes_returned"] = requestedBytes
+                if sessionResolvedFromTask {
+                    payload["session_inferred_from_job"] = true
+                }
                 result = .ok(payload)
 
             case "delta":
@@ -5202,7 +5352,7 @@ class TerminalController {
                     lineLimit: requestedLines,
                     byteLimit: requestedBytes
                 )
-                result = .ok([
+                var payload: [String: Any] = [
                     "session_id": sessionId,
                     "job_id": taskId,
                     "mode": mode,
@@ -5213,7 +5363,11 @@ class TerminalController {
                     "tail_lines": payloadText.lines.count,
                     "bytes": payloadText.payloadBytes,
                     "event_cursor": self.v2AgentCurrentEventCursor()
-                ])
+                ]
+                if sessionResolvedFromTask {
+                    payload["session_inferred_from_job"] = true
+                }
+                result = .ok(payload)
 
             default:
                 let payloadText = self.v2AgentLimitedTailText(
@@ -5221,7 +5375,7 @@ class TerminalController {
                     lineLimit: requestedLines,
                     byteLimit: requestedBytes
                 )
-                result = .ok([
+                var payload: [String: Any] = [
                     "session_id": sessionId,
                     "job_id": taskId,
                     "mode": mode,
@@ -5232,22 +5386,30 @@ class TerminalController {
                     "tail_lines": payloadText.lines.count,
                     "bytes": payloadText.payloadBytes,
                     "event_cursor": self.v2AgentCurrentEventCursor()
-                ])
+                ]
+                if sessionResolvedFromTask {
+                    payload["session_inferred_from_job"] = true
+                }
+                result = .ok(payload)
             }
         }
         return result
     }
 
     private func v2AgentTaskCancel(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let bindingResolution = v2AgentResolvedTaskBinding(params: params)
+        let taskId: String
+        let session: AgentSession
+        let sessionResolvedFromTask: Bool
+        switch bindingResolution {
+        case .success(let resolved):
+            taskId = resolved.taskId
+            session = resolved.session
+            sessionResolvedFromTask = resolved.sessionResolvedFromTask
+        case .failure(let error):
+            return error
         }
-        guard let taskId = v2String(params, "job_id") ?? v2String(params, "task_id") else {
-            return .err(code: "invalid_params", message: "Missing job_id", data: nil)
-        }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to cancel task", data: nil)
         v2MainSync {
@@ -5263,7 +5425,8 @@ class TerminalController {
                     "session_id": sessionId,
                     "job_id": taskId,
                     "status": task.status.rawValue,
-                    "already_cancelled": true
+                    "already_cancelled": true,
+                    "session_inferred_from_job": sessionResolvedFromTask
                 ]
                 result = .ok(payload)
                 return
@@ -5273,7 +5436,8 @@ class TerminalController {
                     "session_id": sessionId,
                     "job_id": taskId,
                     "status": task.status.rawValue,
-                    "already_terminal": true
+                    "already_terminal": true,
+                    "session_inferred_from_job": sessionResolvedFromTask
                 ])
                 return
             }
@@ -5307,6 +5471,7 @@ class TerminalController {
                     "job_id": taskId,
                     "status": task.status.rawValue,
                     "interrupt_delivery": "pending_queue",
+                    "session_inferred_from_job": sessionResolvedFromTask,
                     "event_cursor": self.v2AgentCurrentEventCursor()
                 ])
                 return
@@ -5349,6 +5514,7 @@ class TerminalController {
                 "job_id": taskId,
                 "status": task.status.rawValue,
                 "interrupt_delivery": interruptDelivery,
+                "session_inferred_from_job": sessionResolvedFromTask,
                 "event_cursor": self.v2AgentCurrentEventCursor()
             ])
         }
@@ -5496,15 +5662,19 @@ class TerminalController {
     }
 
     private func v2AgentTaskWait(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
+        let bindingResolution = v2AgentResolvedTaskBinding(params: params)
+        let taskId: String
+        let session: AgentSession
+        let sessionResolvedFromTask: Bool
+        switch bindingResolution {
+        case .success(let resolved):
+            taskId = resolved.taskId
+            session = resolved.session
+            sessionResolvedFromTask = resolved.sessionResolvedFromTask
+        case .failure(let error):
+            return error
         }
-        guard let taskId = v2String(params, "job_id") ?? v2String(params, "task_id") else {
-            return .err(code: "invalid_params", message: "Missing job_id", data: nil)
-        }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
-        }
+        let sessionId = session.id
 
         let timeoutMs = max(0, v2Int(params, "timeout_ms") ?? 300_000)
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
@@ -5516,7 +5686,8 @@ class TerminalController {
                     completedResult = self.v2AgentTaskResultPayloadMain(
                         taskId: taskId,
                         session: session,
-                        includeTailLines: nil
+                        includeTailLines: nil,
+                        sessionResolvedFromTask: sessionResolvedFromTask
                     )
                 }
             }
@@ -5526,7 +5697,8 @@ class TerminalController {
             if Date() >= deadline {
                 return .err(code: "timeout", message: "Timed out waiting for task", data: [
                     "session_id": sessionId,
-                    "job_id": taskId
+                    "job_id": taskId,
+                    "session_inferred_from_job": sessionResolvedFromTask
                 ])
             }
             Thread.sleep(forTimeInterval: 0.1)
@@ -5534,14 +5706,17 @@ class TerminalController {
     }
 
     private func v2AgentTaskResult(params: [String: Any]) -> V2CallResult {
-        guard let sessionId = v2String(params, "session_id") else {
-            return .err(code: "invalid_params", message: "Missing session_id", data: nil)
-        }
-        guard let taskId = v2String(params, "job_id") ?? v2String(params, "task_id") else {
-            return .err(code: "invalid_params", message: "Missing job_id", data: nil)
-        }
-        guard let session = v2AgentSessions[sessionId] else {
-            return .err(code: "not_found", message: "Agent session not found", data: ["session_id": sessionId])
+        let bindingResolution = v2AgentResolvedTaskBinding(params: params)
+        let taskId: String
+        let session: AgentSession
+        let sessionResolvedFromTask: Bool
+        switch bindingResolution {
+        case .success(let resolved):
+            taskId = resolved.taskId
+            session = resolved.session
+            sessionResolvedFromTask = resolved.sessionResolvedFromTask
+        case .failure(let error):
+            return error
         }
 
         var result: V2CallResult = .err(code: "internal_error", message: "Failed to load task result", data: nil)
@@ -5549,7 +5724,8 @@ class TerminalController {
             result = self.v2AgentTaskResultPayloadMain(
                 taskId: taskId,
                 session: session,
-                includeTailLines: v2Int(params, "tail_lines")
+                includeTailLines: v2Int(params, "tail_lines"),
+                sessionResolvedFromTask: sessionResolvedFromTask
             )
         }
         return result
@@ -8333,6 +8509,68 @@ class TerminalController {
         return String(singleLine.prefix(48)) + "..."
     }
 
+    private func v2AgentResolvedPauseForUser(
+        params: [String: Any],
+        command: String,
+        profileName: String?,
+        executionClass: String?,
+        expectedPorts: [Int]
+    ) -> Bool {
+        if let explicit = v2Bool(params, "pause_for_user") {
+            return explicit
+        }
+        if v2HasNonNullParam(params, "pause_for_user") {
+            return false
+        }
+        return v2AgentShouldDefaultPauseForUser(
+            command: command,
+            profileName: profileName,
+            executionClass: executionClass,
+            expectedPorts: expectedPorts
+        )
+    }
+
+    // Default the user-gated contract for noisy managed tasks so MCP callers that
+    // cannot yet pass pause_for_user still stop after dispatch instead of auto-waiting.
+    private func v2AgentShouldDefaultPauseForUser(
+        command: String,
+        profileName: String?,
+        executionClass: String?,
+        expectedPorts: [Int]
+    ) -> Bool {
+        if !expectedPorts.isEmpty {
+            return true
+        }
+        if executionClass?.lowercased() == "local_verify" {
+            return true
+        }
+        if let profileName = profileName?.lowercased(),
+           ["verify.ts", "verify.flutter", "dev.web"].contains(profileName) {
+            return true
+        }
+
+        let normalized = command.lowercased()
+        let noisyPatterns = [
+            #"\b(?:cargo|swift)\s+(?:test|build)\b"#,
+            #"\bxcodebuild\b"#,
+            #"\bflutter\s+test\b"#,
+            #"\bpytest\b"#,
+            #"\b(?:vitest|jest)\b"#,
+            #"\b(?:bun|npm|pnpm|yarn)\s+(?:run\s+)?test\b"#,
+            #"\b(?:bun\s+x\s+tsc|tsc\b|check-types\b|typecheck\b|type-check\b)"#,
+            #"\b(?:bun|npm|pnpm|yarn)\s+install\b"#,
+            #"\bnpm\s+ci\b"#,
+            #"\bbun\s+add\b"#,
+            #"\b(?:migration|migrate|benchmark|bench)\b"#,
+            #"\b(?:bun|npm|pnpm|yarn)\s+run\s+(?:dev|start|serve|preview)\b"#,
+            #"\b(?:vite|next|astro)\s+(?:dev|start|serve|preview)\b"#,
+            #"\b(?:webpack(?:-dev-server)?|react-scripts)\s+(?:serve|start|watch)\b"#
+        ]
+        return noisyPatterns.contains { pattern in
+            normalized.range(of: pattern, options: .regularExpression) != nil
+        }
+    }
+
     private func v2AgentShellQuote(_ value: String) -> String {
         if value.range(of: "^[A-Za-z0-9_@%+=:,./-]+$", options: .regularExpression) != nil {
             return value
@@ -8350,6 +8588,7 @@ class TerminalController {
             "execution_class": v2OrNull(task.executionClass),
             "approval_state": v2OrNull(task.approvalState),
             "expected_ports": task.expectedPorts,
+            "pause_for_user": task.pauseForUser,
             "status": task.status.rawValue,
             "attempt": task.attempt,
             "window_id": v2OrNull(task.windowId?.uuidString),
@@ -9265,7 +9504,8 @@ class TerminalController {
     private func v2AgentTaskResultPayloadMain(
         taskId: String,
         session: AgentSession,
-        includeTailLines: Int?
+        includeTailLines: Int?,
+        sessionResolvedFromTask: Bool = false
     ) -> V2CallResult {
         guard let task = v2AgentTasks[taskId], task.sessionId == session.id else {
             return .err(code: "not_found", message: "Task not found", data: [
@@ -9276,6 +9516,9 @@ class TerminalController {
 
         var payload = v2AgentTaskPayload(task)
         payload["session_id"] = session.id
+        if sessionResolvedFromTask {
+            payload["session_inferred_from_job"] = true
+        }
         payload["event_cursor"] = v2AgentCurrentEventCursor()
 
         let detectedTool = v2AgentDetectedParser(command: task.command, output: "")

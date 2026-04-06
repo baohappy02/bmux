@@ -2988,13 +2988,16 @@ struct CMUXCLI {
 
     private func agentRunManyParams(
         from object: Any,
-        sessionId: String,
+        sessionId: String?,
         workspaceId: String?,
         surfaceId: String?,
         windowId: String?
     ) throws -> [String: Any] {
         let jobsPayload: [[String: Any]]
-        var params: [String: Any] = ["session_id": sessionId]
+        var params: [String: Any] = [:]
+        if let sessionId {
+            params["session_id"] = sessionId
+        }
 
         switch object {
         case let jobs as [[String: Any]]:
@@ -3006,7 +3009,9 @@ struct CMUXCLI {
             }
             jobsPayload = jobs
             params = dict
-            if params["session_id"] == nil { params["session_id"] = sessionId }
+            if params["session_id"] == nil, let sessionId {
+                params["session_id"] = sessionId
+            }
         default:
             throw CLIError(message: "agent run-many input must be a JSON array of jobs or an object containing jobs")
         }
@@ -3014,7 +3019,7 @@ struct CMUXCLI {
         if params["jobs"] == nil {
             params["jobs"] = jobsPayload
         }
-        if params["session_id"] == nil {
+        if params["session_id"] == nil, let sessionId {
             params["session_id"] = sessionId
         }
         if params["workspace_id"] == nil, let workspaceId {
@@ -5395,19 +5400,17 @@ struct CMUXCLI {
             let (cwdOpt, rem11) = parseOption(rem10, name: "--cwd")
             let (focusOpt, remaining) = parseOption(rem11, name: "--focus")
 
-            guard let sessionId = sessionOptA ?? sessionOptB else {
-                throw CLIError(message: "agent open requires --session <id>")
-            }
+            let sessionId = sessionOptA ?? sessionOptB
 
             let kind = (kindPositional ?? kindOpt ?? "terminal").lowercased()
             if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
                 throw CLIError(message: "agent open: unknown flag '\(unknown)'")
             }
             let positionalArgs = remaining.filter { !$0.hasPrefix("--") }
-            var params: [String: Any] = [
-                "session_id": sessionId,
-                "kind": kind
-            ]
+            var params: [String: Any] = ["kind": kind]
+            if let sessionId {
+                params["session_id"] = sessionId
+            }
 
             if let workspaceOpt,
                let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
@@ -5474,7 +5477,8 @@ struct CMUXCLI {
             let kindText = (payload["surface_kind"] as? String)
                 ?? ((payload["opened"] as? [String: Any])?["surface_kind"] as? String)
                 ?? kind
-            output(payload, fallback: "OK session=\(sessionId) surface=\(surfaceText) kind=\(kindText)")
+            let resolvedSessionId = (payload["session_id"] as? String) ?? sessionId ?? "unknown"
+            output(payload, fallback: "OK session=\(resolvedSessionId) surface=\(surfaceText) kind=\(kindText)")
 
         case "ensure":
             var effectiveArgs = subArgs
@@ -5501,9 +5505,7 @@ struct CMUXCLI {
             let (portOpt, rem14) = parseOption(rem13, name: "--port")
             let (focusOpt, remaining) = parseOption(rem14, name: "--focus")
 
-            guard let sessionId = sessionOptA ?? sessionOptB else {
-                throw CLIError(message: "agent ensure requires --session <id>")
-            }
+            let sessionId = sessionOptA ?? sessionOptB
             let target = (targetPositional ?? targetOptA ?? targetOptB)?.lowercased()
             guard let target, !target.isEmpty else {
                 throw CLIError(message: "agent ensure requires a target: terminal|browser|service|profile")
@@ -5512,10 +5514,10 @@ struct CMUXCLI {
                 throw CLIError(message: "agent ensure: unknown flag '\(unknown)'")
             }
 
-            var params: [String: Any] = [
-                "session_id": sessionId,
-                "target": target
-            ]
+            var params: [String: Any] = ["target": target]
+            if let sessionId {
+                params["session_id"] = sessionId
+            }
             if let workspaceOpt,
                let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
                 params["workspace_id"] = workspaceId
@@ -5603,20 +5605,21 @@ struct CMUXCLI {
             }
 
             let payload = try client.sendV2(method: "agent.ensure", params: params)
+            let resolvedSessionId = (payload["session_id"] as? String) ?? sessionId ?? "unknown"
             let created = (payload["created"] as? Bool) ?? false
             switch target {
             case "terminal", "browser":
                 let surfaceText = formatHandle(payload, kind: "surface", idFormat: idFormat) ?? "unknown"
-                output(payload, fallback: "OK session=\(sessionId) target=\(target) surface=\(surfaceText) created=\(created)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) target=\(target) surface=\(surfaceText) created=\(created)")
             case "service":
                 let port = intFromAny(payload["port"]) ?? (portOpt.flatMap(Int.init) ?? 0)
-                output(payload, fallback: "OK session=\(sessionId) target=service port=\(port) created=\(created)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) target=service port=\(port) created=\(created)")
             case "profile":
                 let groupId = (payload["group_id"] as? String) ?? "unknown"
                 let profile = (payload["profile"] as? String) ?? "unknown"
-                output(payload, fallback: "OK session=\(sessionId) target=profile group=\(groupId) profile=\(profile)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) target=profile group=\(groupId) profile=\(profile)")
             default:
-                output(payload, fallback: "OK session=\(sessionId) target=\(target) created=\(created)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) target=\(target) created=\(created)")
             }
 
         case "batch":
@@ -5935,9 +5938,7 @@ struct CMUXCLI {
                 let (cwdOpt, rem8) = parseOption(rem7, name: "--cwd")
                 let (pauseForUserOpt, remaining) = parseOption(rem8, name: "--pause-for-user")
 
-                guard let sessionId = sessionOptA ?? sessionOptB else {
-                    throw CLIError(message: "agent task run requires --session <id>")
-                }
+                let sessionId = sessionOptA ?? sessionOptB
                 if let unknown = remaining.first(where: { $0.hasPrefix("--") }) {
                     throw CLIError(message: "agent task run: unknown flag '\(unknown)'")
                 }
@@ -5946,7 +5947,10 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task run requires --cmd <command> or positional command")
                 }
 
-                var params: [String: Any] = ["session_id": sessionId, "command": command]
+                var params: [String: Any] = ["command": command]
+                if let sessionId {
+                    params["session_id"] = sessionId
+                }
                 if let workspaceOpt,
                    let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
                     params["workspace_id"] = workspaceId
@@ -5970,12 +5974,13 @@ struct CMUXCLI {
                 }
 
                 let payload = try client.sendV2(method: "agent.task.run", params: params)
+                let resolvedSessionId = (payload["session_id"] as? String) ?? sessionId ?? "unknown"
                 let taskPayload = payload["task"] as? [String: Any] ?? [:]
                 let jobId = (taskPayload["job_id"] as? String) ?? "unknown"
                 if (payload["paused_for_user"] as? Bool) == true {
-                    output(payload, fallback: "PAUSED session=\(sessionId) job=\(jobId) waiting_for_user=1")
+                    output(payload, fallback: "PAUSED session=\(resolvedSessionId) job=\(jobId) waiting_for_user=1")
                 } else {
-                    output(payload, fallback: "OK session=\(sessionId) job=\(jobId)")
+                    output(payload, fallback: "OK session=\(resolvedSessionId) job=\(jobId)")
                 }
 
             case "run-many":
@@ -5988,9 +5993,7 @@ struct CMUXCLI {
                 let (jobsFileOpt, rem6) = parseOption(rem5, name: "--jobs-file")
                 let (pauseForUserOpt, remaining) = parseOption(rem6, name: "--pause-for-user")
 
-                guard let sessionId = sessionOptA ?? sessionOptB else {
-                    throw CLIError(message: "agent task run-many requires --session <id>")
-                }
+                let sessionId = sessionOptA ?? sessionOptB
                 if jobsOpt != nil, jobsFileOpt != nil {
                     throw CLIError(message: "agent task run-many: use either --jobs or --jobs-file, not both")
                 }
@@ -6031,12 +6034,13 @@ struct CMUXCLI {
                 }
 
                 let payload = try client.sendV2(method: "agent.task.run_many", params: runManyParams)
+                let resolvedSessionId = (payload["session_id"] as? String) ?? sessionId ?? "unknown"
                 let groupId = (payload["group_id"] as? String) ?? "unknown"
                 let jobCount = intFromAny(payload["job_count"]) ?? 0
                 if (payload["paused_for_user"] as? Bool) == true {
-                    output(payload, fallback: "PAUSED session=\(sessionId) group=\(groupId) jobs=\(jobCount) waiting_for_user=1")
+                    output(payload, fallback: "PAUSED session=\(resolvedSessionId) group=\(groupId) jobs=\(jobCount) waiting_for_user=1")
                 } else {
-                    output(payload, fallback: "OK session=\(sessionId) group=\(groupId) jobs=\(jobCount)")
+                    output(payload, fallback: "OK session=\(resolvedSessionId) group=\(groupId) jobs=\(jobCount)")
                 }
 
             case "run-profile":
@@ -6048,9 +6052,7 @@ struct CMUXCLI {
                 let (profileOpt, rem5) = parseOption(rem4, name: "--profile")
                 let (pauseForUserOpt, remaining) = parseOption(rem5, name: "--pause-for-user")
 
-                guard let sessionId = sessionOptA ?? sessionOptB else {
-                    throw CLIError(message: "agent task run-profile requires --session <id>")
-                }
+                let sessionId = sessionOptA ?? sessionOptB
                 let profile = profileOpt ?? remaining.first
                 guard let profile, !profile.isEmpty else {
                     throw CLIError(message: "agent task run-profile requires --profile <name>")
@@ -6060,7 +6062,10 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task run-profile: unknown flag '\(unknown)'")
                 }
 
-                var params: [String: Any] = ["session_id": sessionId, "profile": profile]
+                var params: [String: Any] = ["profile": profile]
+                if let sessionId {
+                    params["session_id"] = sessionId
+                }
                 if let workspaceOpt,
                    let workspaceId = try normalizeWorkspaceHandle(workspaceOpt, client: client) {
                     params["workspace_id"] = workspaceId
@@ -6081,15 +6086,16 @@ struct CMUXCLI {
                 }
 
                 let payload = try client.sendV2(method: "agent.task.run_profile", params: params)
+                let resolvedSessionId = (payload["session_id"] as? String) ?? sessionId ?? "unknown"
                 if (payload["cached"] as? Bool) == true {
                     let summary = (payload["summary"] as? String) ?? "cached"
-                    output(payload, fallback: "OK session=\(sessionId) profile=\(profile) \(summary)")
+                    output(payload, fallback: "OK session=\(resolvedSessionId) profile=\(profile) \(summary)")
                 } else {
                     let groupId = (payload["group_id"] as? String) ?? "unknown"
                     if (payload["paused_for_user"] as? Bool) == true {
-                        output(payload, fallback: "PAUSED session=\(sessionId) group=\(groupId) profile=\(profile) waiting_for_user=1")
+                        output(payload, fallback: "PAUSED session=\(resolvedSessionId) group=\(groupId) profile=\(profile) waiting_for_user=1")
                     } else {
-                        output(payload, fallback: "OK session=\(sessionId) group=\(groupId) profile=\(profile)")
+                        output(payload, fallback: "OK session=\(resolvedSessionId) group=\(groupId) profile=\(profile)")
                     }
                 }
 
@@ -6103,9 +6109,6 @@ struct CMUXCLI {
                 let (bytesOpt, rem6) = parseOption(rem5, name: "--bytes")
                 let (cursorOpt, remaining) = parseOption(rem6, name: "--cursor")
 
-                guard let sessionId = sessionOptA ?? sessionOptB else {
-                    throw CLIError(message: "agent task logs requires --session <id>")
-                }
                 guard let jobId = jobOptA ?? jobOptB else {
                     throw CLIError(message: "agent task logs requires --job <id>")
                 }
@@ -6113,7 +6116,10 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task logs: unknown flag '\(unknown)'")
                 }
 
-                var params: [String: Any] = ["session_id": sessionId, "job_id": jobId]
+                var params: [String: Any] = ["job_id": jobId]
+                if let sessionId = sessionOptA ?? sessionOptB {
+                    params["session_id"] = sessionId
+                }
                 if let modeOpt { params["mode"] = modeOpt }
                 if let linesOpt {
                     guard let lines = Int(linesOpt), lines > 0 else {
@@ -6135,9 +6141,10 @@ struct CMUXCLI {
                 }
 
                 let payload = try client.sendV2(method: "agent.task.logs", params: params)
+                let resolvedSessionId = (payload["session_id"] as? String) ?? (sessionOptA ?? sessionOptB) ?? "unknown"
                 let status = (payload["status"] as? String) ?? "unknown"
                 let mode = (payload["mode"] as? String) ?? "tail"
-                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status) mode=\(mode)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) job=\(jobId) status=\(status) mode=\(mode)")
 
             case "cancel":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
@@ -6148,19 +6155,18 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task cancel: unknown flag '\(unknown)'")
                 }
 
-                guard let sessionId = sessionOptA ?? sessionOptB else {
-                    throw CLIError(message: "agent task cancel requires --session <id>")
-                }
                 guard let jobId = jobOptA ?? jobOptB else {
                     throw CLIError(message: "agent task cancel requires --job <id>")
                 }
 
-                let payload = try client.sendV2(method: "agent.task.cancel", params: [
-                    "session_id": sessionId,
-                    "job_id": jobId
-                ])
+                var params: [String: Any] = ["job_id": jobId]
+                if let sessionId = sessionOptA ?? sessionOptB {
+                    params["session_id"] = sessionId
+                }
+                let payload = try client.sendV2(method: "agent.task.cancel", params: params)
+                let resolvedSessionId = (payload["session_id"] as? String) ?? (sessionOptA ?? sessionOptB) ?? "unknown"
                 let status = (payload["status"] as? String) ?? "unknown"
-                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) job=\(jobId) status=\(status)")
 
             case "wait":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
@@ -6169,9 +6175,6 @@ struct CMUXCLI {
                 let (jobOptB, rem3) = parseOption(rem2, name: "--job-id")
                 let (timeoutMsOpt, remaining) = parseOption(rem3, name: "--timeout-ms")
 
-                guard let sessionId = sessionOptA ?? sessionOptB else {
-                    throw CLIError(message: "agent task wait requires --session <id>")
-                }
                 guard let jobId = jobOptA ?? jobOptB else {
                     throw CLIError(message: "agent task wait requires --job <id>")
                 }
@@ -6179,7 +6182,10 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task wait: unknown flag '\(unknown)'")
                 }
 
-                var params: [String: Any] = ["session_id": sessionId, "job_id": jobId]
+                var params: [String: Any] = ["job_id": jobId]
+                if let sessionId = sessionOptA ?? sessionOptB {
+                    params["session_id"] = sessionId
+                }
                 if let timeoutMsOpt {
                     guard let timeoutMs = Int(timeoutMsOpt), timeoutMs >= 0 else {
                         throw CLIError(message: "agent task wait: --timeout-ms must be >= 0")
@@ -6188,8 +6194,9 @@ struct CMUXCLI {
                 }
 
                 let payload = try client.sendV2(method: "agent.task.wait", params: params)
+                let resolvedSessionId = (payload["session_id"] as? String) ?? (sessionOptA ?? sessionOptB) ?? "unknown"
                 let status = (payload["status"] as? String) ?? "unknown"
-                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) job=\(jobId) status=\(status)")
 
             case "result":
                 let (sessionOptA, rem0) = parseOption(taskArgs, name: "--session")
@@ -6198,9 +6205,6 @@ struct CMUXCLI {
                 let (jobOptB, rem3) = parseOption(rem2, name: "--job-id")
                 let (tailLinesOpt, remaining) = parseOption(rem3, name: "--tail-lines")
 
-                guard let sessionId = sessionOptA ?? sessionOptB else {
-                    throw CLIError(message: "agent task result requires --session <id>")
-                }
                 guard let jobId = jobOptA ?? jobOptB else {
                     throw CLIError(message: "agent task result requires --job <id>")
                 }
@@ -6208,7 +6212,10 @@ struct CMUXCLI {
                     throw CLIError(message: "agent task result: unknown flag '\(unknown)'")
                 }
 
-                var params: [String: Any] = ["session_id": sessionId, "job_id": jobId]
+                var params: [String: Any] = ["job_id": jobId]
+                if let sessionId = sessionOptA ?? sessionOptB {
+                    params["session_id"] = sessionId
+                }
                 if let tailLinesOpt {
                     guard let tailLines = Int(tailLinesOpt), tailLines >= 0 else {
                         throw CLIError(message: "agent task result: --tail-lines must be >= 0")
@@ -6217,8 +6224,9 @@ struct CMUXCLI {
                 }
 
                 let payload = try client.sendV2(method: "agent.task.result", params: params)
+                let resolvedSessionId = (payload["session_id"] as? String) ?? (sessionOptA ?? sessionOptB) ?? "unknown"
                 let status = (payload["status"] as? String) ?? "unknown"
-                output(payload, fallback: "OK session=\(sessionId) job=\(jobId) status=\(status)")
+                output(payload, fallback: "OK session=\(resolvedSessionId) job=\(jobId) status=\(status)")
 
             default:
                 throw CLIError(message: "Unsupported agent task subcommand: \(taskSubcommand)")
@@ -9592,8 +9600,8 @@ struct CMUXCLI {
               attach [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
               layout --session <session-id> [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
               capabilities [--session <session-id>] [--window <id|ref|index>] [--workspace <id|ref|index>] [--surface <id|ref|index>]
-              open <terminal|browser|markdown> --session <session-id> [--split <left|right|up|down>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--url <url>] [--path <file>] [--cwd <path>] [--focus <true|false>]
-              ensure <terminal|browser|service|profile> --session <session-id> [--split <left|right|up|down>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--url <url>] [--cwd <path>] [--profile <name>] [--port <port>] [--focus <true|false>]
+              open <terminal|browser|markdown> [--session <session-id>] [--split <left|right|up|down>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--url <url>] [--path <file>] [--cwd <path>] [--focus <true|false>]
+              ensure <terminal|browser|service|profile> [--session <session-id>] [--split <left|right|up|down>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--url <url>] [--cwd <path>] [--profile <name>] [--port <port>] [--focus <true|false>]
               batch --session <session-id> (--json '<payload>' | --file <path> | <json-payload>) [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--continue-on-error <true|false>]
               focus --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
               close --session <session-id> [--surface <id|ref|index>] [--workspace <id|ref|index>] [--window <id|ref|index>]
@@ -9601,13 +9609,13 @@ struct CMUXCLI {
               terminal write --session <session-id> [--surface <id|ref|index>] [--text <text> | <text>]
               terminal capture --session <session-id> [--surface <id|ref|index>] [--mode tail|full|delta] [--lines <n>] [--scrollback <true|false>]
               terminal wait --session <session-id> [--surface <id|ref|index>] [--state prompt|running] [--timeout-ms <ms>]
-              task run --session <session-id> [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--pause-for-user <true|false>] [--cmd <command> | <command>]
-              task run-many --session <session-id> (--jobs '<json>' | --jobs-file <path> | <json>) [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--pause-for-user <true|false>]
-              task run-profile --session <session-id> [--pause-for-user <true|false>] --profile <name>
-              task logs --session <session-id> --job <job-id> [--mode tail|delta|path-only] [--lines <n>] [--bytes <n>] [--cursor <n>]
-              task cancel --session <session-id> --job <job-id>
-              task wait --session <session-id> --job <job-id> [--timeout-ms <ms>]
-              task result --session <session-id> --job <job-id> [--tail-lines <n>]
+              task run [--session <session-id>] [--label <text>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>] [--pause-for-user <true|false>] [--cmd <command> | <command>]
+              task run-many [--session <session-id>] (--jobs '<json>' | --jobs-file <path> | <json>) [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>] [--pause-for-user <true|false>]
+              task run-profile [--session <session-id>] [--pause-for-user <true|false>] --profile <name>
+              task logs [--session <session-id>] --job <job-id> [--mode tail|delta|path-only] [--lines <n>] [--bytes <n>] [--cursor <n>]
+              task cancel [--session <session-id>] --job <job-id>
+              task wait [--session <session-id>] --job <job-id> [--timeout-ms <ms>]
+              task result [--session <session-id>] --job <job-id> [--tail-lines <n>]
               events --session <session-id> [--since <cursor>] [--limit <n>]
               state summary --session <session-id> [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
               artifact list --session <session-id> [--job <job-id>] [--workspace <id|ref|index>] [--surface <id|ref|index>] [--window <id|ref|index>]
@@ -9641,12 +9649,12 @@ struct CMUXCLI {
               - `attach` creates a lightweight bmux agent session and returns focused context.
               - `layout` returns a compact split tree for the selected workspace.
               - `capabilities` returns backend, environment, and preference metadata.
-              - `open` opens a compact agent-managed terminal/browser/markdown surface.
-              - `ensure` reuses existing surfaces/services when possible and only creates new ones when needed.
+              - `open` opens a compact agent-managed terminal/browser/markdown surface. When `--session` is omitted, bmux auto-attaches to the current focus first.
+              - `ensure` reuses existing surfaces/services when possible and only creates new ones when needed. When `--session` is omitted, bmux auto-attaches to the current focus first.
               - `batch` runs compact multi-step plans in one round-trip.
               - `surface-read` returns a compact metadata snapshot for the target surface.
               - `terminal` wraps low-token terminal input/capture/wait primitives.
-              - `task` runs managed shell commands or named profiles in bmux terminals and returns compact status.
+              - `task` runs managed shell commands or named profiles in bmux terminals and returns compact status. `task run|run-many|run-profile` can omit `--session` to auto-attach current focus, and `task wait|result|logs|cancel` can resolve the session from `--job` when needed.
               - `task ... --pause-for-user true` starts noisy work but returns a compact wait-for-user contract instead of encouraging immediate log ingestion.
               - `events` streams cursor-based task and service events.
               - `state summary` returns the minimal server-side memory Codex needs to resume work cheaply.

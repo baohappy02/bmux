@@ -1493,6 +1493,99 @@ final class WorkspaceTerminalConfigInheritanceSelectionTests: XCTestCase {
 
 
 @MainActor
+final class WorkspaceTerminalCloseRedrawTests: XCTestCase {
+    private func makeWindow() -> NSWindow {
+        NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+    }
+
+    private func waitForCondition(
+        timeout: TimeInterval = 2,
+        pollInterval: TimeInterval = 0.01,
+        _ condition: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() {
+                return true
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(pollInterval))
+        }
+        return condition()
+    }
+
+    func testClosingSplitPaneRedrawsSurvivingTerminal() throws {
+#if DEBUG
+        let workspace = Workspace()
+        guard let leftPanelId = workspace.focusedPanelId,
+              let leftPanel = workspace.terminalPanel(for: leftPanelId),
+              let rightPanel = workspace.newTerminalSplit(from: leftPanelId, orientation: .horizontal) else {
+            XCTFail("Expected split terminal panels")
+            return
+        }
+
+        let window = makeWindow()
+        defer { window.orderOut(nil) }
+        let contentView = try XCTUnwrap(window.contentView, "Expected content view")
+
+        leftPanel.hostedView.frame = NSRect(x: 0, y: 0, width: 180, height: 220)
+        rightPanel.hostedView.frame = NSRect(x: 180, y: 0, width: 180, height: 220)
+        contentView.addSubview(leftPanel.hostedView)
+        contentView.addSubview(rightPanel.hostedView)
+
+        leftPanel.hostedView.setVisibleInUI(true)
+        rightPanel.hostedView.setVisibleInUI(true)
+        leftPanel.hostedView.setActive(false)
+        rightPanel.hostedView.setActive(true)
+
+        window.makeKeyAndOrderFront(nil)
+        window.displayIfNeeded()
+        contentView.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(
+            waitForCondition {
+                leftPanel.surface.surface != nil && rightPanel.surface.surface != nil
+            },
+            "Expected both split terminals to materialize runtime surfaces"
+        )
+
+        GhosttySurfaceScrollView.resetDrawStats()
+        let baseline = leftPanel.hostedView.debugRenderStats()
+
+        XCTAssertTrue(workspace.closePanel(rightPanel.id), "Expected split close to succeed")
+        XCTAssertTrue(
+            waitForCondition {
+                workspace.panels[rightPanel.id] == nil
+            },
+            "Expected closed split pane to be removed from the workspace"
+        )
+
+        rightPanel.hostedView.removeFromSuperview()
+        leftPanel.hostedView.frame = contentView.bounds
+        contentView.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+
+        XCTAssertTrue(
+            waitForCondition(timeout: 2.5) {
+                contentView.layoutSubtreeIfNeeded()
+                window.displayIfNeeded()
+                let stats = leftPanel.hostedView.debugRenderStats()
+                return stats.drawCount > baseline.drawCount || stats.presentCount > baseline.presentCount
+            },
+            "Expected surviving terminal to redraw after a sibling split pane closes"
+        )
+#else
+        throw XCTSkip("Debug-only regression test")
+#endif
+    }
+}
+
+
+@MainActor
 final class WorkspaceAttentionFlashTests: XCTestCase {
     func testMoveFocusDoesNotTriggerWholePaneFlashTokenWhenWholePaneModeEnabled() {
         let defaults = UserDefaults.standard

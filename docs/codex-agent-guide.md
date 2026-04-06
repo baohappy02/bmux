@@ -21,6 +21,16 @@ Use `agent.*` first. Use legacy `list-*` and full browser snapshots only for deb
 6. `bmux agent events --session <sid> --since <cursor> --json`
 7. `bmux agent state summary --session <sid> --json`
 
+For one-shot task dispatch, `attach` is optional:
+
+```bash
+bmux agent task run --pause-for-user true --cmd "cargo test" --json
+```
+
+When `--session` is omitted on `open`, `ensure`, `task run`, `task run-many`, or `task run-profile`, bmux auto-attaches to the current focus and returns `session_id` in the payload.
+After that, `task wait`, `task result`, `task logs`, and `task cancel` can be called with `--job` alone when the session is not already cached by the caller.
+For noisy commands, bmux may also pause by default; if the payload comes back with `paused_for_user: true`, stop and do not auto-wait.
+
 ## Skill Loop
 
 ```bash
@@ -42,7 +52,7 @@ Rules:
 ## Verify Loop
 
 ```bash
-bmux agent task run-profile --session <sid> verify.ts --json
+bmux agent task run-profile --session <sid> --pause-for-user false verify.ts --json
 bmux agent task wait --session <sid> --job-id <job> --json
 bmux agent task result --session <sid> --job-id <job> --json
 ```
@@ -62,8 +72,8 @@ When the command is large or noisy and the user wants to inspect the terminal fi
 start it with a pause contract instead of immediately pulling logs back into the model:
 
 ```bash
-bmux agent task run --session <sid> --pause-for-user true --cmd "cargo test" --json
-bmux agent task run-profile --session <sid> --pause-for-user true verify.ts --json
+bmux agent task run --pause-for-user true --cmd "cargo test" --json
+bmux agent task run-profile --pause-for-user true verify.ts --json
 ```
 
 The response should stay compact and machine-readable:
@@ -74,6 +84,7 @@ The response should stay compact and machine-readable:
 
 After that, stop and wait for the user.
 Only fetch `task result`, a targeted tail, or logs after the user says to continue or provides a failure snippet.
+Do not call `task wait` against a paused payload unless the user explicitly redirected you to continue unattended.
 
 ## Dev Server Loop
 
