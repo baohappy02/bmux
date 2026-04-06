@@ -668,6 +668,20 @@ class TabManager: ObservableObject {
         let executionError: String?
     }
 
+    struct RepoDependencyBootstrapStatus: Equatable {
+        let repoRoot: String
+        let state: String
+        let dependencyCount: Int?
+        let unresolvedCount: Int?
+        let lockfileCount: Int?
+        let manifestPath: String?
+        let storeRoot: String?
+        let storeWritable: Bool?
+        let helperAvailable: Bool?
+        let lastError: String?
+        let warning: String?
+    }
+
     private struct WorkspaceGitProbeKey: Hashable {
         let workspaceId: UUID
         let panelId: UUID
@@ -712,6 +726,8 @@ class TabManager: ObservableObject {
     private static let selectedWorkspaceGitMetadataPollInterval: TimeInterval = 5
     private nonisolated static let workspacePullRequestProbeTimeout: TimeInterval = 5.0
     private nonisolated static let dependencyBootstrapTimeout: TimeInterval = 120.0
+    private nonisolated static let dependencyBootstrapStatusTimeout: TimeInterval = 5.0
+    private nonisolated static let dependencyBootstrapDoctorTimeout: TimeInterval = 5.0
     private nonisolated static let bmuxIndexStatusTimeout: TimeInterval = 15.0
     private nonisolated static let bmuxIndexWarmTimeout: TimeInterval = 120.0
     private nonisolated static let dependencyBootstrapQueue = DispatchQueue(
@@ -2323,31 +2339,69 @@ class TabManager: ObservableObject {
     }
 
     private nonisolated static func bmuxIndexState(from output: String?) -> String? {
-        guard let output else { return nil }
+        guard let payload = jsonObject(from: output) else {
+            guard let output else { return nil }
+            for line in output.split(whereSeparator: \.isNewline) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.hasPrefix("state:") {
+                    return trimmed.replacingOccurrences(of: "state:", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                }
+                if trimmed.hasPrefix("index_state:") {
+                    return trimmed.replacingOccurrences(of: "index_state:", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                }
+            }
+            return nil
+        }
 
-        if let data = output.data(using: .utf8),
-           let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let state = ((payload["state"] as? String) ?? (payload["index_state"] as? String))?
+        if let state = ((payload["state"] as? String) ?? (payload["index_state"] as? String))?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !state.isEmpty {
             return state.lowercased()
         }
 
-        for line in output.split(whereSeparator: \.isNewline) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.hasPrefix("state:") {
-                return trimmed.replacingOccurrences(of: "state:", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-            }
-            if trimmed.hasPrefix("index_state:") {
-                return trimmed.replacingOccurrences(of: "index_state:", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .lowercased()
-            }
+        return nil
+    }
+
+    private nonisolated static func jsonObject(from output: String?) -> [String: Any]? {
+        guard let output,
+              let data = output.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return payload
+    }
+
+    private nonisolated static func dependencyBootstrapWarning(
+        state: String,
+        unresolvedCount: Int?,
+        storeWritable: Bool?,
+        helperAvailable: Bool?,
+        lastError: String?
+    ) -> String? {
+        if let lastError,
+           !lastError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return lastError
         }
 
-        return nil
+        var components: [String] = []
+        if state != "warm" {
+            components.append("repo status \(state)")
+        }
+        if let unresolvedCount,
+           unresolvedCount > 0 {
+            components.append("\(unresolvedCount) unresolved dependencies")
+        }
+        if storeWritable == false {
+            components.append("dependency store not writable")
+        }
+        if helperAvailable == false {
+            components.append("fingerprint helper unavailable")
+        }
+        return components.isEmpty ? nil : components.joined(separator: "; ")
     }
 
     private nonisolated static func runCommand(
@@ -2436,22 +2490,134 @@ class TabManager: ObservableObject {
         )
     }
 
+    nonisolated static func bmuxDepsRepositoryStatus(repoRoot: String) -> RepoDependencyBootstrapStatus? {
+        let normalizedRepoRoot = NSString(string: repoRoot).standardizingPath
+        guard let executablePath = resolvedDependencyBootstrapPath() else {
+            return nil
+        }
+
+        let statusResult = runCommandResult(
+            directory: normalizedRepoRoot,
+            executable: executablePath,
+            arguments: ["status", "--repo", normalizedRepoRoot, "--json"],
+            timeout: dependencyBootstrapStatusTimeout
+        )
+
+        guard let statusResult else {
+            return RepoDependencyBootstrapStatus(
+                repoRoot: normalizedRepoRoot,
+                state: "error",
+                dependencyCount: nil,
+                unresolvedCount: nil,
+                lockfileCount: nil,
+                manifestPath: nil,
+                storeRoot: nil,
+                storeWritable: nil,
+                helperAvailable: nil,
+                lastError: "failed to run bmux-deps status",
+                warning: "failed to run bmux-deps status"
+            )
+        }
+
+        let statusError: String? = {
+            if statusResult.timedOut {
+                return "bmux-deps status timed out"
+            }
+            if let executionError = statusResult.executionError,
+               !executionError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return executionError
+            }
+            if statusResult.exitStatus != 0 {
+                let stderr = statusResult.stderr?.trimmingCharacters(in: .whitespacesAndNewlines)
+                return (stderr?.isEmpty == false) ? stderr : "bmux-deps status exited with \(statusResult.exitStatus ?? -1)"
+            }
+            return nil
+        }()
+
+        guard statusError == nil,
+              let statusPayload = jsonObject(from: statusResult.stdout) else {
+            return RepoDependencyBootstrapStatus(
+                repoRoot: normalizedRepoRoot,
+                state: "error",
+                dependencyCount: nil,
+                unresolvedCount: nil,
+                lockfileCount: nil,
+                manifestPath: nil,
+                storeRoot: nil,
+                storeWritable: nil,
+                helperAvailable: nil,
+                lastError: statusError ?? "bmux-deps status returned invalid JSON",
+                warning: statusError ?? "bmux-deps status returned invalid JSON"
+            )
+        }
+
+        let state = ((statusPayload["state"] as? String) ?? "unknown")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let dependencyCount = statusPayload["dependencyCount"] as? Int
+        let unresolvedCount = statusPayload["unresolvedCount"] as? Int
+        let lockfileCount = (statusPayload["lockfiles"] as? [[String: Any]])?.count
+        let manifestPath = statusPayload["manifestPath"] as? String
+        let storeRoot = statusPayload["storeRoot"] as? String
+
+        var storeWritable: Bool?
+        var helperAvailable: Bool?
+        if state != "warm" {
+            let doctorResult = runCommandResult(
+                directory: normalizedRepoRoot,
+                executable: executablePath,
+                arguments: ["doctor", "--repo", normalizedRepoRoot, "--json"],
+                timeout: dependencyBootstrapDoctorTimeout
+            )
+            if let doctorResult,
+               doctorResult.exitStatus == 0,
+               !doctorResult.timedOut,
+               let doctorPayload = jsonObject(from: doctorResult.stdout) {
+                storeWritable = doctorPayload["storeWritable"] as? Bool
+                helperAvailable = doctorPayload["helperAvailable"] as? Bool
+            }
+        }
+
+        let warning = dependencyBootstrapWarning(
+            state: state,
+            unresolvedCount: unresolvedCount,
+            storeWritable: storeWritable,
+            helperAvailable: helperAvailable,
+            lastError: nil
+        )
+
+        return RepoDependencyBootstrapStatus(
+            repoRoot: normalizedRepoRoot,
+            state: state,
+            dependencyCount: dependencyCount,
+            unresolvedCount: unresolvedCount,
+            lockfileCount: lockfileCount,
+            manifestPath: manifestPath,
+            storeRoot: storeRoot,
+            storeWritable: storeWritable,
+            helperAvailable: helperAvailable,
+            lastError: nil,
+            warning: warning
+        )
+    }
+
     private func scheduleDependencyBootstrapIfNeeded(directory: String) {
         let normalizedDirectory = normalizeDirectory(directory)
-        guard Self.dependencyBootstrapInFlightDirectories.insert(normalizedDirectory).inserted else {
+        let targetDirectory = Self.repositoryRoot(startingAt: normalizedDirectory) ?? normalizedDirectory
+        guard Self.dependencyBootstrapInFlightDirectories.insert(targetDirectory).inserted else {
             return
         }
 
         let runner = dependencyBootstrapRunner
 #if DEBUG
-        dlog("workspace.deps.ensure.schedule dir=\(normalizedDirectory)")
+        dlog("workspace.deps.ensure.schedule dir=\(targetDirectory)")
 #endif
         Self.dependencyBootstrapQueue.async {
-            runner(normalizedDirectory)
+            runner(targetDirectory)
             Task { @MainActor in
-                Self.dependencyBootstrapInFlightDirectories.remove(normalizedDirectory)
+                Self.dependencyBootstrapInFlightDirectories.remove(targetDirectory)
 #if DEBUG
-                dlog("workspace.deps.ensure.finish dir=\(normalizedDirectory)")
+                dlog("workspace.deps.ensure.finish dir=\(targetDirectory)")
 #endif
             }
         }
@@ -3257,6 +3423,9 @@ class TabManager: ObservableObject {
                 reason: "directoryChange"
             )
             if let nextDirectory {
+                if Self.repositoryRoot(startingAt: nextDirectory) != nil {
+                    scheduleDependencyBootstrapIfNeeded(directory: nextDirectory)
+                }
                 scheduleBmuxIndexWarmIfPossible(
                     directory: nextDirectory,
                     reason: "directoryChange"

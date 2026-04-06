@@ -16,7 +16,7 @@ Run the setup script to initialize submodules and build GhosttyKit:
 
 - When bmux opens or switches to a project repo, it should keep one long-lived `bmux-index serve` session and call `bmux-index prepare` as a non-blocking warmup step.
 - Do not treat `bmux-index status` as a required gate for repo-scoped reads. For `route`, `search`, `search_many`, `symbols`, `context`, `impact`, `trace`, `refs`, `rename`, `changes`, and `module`, call the read path directly and let `bmux-index` auto-index if the local index is `missing` or `stale`.
-- Use `status` as telemetry or diagnostics only.
+- Use `status` as telemetry or diagnostics only. Dirty tracked or untracked worktree counts are noisy in normal development and should not block indexed reads.
 - Re-warm on repo switch or when freshness inputs drift enough to stale the index, such as branch switches, large checkouts, or source fingerprint changes, but keep normal indexed reads on the direct read path.
 
 ## Local dev
@@ -186,7 +186,8 @@ The app has a **Debug** menu in the macOS menu bar (only in DEBUG builds). Use i
 ## Testing policy
 
 - **E2E / UI tests:** trigger via `gh workflow run test-e2e.yml` (see cmuxterm-hq CLAUDE.md for details)
-- **Unit tests:** `xcodebuild -scheme cmux-unit` is safe (no app launch) and may be run locally when needed
+- **Unit tests:** prefer `./scripts/test-unit.sh` for local runs. It wraps `xcodebuild -scheme bmux-unit`.
+- **Raw local xcodebuild:** not a trustworthy first diagnostic in restricted or sandboxed environments. DerivedData, module cache, and SwiftPM permission failures can mask the real code issue. If you must invoke `xcodebuild` directly, use an explicit writable `-derivedDataPath` and treat cache/permission failures as environment noise first.
 - **Python socket tests (tests_v2/):** these connect to a running cmux instance's socket. Never launch an untagged `cmux DEV.app` to run them. If you must test locally, use a tagged build's socket (`/tmp/cmux-debug-<tag>.sock`) with `CMUX_SOCKET=/tmp/cmux-debug-<tag>.sock`
 - **Never `open` an untagged `cmux DEV.app`** from DerivedData. It conflicts with the user's running debug instance.
 

@@ -3624,6 +3624,7 @@ class TerminalController {
 #endif
 
         let workingDirectory = v2AgentWorkspaceDirectory(context: context)
+        let repoRoot = v2AgentRepositoryRoot(startingAt: workingDirectory)
 #if DEBUG
         dlog("agent.capabilities.after_cwd cwd=\(workingDirectory ?? "nil")")
 #endif
@@ -3639,7 +3640,7 @@ class TerminalController {
         dlog("agent.capabilities.after_environment repo=\((environment["repo_root"] as? String) ?? "nil") cwd=\((environment["cwd"] as? String) ?? "nil")")
 #endif
         let preferences = v2AgentUserPreferences(inferredPackageManager: packageManager)
-        let runtimeHelpers = v2AgentRuntimeHelpersSnapshot()
+        let runtimeHelpers = v2AgentRuntimeHelpersSnapshot(repoRoot: repoRoot)
 
 #if DEBUG
         dlog("agent.capabilities cwd=\(workingDirectory ?? "nil") repo=\((environment["repo_root"] as? String) ?? "nil")")
@@ -3674,7 +3675,8 @@ class TerminalController {
                 "guidance": [
                     "bmux-index is the local repo and artifact intelligence lane, not web search.",
                     "Use agent.code.route for rough task descriptions so bmux-index can return prepare plus the next indexed command.",
-                    "Treat missing or stale index status as telemetry only; repo-scoped reads must continue after a non-blocking prepare.",
+                    "Treat missing, stale, or dirty-worktree index status as telemetry only; repo-scoped reads must continue after a non-blocking prepare.",
+                    "Dirty or untracked worktree counts are normal in active dev repos and should not block indexed reads.",
                     "Send screenshots, PDFs, and docs through agent.code.artifact_extract or agent.code.artifact_search before repo retrieval."
                 ]
             ],
@@ -3686,6 +3688,7 @@ class TerminalController {
             "runtime_helper_drift_detected": runtimeHelpers.driftDetected,
             "task_execution_guidance": [
                 "Prefer agent.task.run or agent.task.run_profile for build, test, verify, typecheck, install, migration, benchmark, and dev-server commands.",
+                "Prefer repo wrappers or bmux-managed tasks over raw xcodebuild when available; local xcodebuild failures often come from sandbox, DerivedData, or cache permissions instead of the real code issue.",
                 "For one-shot work, agent.open, agent.ensure, agent.task.run, agent.task.run_many, and agent.task.run_profile can omit session_id; bmux will auto-attach to the current focus and return session_id in the payload.",
                 "Use agent.task.result as the default success channel. Only read agent.task.logs on failure, timeout, or explicit user request.",
                 "When a command is noisy and the user may want to inspect the terminal, bmux defaults pause_for_user=true unless the caller explicitly overrides it; stop until the user follows up."
@@ -5796,9 +5799,10 @@ class TerminalController {
         let effectiveSession = withV2AgentState({ v2AgentSessions[sessionId] }) ?? session
 
         let workingDirectory = v2AgentWorkspaceDirectory(context: context)
+        let repoRoot = v2AgentRepositoryRoot(startingAt: workingDirectory)
         let packageManager = v2AgentInferredPackageManager(startingAt: workingDirectory)
         let preferences = v2AgentUserPreferences(inferredPackageManager: packageManager)
-        let runtimeHelpers = v2AgentRuntimeHelpersSnapshot()
+        let runtimeHelpers = v2AgentRuntimeHelpersSnapshot(repoRoot: repoRoot)
         let mainSnapshot = v2MainSync {
             (
                 activeDevServer: v2AgentActiveDevServer(sessionId: sessionId, workspace: context.workspace),
@@ -6661,16 +6665,22 @@ class TerminalController {
         TabManager.bmuxIndexRuntimeHelperInfo().resolvedPath
     }
 
-    private func v2AgentRuntimeHelpersSnapshot() -> (payload: [String: Any], warnings: [String], driftDetected: Bool) {
+    private func v2AgentRuntimeHelpersSnapshot(
+        repoRoot: String? = nil
+    ) -> (payload: [String: Any], warnings: [String], driftDetected: Bool) {
         let helpers: [(String, TabManager.RuntimeHelperInfo)] = [
             ("bmux_index", TabManager.bmuxIndexRuntimeHelperInfo()),
             ("bmux_deps", TabManager.bmuxDepsRuntimeHelperInfo()),
         ]
+        let bmuxDepsRepoStatus = repoRoot.flatMap { TabManager.bmuxDepsRepositoryStatus(repoRoot: $0) }
         let payload = Dictionary(uniqueKeysWithValues: helpers.map { key, info in
-            (key, v2AgentRuntimeHelperPayload(info))
+            (key, v2AgentRuntimeHelperPayload(info, repoRoot: repoRoot, bmuxDepsRepoStatus: bmuxDepsRepoStatus))
         })
-        let warnings = helpers.compactMap { _, info in
+        var warnings = helpers.compactMap { _, info in
             info.warning.map { "\(info.name): \($0)" }
+        }
+        if let warning = bmuxDepsRepoStatus?.warning {
+            warnings.append("bmux-deps: \(warning)")
         }
         let driftDetected = helpers.contains { _, info in
             info.pathMismatch || info.newerExternalCandidateAvailable
@@ -6678,8 +6688,12 @@ class TerminalController {
         return (payload, warnings, driftDetected)
     }
 
-    private func v2AgentRuntimeHelperPayload(_ info: TabManager.RuntimeHelperInfo) -> [String: Any] {
-        [
+    private func v2AgentRuntimeHelperPayload(
+        _ info: TabManager.RuntimeHelperInfo,
+        repoRoot: String?,
+        bmuxDepsRepoStatus: TabManager.RepoDependencyBootstrapStatus?
+    ) -> [String: Any] {
+        var payload: [String: Any] = [
             "name": info.name,
             "role": info.role,
             "resolved_path": v2OrNull(info.resolvedPath),
@@ -6691,6 +6705,33 @@ class TerminalController {
             "external_candidate_source": v2OrNull(info.externalCandidateSource),
             "newer_external_candidate_available": info.newerExternalCandidateAvailable,
             "warning": v2OrNull(info.warning)
+        ]
+        if info.name == "bmux-deps" {
+            payload["repo_status"] = v2OrNull(
+                bmuxDepsRepoStatus.map { status in
+                    v2AgentBmuxDepsRepoStatusPayload(status, fallbackRepoRoot: repoRoot)
+                }
+            )
+        }
+        return payload
+    }
+
+    private func v2AgentBmuxDepsRepoStatusPayload(
+        _ status: TabManager.RepoDependencyBootstrapStatus,
+        fallbackRepoRoot: String?
+    ) -> [String: Any] {
+        [
+            "repo_root": status.repoRoot.isEmpty ? v2OrNull(fallbackRepoRoot) : status.repoRoot,
+            "state": status.state,
+            "dependency_count": v2OrNull(status.dependencyCount),
+            "unresolved_count": v2OrNull(status.unresolvedCount),
+            "lockfile_count": v2OrNull(status.lockfileCount),
+            "manifest_path": v2OrNull(status.manifestPath),
+            "store_root": v2OrNull(status.storeRoot),
+            "store_writable": v2OrNull(status.storeWritable),
+            "helper_available": v2OrNull(status.helperAvailable),
+            "last_error": v2OrNull(status.lastError),
+            "warning": v2OrNull(status.warning)
         ]
     }
 

@@ -756,6 +756,46 @@ final class TabManagerPullRequestProbeTests: XCTestCase {
         wait(for: [idleExpectation], timeout: 0.3)
     }
 
+    func testUpdateSurfaceDirectoryInsideRepositorySchedulesDependencyBootstrapForRepoRoot() throws {
+        let fileManager = FileManager.default
+        let repoURL = fileManager.temporaryDirectory.appendingPathComponent(
+            "cmux-deps-directory-change-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let nestedURL = repoURL.appendingPathComponent("Sources", isDirectory: true)
+        try fileManager.createDirectory(at: nestedURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(
+            at: repoURL.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? fileManager.removeItem(at: repoURL) }
+
+        let bootstrapExpectation = expectation(description: "dependency bootstrap invoked after directory change")
+        var capturedDirectories: [String] = []
+        let manager = TabManager(
+            dependencyBootstrapRunner: { directory in
+                capturedDirectories.append(directory)
+                bootstrapExpectation.fulfill()
+            },
+            bmuxIndexWarmRunner: { _ in }
+        )
+
+        guard let workspace = manager.selectedWorkspace,
+              let panelId = workspace.focusedPanelId else {
+            XCTFail("Expected selected workspace with focused panel")
+            return
+        }
+
+        manager.updateSurfaceDirectory(
+            tabId: workspace.id,
+            surfaceId: panelId,
+            directory: nestedURL.path
+        )
+
+        wait(for: [bootstrapExpectation], timeout: 1.0)
+        XCTAssertEqual(capturedDirectories, [repoURL.standardizedFileURL.path])
+    }
+
     func testRunningChildTerminalsPublishSidebarStatusSummaryAndDetail() {
         let manager = TabManager()
         guard let workspace = manager.selectedWorkspace,

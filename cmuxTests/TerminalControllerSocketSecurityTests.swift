@@ -443,6 +443,18 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertEqual(managedTaskDefaults["logs_on_success"] as? String, "avoid")
         XCTAssertEqual(managedTaskDefaults["logs_on_failure"] as? String, "on_demand")
         XCTAssertEqual(managedTaskDefaults["pause_for_user_for_noisy_commands"] as? Bool, true)
+        let codeIntelligence = try XCTUnwrap(result["code_intelligence"] as? [String: Any])
+        let codeGuidance = try XCTUnwrap(codeIntelligence["guidance"] as? [String])
+        XCTAssertTrue(
+            codeGuidance.contains { $0.localizedCaseInsensitiveContains("dirty") && $0.localizedCaseInsensitiveContains("telemetry") }
+        )
+        let taskExecutionGuidance = try XCTUnwrap(result["task_execution_guidance"] as? [String])
+        XCTAssertTrue(
+            taskExecutionGuidance.contains {
+                $0.localizedCaseInsensitiveContains("xcodebuild")
+                    && $0.localizedCaseInsensitiveContains("repo wrappers")
+            }
+        )
 
         let summaryResponse = try sendV2Request(
             method: "agent.state.summary",
@@ -456,6 +468,89 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
         XCTAssertNotNil(summaryRuntimeHelpers["bmux_deps"])
         XCTAssertNotNil(summary["runtime_helper_warnings"] as? [String])
         XCTAssertNotNil(summary["runtime_helper_drift_detected"] as? Bool)
+    }
+
+    func testAgentCapabilitiesSurfaceBmuxDepsRepoStatusAndWarnings() throws {
+        let socketPath = makeSocketPath("deps-state")
+        let repoURL = try makeFakeRepository(named: "bmux-deps-state")
+        let fakeDeps = try makeFakeBmuxDepsScript(for: repoURL)
+        defer {
+            try? FileManager.default.removeItem(at: repoURL.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fakeDeps.scriptURL)
+            try? FileManager.default.removeItem(at: fakeDeps.logURL)
+        }
+
+        let previousDepsPath = ProcessInfo.processInfo.environment["BMUX_DEPS_CLI"]
+        setenv("BMUX_DEPS_CLI", fakeDeps.scriptURL.path, 1)
+        defer {
+            if let previousDepsPath {
+                setenv("BMUX_DEPS_CLI", previousDepsPath, 1)
+            } else {
+                unsetenv("BMUX_DEPS_CLI")
+            }
+        }
+
+        let manager = TabManager(
+            initialWorkingDirectory: repoURL.path,
+            dependencyBootstrapRunner: { _ in },
+            bmuxIndexWarmRunner: { _ in }
+        )
+        guard let workspace = manager.selectedWorkspace else {
+            XCTFail("Expected selected workspace")
+            return
+        }
+
+        TerminalController.shared.start(
+            tabManager: manager,
+            socketPath: socketPath,
+            accessMode: .allowAll
+        )
+        try waitForSocket(at: socketPath)
+
+        let attachResponse = try sendV2Request(
+            method: "agent.attach",
+            params: ["workspace_id": workspace.id.uuidString],
+            to: socketPath
+        )
+        XCTAssertEqual(attachResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(attachResponse)")
+        let attachResult = try XCTUnwrap(attachResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(attachResponse)")
+        let sessionId = try XCTUnwrap(attachResult["session_id"] as? String)
+
+        let capabilitiesResponse = try sendV2Request(
+            method: "agent.capabilities",
+            params: ["session_id": sessionId],
+            to: socketPath
+        )
+        XCTAssertEqual(capabilitiesResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(capabilitiesResponse)")
+        let capabilitiesResult = try XCTUnwrap(capabilitiesResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(capabilitiesResponse)")
+        let capabilitiesRuntimeHelpers = try XCTUnwrap(capabilitiesResult["runtime_helpers"] as? [String: Any])
+        let capabilitiesDepsHelper = try XCTUnwrap(capabilitiesRuntimeHelpers["bmux_deps"] as? [String: Any])
+        let capabilitiesRepoStatus = try XCTUnwrap(capabilitiesDepsHelper["repo_status"] as? [String: Any])
+        XCTAssertEqual(capabilitiesRepoStatus["repo_root"] as? String, repoURL.path)
+        XCTAssertEqual(capabilitiesRepoStatus["state"] as? String, "cold")
+        XCTAssertEqual(capabilitiesRepoStatus["dependency_count"] as? Int, 7)
+        XCTAssertEqual(capabilitiesRepoStatus["unresolved_count"] as? Int, 2)
+        XCTAssertEqual(capabilitiesRepoStatus["lockfile_count"] as? Int, 1)
+        XCTAssertEqual(capabilitiesRepoStatus["store_writable"] as? Bool, false)
+        XCTAssertEqual(capabilitiesRepoStatus["helper_available"] as? Bool, false)
+        let capabilitiesWarnings = try XCTUnwrap(capabilitiesResult["runtime_helper_warnings"] as? [String])
+        XCTAssertTrue(capabilitiesWarnings.contains {
+            $0.localizedCaseInsensitiveContains("repo status cold")
+                && $0.localizedCaseInsensitiveContains("not writable")
+        })
+
+        let summaryResponse = try sendV2Request(
+            method: "agent.state.summary",
+            params: ["session_id": sessionId],
+            to: socketPath
+        )
+        XCTAssertEqual(summaryResponse["ok"] as? Bool, true, "Unexpected JSON-RPC response: \(summaryResponse)")
+        let summaryResult = try XCTUnwrap(summaryResponse["result"] as? [String: Any], "Unexpected JSON-RPC response: \(summaryResponse)")
+        let summaryRuntimeHelpers = try XCTUnwrap(summaryResult["runtime_helpers"] as? [String: Any])
+        let summaryDepsHelper = try XCTUnwrap(summaryRuntimeHelpers["bmux_deps"] as? [String: Any])
+        let summaryRepoStatus = try XCTUnwrap(summaryDepsHelper["repo_status"] as? [String: Any])
+        XCTAssertEqual(summaryRepoStatus["state"] as? String, "cold")
+        XCTAssertEqual(Array(try fakeCommandLog(at: fakeDeps.logURL).prefix(4)), ["status", "doctor", "status", "doctor"])
     }
 
     func testAgentTaskRunWithoutSplitReusesAttachedVisibleTerminal() async throws {
@@ -973,6 +1068,35 @@ final class TerminalControllerSocketSecurityTests: XCTestCase {
               ;;
           esac
         done
+        """
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return (scriptURL, logURL)
+    }
+
+    private func makeFakeBmuxDepsScript(for repoURL: URL) throws -> (scriptURL: URL, logURL: URL) {
+        let scriptURL = FileManager.default.temporaryDirectory.appendingPathComponent("fake-bmux-deps-\(UUID().uuidString).sh")
+        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("fake-bmux-deps-\(UUID().uuidString).log")
+        let statusResponse = #"{"repoRoot":"__REPO__","state":"cold","dependencyCount":7,"unresolvedCount":2,"manifestPath":"__STORE__/manifest.json","storeRoot":"__STORE__","lockfiles":[{"relativePath":"Package.resolved"}]}"#
+            .replacingOccurrences(of: "__REPO__", with: repoURL.path)
+            .replacingOccurrences(of: "__STORE__", with: "/tmp/fake-bmux-deps-store")
+        let doctorResponse = #"{"storeRoot":"__STORE__","storeWritable":false,"helperAvailable":false,"allowGit":false}"#
+            .replacingOccurrences(of: "__STORE__", with: "/tmp/fake-bmux-deps-store")
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' "$1" >> "\(logURL.path)"
+        case "$1" in
+          status)
+            printf '%s\\n' '\(statusResponse)'
+            ;;
+          doctor)
+            printf '%s\\n' '\(doctorResponse)'
+            ;;
+          *)
+            printf '%s\\n' '{"error":"unsupported"}' >&2
+            exit 1
+            ;;
+        esac
         """
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
